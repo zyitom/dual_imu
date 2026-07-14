@@ -118,7 +118,7 @@ bool attitude_mekf_propagate_delta(attitude_mekf_t *filter,
 
 /*
  * The update is rank-two in the gravity tangent plane and cannot observe yaw.
- * variance_scale must be finite and >= 1; use it for externally detected
+ * variance_scale must be finite and >= 1; use it for caller-detected
  * vibration/dynamics, and skip this call entirely during a hard accel gate.
  */
 attitude_mekf_accel_result_t attitude_mekf_update_accel(
@@ -127,7 +127,7 @@ attitude_mekf_accel_result_t attitude_mekf_update_accel(
     float variance_scale);
 
 /*
- * Call only after an external stationary detector has passed. gyro_rad_s is the
+ * Call only after a stationary detector has passed. gyro_rad_s is the
  * calibrated window-average measurement before this filter's bg subtraction;
  * measurement_covariance is its SPD covariance in (rad/s)^2. The z=bg+n update
  * observes all three bias axes, but it still does not observe absolute yaw.
@@ -137,6 +137,23 @@ attitude_mekf_zaru_result_t attitude_mekf_update_zero_rate(
     const float gyro_rad_s[ATTITUDE_MEKF_VECTOR_DIM],
     const float measurement_covariance[ATTITUDE_MEKF_VECTOR_DIM]
                                       [ATTITUDE_MEKF_VECTOR_DIM]);
+
+/*
+ * Bounded form for an internally inferred stationary interval.  The input is
+ * already fixed/temperature calibrated, so its residual target is clipped
+ * around zero before the z=bg+n update.  If the unconstrained Kalman update
+ * would move the 3-D bias vector by more than max_bias_correction_rad_s, the
+ * complete gain is scaled uniformly and the same gain is used by the Joseph
+ * covariance update.  bounded_target_rad_s may be NULL.
+ */
+attitude_mekf_zaru_result_t attitude_mekf_update_zero_rate_bounded(
+    attitude_mekf_t *filter,
+    const float gyro_rad_s[ATTITUDE_MEKF_VECTOR_DIM],
+    const float measurement_covariance[ATTITUDE_MEKF_VECTOR_DIM]
+                                      [ATTITUDE_MEKF_VECTOR_DIM],
+    float target_residual_limit_rad_s,
+    float max_bias_correction_rad_s,
+    float bounded_target_rad_s[ATTITUDE_MEKF_VECTOR_DIM]);
 
 bool attitude_mekf_is_valid(const attitude_mekf_t *filter);
 bool attitude_mekf_get_quaternion(const attitude_mekf_t *filter, float quaternion[4]);

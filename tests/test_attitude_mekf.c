@@ -7,6 +7,7 @@
 #define TEST_PI_F      (3.14159265358979323846f)
 #define TEST_GRAVITY   (9.80665f)
 #define TEST_DT_S      (0.0025f)
+#define TEST_NOISE_SAMPLE_COUNT (8000U)
 
 static unsigned int failure_count;
 
@@ -24,6 +25,13 @@ static unsigned int failure_count;
 static float degrees_to_radians(float degrees)
 {
     return degrees * TEST_PI_F / 180.0f;
+}
+
+static float deterministic_signed_unit_noise(uint32_t *state)
+{
+    *state = (UINT32_C(1664525) * *state) + UINT32_C(1013904223);
+    return ((float)((*state >> 8) & UINT32_C(0x00FFFFFF)) / 8388608.0f) -
+           1.0f;
 }
 
 static float wrap_pi(float angle)
@@ -292,6 +300,161 @@ static void test_yaw_unobservability_and_propagation_rejection(void)
     TEST_EXPECT(memcmp(saved_covariance, filter.covariance, sizeof(saved_covariance)) == 0);
 }
 
+static void test_gravity_axis_bias_is_unobservable_at_tilt(void)
+{
+    attitude_mekf_t filter;
+    float true_quaternion[4];
+    float static_force[3];
+    float estimated_bias[3];
+    const float zero_bias[3] = {0.0f, 0.0f, 0.0f};
+    const float bias_magnitude = 0.02f;
+
+    quaternion_from_euler(degrees_to_radians(-18.0f),
+                          degrees_to_radians(13.0f),
+                          degrees_to_radians(27.0f),
+                          true_quaternion);
+    static_specific_force(true_quaternion, static_force);
+    const float down_body[3] = {
+        -static_force[0] / TEST_GRAVITY,
+        -static_force[1] / TEST_GRAVITY,
+        -static_force[2] / TEST_GRAVITY,
+    };
+    const float measured_delta[3] = {
+        bias_magnitude * down_body[0] * TEST_DT_S,
+        bias_magnitude * down_body[1] * TEST_DT_S,
+        bias_magnitude * down_body[2] * TEST_DT_S,
+    };
+
+    TEST_EXPECT(attitude_mekf_init(&filter, NULL));
+    TEST_EXPECT(attitude_mekf_reset(&filter, true_quaternion, zero_bias));
+    for (unsigned int sample = 0U; sample < 4000U; ++sample)
+    {
+        TEST_EXPECT(attitude_mekf_propagate_delta(&filter,
+                                                  measured_delta,
+                                                  TEST_DT_S));
+        TEST_EXPECT(attitude_mekf_update_accel(&filter, static_force, 1.0f) ==
+                    ATTITUDE_MEKF_ACCEL_ACCEPTED);
+    }
+
+    TEST_EXPECT(attitude_mekf_get_bias(&filter, estimated_bias));
+    const float learned_gravity_axis_bias =
+        (estimated_bias[0] * down_body[0]) +
+        (estimated_bias[1] * down_body[1]) +
+        (estimated_bias[2] * down_body[2]);
+    TEST_EXPECT(fabsf(learned_gravity_axis_bias) < 1.0e-4f);
+    TEST_EXPECT(attitude_mekf_is_valid(&filter));
+}
+
+static void test_noisy_tilt_preserves_gravity_gauge_and_observable_bias(void)
+{
+    attitude_mekf_t filter;
+    float true_quaternion[4];
+    float static_force[3];
+    float estimated_bias[3];
+    float euler[3];
+    const float zero_bias[3] = {0.0f, 0.0f, 0.0f};
+    const float gyro_noise_amplitude = degrees_to_radians(3.0f);
+    const float accel_noise_amplitude = 0.03f;
+    double gyro_noise_mean[3] = {0.0, 0.0, 0.0};
+    double accel_noise_mean[3] = {0.0, 0.0, 0.0};
+    uint32_t noise_state = UINT32_C(7);
+
+    /* Subtract the finite-record mean so this stress sequence contains no
+     * real constant rate or force that the filter could legitimately learn. */
+    for (unsigned int sample = 0U; sample < TEST_NOISE_SAMPLE_COUNT; ++sample)
+    {
+        for (unsigned int axis = 0U; axis < 3U; ++axis)
+        {
+            gyro_noise_mean[axis] +=
+                (double)gyro_noise_amplitude *
+                (double)deterministic_signed_unit_noise(&noise_state);
+            accel_noise_mean[axis] +=
+                (double)accel_noise_amplitude *
+                (double)deterministic_signed_unit_noise(&noise_state);
+        }
+    }
+    for (unsigned int axis = 0U; axis < 3U; ++axis)
+    {
+        gyro_noise_mean[axis] /= (double)TEST_NOISE_SAMPLE_COUNT;
+        accel_noise_mean[axis] /= (double)TEST_NOISE_SAMPLE_COUNT;
+    }
+
+    quaternion_from_euler(degrees_to_radians(-2.0f),
+                          degrees_to_radians(1.5f),
+                          0.0f,
+                          true_quaternion);
+    static_specific_force(true_quaternion, static_force);
+    const float down_body[3] = {
+        -static_force[0] / TEST_GRAVITY,
+        -static_force[1] / TEST_GRAVITY,
+        -static_force[2] / TEST_GRAVITY,
+    };
+
+    float observable_direction[3] = {
+        1.0f - (down_body[0] * down_body[0]),
+        -down_body[0] * down_body[1],
+        -down_body[0] * down_body[2],
+    };
+    const float observable_direction_norm =
+        sqrtf((observable_direction[0] * observable_direction[0]) +
+              (observable_direction[1] * observable_direction[1]) +
+              (observable_direction[2] * observable_direction[2]));
+    const float observable_bias_magnitude = 0.02f;
+    float observable_bias[3];
+    for (unsigned int axis = 0U; axis < 3U; ++axis)
+    {
+        observable_direction[axis] /= observable_direction_norm;
+        observable_bias[axis] =
+            observable_bias_magnitude * observable_direction[axis];
+    }
+
+    TEST_EXPECT(attitude_mekf_init(&filter, NULL));
+    TEST_EXPECT(attitude_mekf_seed_from_accel(&filter, static_force,
+                                              0.0f, zero_bias));
+    noise_state = UINT32_C(7);
+    for (unsigned int sample = 0U; sample < TEST_NOISE_SAMPLE_COUNT; ++sample)
+    {
+        float delta_angle[3];
+        float noisy_force[3];
+        for (unsigned int axis = 0U; axis < 3U; ++axis)
+        {
+            const float gyro_noise =
+                (gyro_noise_amplitude *
+                 deterministic_signed_unit_noise(&noise_state)) -
+                (float)gyro_noise_mean[axis];
+            const float accel_noise =
+                (accel_noise_amplitude *
+                 deterministic_signed_unit_noise(&noise_state)) -
+                (float)accel_noise_mean[axis];
+            delta_angle[axis] =
+                (observable_bias[axis] + gyro_noise) * TEST_DT_S;
+            noisy_force[axis] = static_force[axis] + accel_noise;
+        }
+
+        TEST_EXPECT(attitude_mekf_propagate_delta(&filter,
+                                                  delta_angle,
+                                                  TEST_DT_S));
+        TEST_EXPECT(attitude_mekf_update_accel(&filter, noisy_force, 1.0f) ==
+                    ATTITUDE_MEKF_ACCEL_ACCEPTED);
+    }
+
+    TEST_EXPECT(attitude_mekf_get_bias(&filter, estimated_bias));
+    TEST_EXPECT(attitude_mekf_get_euler(&filter, euler));
+    const float gravity_axis_bias =
+        (estimated_bias[0] * down_body[0]) +
+        (estimated_bias[1] * down_body[1]) +
+        (estimated_bias[2] * down_body[2]);
+    const float learned_observable_bias =
+        (estimated_bias[0] * observable_direction[0]) +
+        (estimated_bias[1] * observable_direction[1]) +
+        (estimated_bias[2] * observable_direction[2]);
+    TEST_EXPECT(fabsf(gravity_axis_bias) < 5.0e-4f);
+    TEST_EXPECT(fabsf(learned_observable_bias - observable_bias_magnitude) <
+                5.0e-4f);
+    TEST_EXPECT(fabsf(wrap_pi(euler[2])) < degrees_to_radians(1.0f));
+    TEST_EXPECT(attitude_mekf_is_valid(&filter));
+}
+
 static void test_zaru_three_axis_bias_update(void)
 {
     attitude_mekf_t filter;
@@ -337,6 +500,60 @@ static void test_zaru_three_axis_bias_update(void)
     TEST_EXPECT(filter.diagnostics.zaru_update_count == 40U);
     TEST_EXPECT(filter.diagnostics.zaru_accept_count == 40U);
     TEST_EXPECT(filter.diagnostics.last_zaru_result == ATTITUDE_MEKF_ZARU_ACCEPTED);
+    TEST_EXPECT(attitude_mekf_is_valid(&filter));
+}
+
+static void test_bounded_zaru_clips_target_and_limits_global_slew(void)
+{
+    attitude_mekf_t filter;
+    const float measured_rate[3] = {
+        degrees_to_radians(2.0f),
+        degrees_to_radians(-1.0f),
+        degrees_to_radians(0.25f),
+    };
+    const float measured_delta[3] = {
+        measured_rate[0] * TEST_DT_S,
+        measured_rate[1] * TEST_DT_S,
+        measured_rate[2] * TEST_DT_S,
+    };
+    const float covariance[3][3] = {
+        {1.0e-7f, 0.0f, 0.0f},
+        {0.0f, 1.0e-7f, 0.0f},
+        {0.0f, 0.0f, 1.0e-7f},
+    };
+    const float target_limit = degrees_to_radians(0.5f);
+    const float maximum_bias_step =
+        degrees_to_radians(0.1f) * TEST_DT_S;
+    float bounded_target[3];
+    float bias_before[3];
+    float bias_after[3];
+
+    TEST_EXPECT(attitude_mekf_init(&filter, NULL));
+    TEST_EXPECT(attitude_mekf_propagate_delta(&filter,
+                                              measured_delta,
+                                              TEST_DT_S));
+    TEST_EXPECT(attitude_mekf_get_bias(&filter, bias_before));
+    TEST_EXPECT(attitude_mekf_update_zero_rate_bounded(
+                    &filter,
+                    measured_rate,
+                    covariance,
+                    target_limit,
+                    maximum_bias_step,
+                    bounded_target) == ATTITUDE_MEKF_ZARU_ACCEPTED);
+    TEST_EXPECT(attitude_mekf_get_bias(&filter, bias_after));
+
+    TEST_EXPECT(fabsf(bounded_target[0] - target_limit) < 1.0e-8f);
+    TEST_EXPECT(fabsf(bounded_target[1] + target_limit) < 1.0e-8f);
+    TEST_EXPECT(fabsf(bounded_target[2] - measured_rate[2]) < 1.0e-8f);
+    float bias_step_sq = 0.0f;
+    for (unsigned int axis = 0U; axis < 3U; ++axis)
+    {
+        const float step = bias_after[axis] - bias_before[axis];
+        bias_step_sq += step * step;
+    }
+    const float bias_step = sqrtf(bias_step_sq);
+    TEST_EXPECT(bias_step <= maximum_bias_step + 1.0e-9f);
+    TEST_EXPECT(bias_step >= 0.99f * maximum_bias_step);
     TEST_EXPECT(attitude_mekf_is_valid(&filter));
 }
 
@@ -452,7 +669,10 @@ int main(void)
     test_gravity_update_at_arbitrary_attitude();
     test_accel_rejection_is_transactional();
     test_yaw_unobservability_and_propagation_rejection();
+    test_gravity_axis_bias_is_unobservable_at_tilt();
+    test_noisy_tilt_preserves_gravity_gauge_and_observable_bias();
     test_zaru_three_axis_bias_update();
+    test_bounded_zaru_clips_target_and_limits_global_slew();
     test_zaru_rejection_is_transactional();
     test_zaru_bias_limit();
     test_long_run_numerical_health();

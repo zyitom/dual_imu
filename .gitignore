@@ -1,1 +1,3 @@
 build*
+Core/Inc/Backup/
+Core/Src/Backup/

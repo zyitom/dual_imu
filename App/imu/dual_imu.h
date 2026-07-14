@@ -4,9 +4,16 @@
 #include "imu_types.h"
 #include "imu_calibration.h"
 #include "imu_selector.h"
+#include "fast_attitude_predictor.h"
 
 #include <stdbool.h>
 #include <stdint.h>
+
+#define DUAL_IMU_ATTITUDE_OUTPUT_RATE_HZ          (1600U)
+#define DUAL_IMU_ATTITUDE_OUTPUT_PERIOD_US         (625U)
+#define DUAL_IMU_ATTITUDE_PUBLISH_DEADLINE_US      (250U)
+#define DUAL_IMU_ATTITUDE_MAX_PREDICTION_HORIZON_US (3000U)
+#define DUAL_IMU_BMI088_ACCEL_REGISTER_SNAPSHOT_SIZE (16U)
 
 typedef enum
 {
@@ -44,6 +51,8 @@ typedef enum
     DUAL_IMU_HINT_ICM45686_BAD
 } dual_imu_isolation_hint_t;
 
+typedef fast_attitude_output_t dual_imu_attitude_output_t;
+
 typedef struct
 {
     bool bmi088_initialized;
@@ -68,6 +77,8 @@ typedef struct
     float selector_residual_nis;
     float lane_quaternion[IMU_SOURCE_COUNT][4];
     float lane_gyro_bias_rad_s[IMU_SOURCE_COUNT][3];
+    float mekf_quaternion[4];
+    float mekf_euler_rad[3];
     float quaternion[4];
     float euler_rad[3];
     float control_gyro_rad_s[3];
@@ -78,6 +89,22 @@ typedef struct
     uint32_t icm45686_fault_flags;
     uint32_t pair_skew_us;
     uint32_t fusion_count;
+    uint32_t fast_attitude_output_count;
+    uint32_t fast_attitude_invalid_count;
+    uint32_t fast_attitude_missed_tick_count;
+    uint32_t fast_attitude_last_integrity_flags;
+    uint32_t fast_attitude_last_publish_latency_us;
+    uint32_t fast_attitude_max_publish_latency_us;
+    uint32_t fast_attitude_last_prediction_horizon_us;
+    uint32_t fast_attitude_compare_event_count;
+    uint32_t fast_attitude_compare_missed_count;
+    uint32_t fast_attitude_tick_drop_count;
+    uint32_t fast_attitude_queue_drop_count;
+    bool fast_attitude_scheduler_running;
+    uint32_t fifo_service_last_us;
+    uint32_t fifo_service_max_us;
+    uint32_t estimator_process_last_us;
+    uint32_t estimator_process_max_us;
     uint32_t selection_count;
     uint32_t mismatch_count;
     uint32_t unpaired_count;
@@ -98,6 +125,11 @@ typedef struct
     uint32_t lane_zaru_accept_count[IMU_SOURCE_COUNT];
     bool stationary_candidate;
     bool stationary_confirmed;
+    uint8_t stationary_last_reject_reason;
+    uint16_t stationary_streak;
+    uint16_t stationary_max_streak;
+    float stationary_temporal_gyro_variance_rad2_s2[IMU_SOURCE_COUNT];
+    float stationary_temporal_accel_variance_m2_s4[IMU_SOURCE_COUNT];
     bool stationary_hint_active;
     bool accel_update_inhibited;
     bool fused_accel_valid;
@@ -120,9 +152,49 @@ typedef struct
     uint32_t bmi088_gyro_buffer_overwrite_count;
     uint32_t icm45686_accel_buffer_overwrite_count;
     uint32_t icm45686_gyro_buffer_overwrite_count;
+    uint32_t bmi088_accel_fifo_batch_count;
+    uint32_t bmi088_gyro_fifo_batch_count;
+    uint32_t bmi088_fifo_dma_error_count;
+    uint32_t bmi088_accel_fifo_length_read_count;
+    uint32_t bmi088_accel_fifo_empty_length_count;
+    uint32_t bmi088_accel_timeline_reset_count;
+    uint32_t bmi088_gyro_capture_mismatch_count;
+    uint32_t bmi088_gyro_capture_queue_overflow_count;
+    uint32_t bmi088_gyro_capture_mismatch_reason;
+    uint32_t bmi088_gyro_warmup_discard_count;
+    bool bmi088_gyro_capture_sync_fault;
+    uint16_t bmi088_accel_fifo_last_bytes;
+    uint16_t bmi088_accel_fifo_peak_bytes;
+    uint8_t bmi088_accel_fifo_length_response[4];
+    uint8_t bmi088_accel_register_snapshot[
+        DUAL_IMU_BMI088_ACCEL_REGISTER_SNAPSHOT_SIZE];
+    uint32_t bmi088_accel_sensor_time_before;
+    uint32_t bmi088_accel_sensor_time_after;
+    int16_t bmi088_accel_direct_raw[3];
+    uint16_t bmi088_accel_initial_fifo_bytes;
+    bool bmi088_accel_snapshot_valid;
+    uint32_t icm45686_fifo_batch_count;
+    uint32_t icm45686_fifo_dma_error_count;
+    bool bmi088_fifo_clock_sync_valid;
+    bool icm45686_fifo_clock_sync_valid;
+    uint32_t fifo_clock_anchor_accepted_count[IMU_SOURCE_COUNT];
+    uint32_t fifo_clock_anchor_rejected_count[IMU_SOURCE_COUNT];
+    uint64_t fifo_clock_reference_mcu_us[IMU_SOURCE_COUNT];
+    float fifo_clock_scale[IMU_SOURCE_COUNT];
+    float fifo_clock_residual_sigma_us[IMU_SOURCE_COUNT];
+    uint32_t fifo_clock_reject_reason_count[IMU_SOURCE_COUNT][4];
+    uint32_t fifo_clock_stale_reset_count[IMU_SOURCE_COUNT];
+    uint32_t fifo_clock_causal_reset_count[IMU_SOURCE_COUNT];
+    uint32_t icm45686_timestamp_discontinuity_count;
+    float fifo_clock_last_observed_scale[IMU_SOURCE_COUNT];
+    float fifo_clock_last_residual_us[IMU_SOURCE_COUNT];
+    uint16_t icm45686_fifo_last_frames;
+    uint16_t icm45686_fifo_peak_frames;
 } dual_imu_state_t;
 
 bool dual_imu_init(void);
+/* Call immediately before enabling the ICM EXTI line. */
+bool dual_imu_start_streaming(void);
 void dual_imu_process(void);
 void dual_imu_handle_exti(uint16_t gpio_pin);
 void dual_imu_notify_impact(uint32_t inhibit_duration_us);
@@ -130,6 +202,9 @@ void dual_imu_set_stationary_hint(bool stationary);
 /* Non-NONE external isolation evidence must be refreshed at least every 100 ms. */
 void dual_imu_set_isolation_hint(dual_imu_isolation_hint_t hint);
 bool dual_imu_get_control_gyro(imu_gyro_sample_t *sample);
+bool dual_imu_get_attitude(dual_imu_attitude_output_t *output);
+/* Pops every TIM5-published frame in order; intended for non-ISR transports. */
+bool dual_imu_pop_attitude(dual_imu_attitude_output_t *output);
 bool dual_imu_set_calibration(imu_source_t source,
                               const imu_calibration_t *calibration);
 bool dual_imu_get_calibration(imu_source_t source,

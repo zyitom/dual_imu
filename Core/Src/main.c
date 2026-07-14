@@ -83,12 +83,19 @@ int main(void)
   /* MPU Configuration--------------------------------------------------------*/
   MPU_Config();
 
+  /* Enable the CPU Cache */
+
+  /* Enable I-Cache---------------------------------------------------------*/
+  SCB_EnableICache();
+
   /* MCU Configuration--------------------------------------------------------*/
 
   /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
   HAL_Init();
 
   /* USER CODE BEGIN Init */
+
+  /* I-cache is generated from the IOC; D-cache stays off for DMA coherency. */
 
   /* USER CODE END Init */
 
@@ -103,7 +110,6 @@ int main(void)
   /* USER CODE END SysInit */
 
   /* Initialize all configured peripherals */
-  MX_TIM5_Init();
   MX_GPIO_Init();
   MX_DMA_Init();
   MX_ADC1_Init();
@@ -128,6 +134,7 @@ int main(void)
   MX_USART3_UART_Init();
   MX_USART6_UART_Init();
   MX_USB_DEVICE_Init();
+  MX_TIM5_Init();
   /* USER CODE BEGIN 2 */
   app_init();
   /* USER CODE END 2 */

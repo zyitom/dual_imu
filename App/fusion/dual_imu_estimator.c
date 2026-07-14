@@ -9,6 +9,7 @@
 #define DUAL_IMU_ESTIMATOR_US_TO_S       (1.0e-6f)
 #define DUAL_IMU_ESTIMATOR_MAX_SCALE     (100.0f)
 #define DUAL_IMU_ESTIMATOR_FILTER_FAULT  (1UL << 31)
+#define DUAL_IMU_ESTIMATOR_STATIONARY_WARMUP_WINDOWS (40U)
 
 static bool estimator_source_to_lane(imu_source_t source, uint32_t *lane)
 {
@@ -145,11 +146,31 @@ static bool estimator_config_is_valid(const dual_imu_estimator_config_t *config)
         (config->output_alignment_slew_rad_s <= 0.0f) ||
         !isfinite(config->stationary_gyro_limit_rad_s) ||
         (config->stationary_gyro_limit_rad_s <= 0.0f) ||
+        !isfinite(config->zaru_target_residual_limit_rad_s) ||
+        (config->zaru_target_residual_limit_rad_s <= 0.0f) ||
+        (config->zaru_target_residual_limit_rad_s >
+         config->stationary_gyro_limit_rad_s) ||
+        !isfinite(config->zaru_bias_slew_limit_rad_s2) ||
+        (config->zaru_bias_slew_limit_rad_s2 <= 0.0f) ||
+        !isfinite(config->zaru_calibration_tolerance_rad_s) ||
+        (config->zaru_calibration_tolerance_rad_s <= 0.0f) ||
+        (config->zaru_calibration_tolerance_rad_s >=
+         config->zaru_target_residual_limit_rad_s) ||
+        !isfinite(config->stationary_gyro_variance_limit_rad2_s2) ||
+        (config->stationary_gyro_variance_limit_rad2_s2 <= 0.0f) ||
         !isfinite(config->stationary_accel_norm_tolerance_mps2) ||
         (config->stationary_accel_norm_tolerance_mps2 <= 0.0f) ||
         !isfinite(config->stationary_accel_pair_limit_mps2) ||
         (config->stationary_accel_pair_limit_mps2 <= 0.0f) ||
-        (config->stationary_dwell_windows == 0U) ||
+        !isfinite(config->stationary_accel_temporal_variance_limit_m2_s4) ||
+        (config->stationary_accel_temporal_variance_limit_m2_s4 <= 0.0f) ||
+        !isfinite(config->stationary_accel_direction_limit) ||
+        (config->stationary_accel_direction_limit <= 0.0f) ||
+        (config->stationary_accel_direction_limit >= 2.0f) ||
+        (config->stationary_dwell_windows < 2U) ||
+        (config->stationary_hint_dwell_windows < 2U) ||
+        (config->stationary_hint_dwell_windows >
+         config->stationary_dwell_windows) ||
         (config->calibration_accept_windows == 0U) ||
         (config->accel_fault_enter_windows == 0U) ||
         (config->accel_fault_recovery_windows == 0U) ||
@@ -166,7 +187,9 @@ static bool estimator_config_is_valid(const dual_imu_estimator_config_t *config)
     for (size_t lane = 0U; lane < DUAL_IMU_ESTIMATOR_LANE_COUNT; ++lane) {
         if (!estimator_vector_is_finite(config->reference_to_sensor_m[lane]) ||
             !isfinite(config->zaru_rate_std_rad_s[lane]) ||
-            (config->zaru_rate_std_rad_s[lane] <= 0.0f))
+            (config->zaru_rate_std_rad_s[lane] <= 0.0f) ||
+            !isfinite(config->stationary_gyro_temporal_variance_limit_rad2_s2[lane]) ||
+            (config->stationary_gyro_temporal_variance_limit_rad2_s2[lane] <= 0.0f))
             return false;
     }
     return true;
@@ -208,10 +231,30 @@ void dual_imu_estimator_default_config(dual_imu_estimator_config_t *config)
     config->output_alignment_slew_rad_s = 1.0f;
     config->zaru_rate_std_rad_s[DUAL_IMU_ESTIMATOR_LANE_BMI088] = 0.30f * degree;
     config->zaru_rate_std_rad_s[DUAL_IMU_ESTIMATOR_LANE_ICM45686] = 0.10f * degree;
-    config->stationary_gyro_limit_rad_s = 0.03f;
+    config->stationary_gyro_limit_rad_s = 3.0f * degree;
+    config->zaru_target_residual_limit_rad_s = 0.50f * degree;
+    config->zaru_bias_slew_limit_rad_s2 = 0.10f * degree;
+    config->zaru_calibration_tolerance_rad_s = 0.05f * degree;
+    const float stationary_gyro_rms_limit = 1.0f * degree;
+    config->stationary_gyro_variance_limit_rad2_s2 =
+        stationary_gyro_rms_limit * stationary_gyro_rms_limit;
+    const float bmi_temporal_gyro_rms_limit = 0.80f * degree;
+    const float icm_temporal_gyro_rms_limit = 0.25f * degree;
+    config->stationary_gyro_temporal_variance_limit_rad2_s2
+        [DUAL_IMU_ESTIMATOR_LANE_BMI088] =
+        bmi_temporal_gyro_rms_limit * bmi_temporal_gyro_rms_limit;
+    config->stationary_gyro_temporal_variance_limit_rad2_s2
+        [DUAL_IMU_ESTIMATOR_LANE_ICM45686] =
+        icm_temporal_gyro_rms_limit * icm_temporal_gyro_rms_limit;
     config->stationary_accel_norm_tolerance_mps2 = 0.30f;
     config->stationary_accel_pair_limit_mps2 = 0.35f;
-    config->stationary_dwell_windows = 400U;
+    const float stationary_temporal_accel_rms_limit = 0.10f;
+    config->stationary_accel_temporal_variance_limit_m2_s4 =
+        stationary_temporal_accel_rms_limit *
+        stationary_temporal_accel_rms_limit;
+    config->stationary_accel_direction_limit = 0.02f;
+    config->stationary_dwell_windows = 800U;
+    config->stationary_hint_dwell_windows = 80U;
     config->calibration_accept_windows = 40U;
     config->accel_fault_enter_windows = 200U;
     config->accel_fault_recovery_windows = 400U;
@@ -509,37 +552,234 @@ static void estimator_selector_covariance(const dual_imu_estimator_t *estimator,
     }
 }
 
-static bool estimator_stationary_candidate(
-    const dual_imu_estimator_t *estimator,
+static void estimator_reset_stationary_tracking(
+    dual_imu_estimator_t *estimator)
+{
+    memset(estimator->stationary_gravity_reference_valid, 0,
+           sizeof(estimator->stationary_gravity_reference_valid));
+    estimator->stationary_statistics_count = 0U;
+    memset(estimator->stationary_gyro_mean_rad_s, 0,
+           sizeof(estimator->stationary_gyro_mean_rad_s));
+    memset(estimator->stationary_gyro_m2_rad2_s2, 0,
+           sizeof(estimator->stationary_gyro_m2_rad2_s2));
+    memset(estimator->stationary_accel_mean_mps2, 0,
+           sizeof(estimator->stationary_accel_mean_mps2));
+    memset(estimator->stationary_accel_m2_m2_s4, 0,
+           sizeof(estimator->stationary_accel_m2_m2_s4));
+}
+
+static bool estimator_reject_stationary(
+    dual_imu_estimator_t *estimator,
+    dual_imu_stationary_reject_reason_t reason)
+{
+    estimator->stationary_last_reject_reason = reason;
+    if ((reason > DUAL_IMU_STATIONARY_REJECT_NONE) &&
+        (reason < DUAL_IMU_STATIONARY_REJECT_COUNT) &&
+        (estimator->stationary_reject_count[reason] < UINT32_MAX)) {
+        estimator->stationary_reject_count[reason]++;
+    }
+    estimator_reset_stationary_tracking(estimator);
+    return false;
+}
+
+static uint32_t estimator_stationary_warmup_windows(
+    const dual_imu_estimator_t *estimator)
+{
+    const uint32_t required_windows = estimator->stationary_hint
+        ? estimator->config.stationary_hint_dwell_windows
+        : estimator->config.stationary_dwell_windows;
+    return (required_windows < DUAL_IMU_ESTIMATOR_STATIONARY_WARMUP_WINDOWS)
+        ? required_windows
+        : DUAL_IMU_ESTIMATOR_STATIONARY_WARMUP_WINDOWS;
+}
+
+static bool estimator_update_stationary_statistics(
+    dual_imu_estimator_t *estimator,
     const dual_imu_estimator_output_t *output)
 {
-    uint32_t usable_count = 0U;
+    const uint32_t previous_count = estimator->stationary_statistics_count;
+    const uint32_t memory_windows = estimator->config.stationary_dwell_windows;
+    const uint32_t count = (previous_count < memory_windows)
+                               ? previous_count + 1U
+                               : memory_windows;
+    for (size_t lane = 0U; lane < DUAL_IMU_ESTIMATOR_LANE_COUNT; ++lane) {
+        for (size_t axis = 0U; axis < 3U; ++axis) {
+            const float gyro = output->lane_rate_rad_s[lane][axis];
+            const float gyro_delta =
+                gyro - estimator->stationary_gyro_mean_rad_s[lane][axis];
+            const float accel = output->lane_specific_force_mps2[lane][axis];
+            const float accel_delta =
+                accel - estimator->stationary_accel_mean_mps2[lane][axis];
+            if (previous_count < memory_windows) {
+                const float inverse_count = 1.0f / (float)count;
+                estimator->stationary_gyro_mean_rad_s[lane][axis] +=
+                    gyro_delta * inverse_count;
+                estimator->stationary_gyro_m2_rad2_s2[lane][axis] +=
+                    gyro_delta *
+                    (gyro - estimator->stationary_gyro_mean_rad_s[lane][axis]);
+                estimator->stationary_accel_mean_mps2[lane][axis] +=
+                    accel_delta * inverse_count;
+                estimator->stationary_accel_m2_m2_s4[lane][axis] +=
+                    accel_delta *
+                    (accel - estimator->stationary_accel_mean_mps2[lane][axis]);
+            } else {
+                const float alpha = 1.0f / (float)memory_windows;
+                const float decay = 1.0f - alpha;
+                const float degrees_of_freedom =
+                    (float)(memory_windows - 1U);
+                const float gyro_variance =
+                    estimator->stationary_gyro_m2_rad2_s2[lane][axis] /
+                    degrees_of_freedom;
+                const float accel_variance =
+                    estimator->stationary_accel_m2_m2_s4[lane][axis] /
+                    degrees_of_freedom;
+                estimator->stationary_gyro_mean_rad_s[lane][axis] +=
+                    alpha * gyro_delta;
+                estimator->stationary_accel_mean_mps2[lane][axis] +=
+                    alpha * accel_delta;
+                estimator->stationary_gyro_m2_rad2_s2[lane][axis] =
+                    decay * (gyro_variance +
+                             (alpha * gyro_delta * gyro_delta)) *
+                    degrees_of_freedom;
+                estimator->stationary_accel_m2_m2_s4[lane][axis] =
+                    decay * (accel_variance +
+                             (alpha * accel_delta * accel_delta)) *
+                    degrees_of_freedom;
+            }
+        }
+    }
+    estimator->stationary_statistics_count = count;
+    const uint32_t warmup_windows =
+        estimator_stationary_warmup_windows(estimator);
+    if (count < warmup_windows)
+        return true;
+
+    const float inverse_degrees_of_freedom = 1.0f / (float)(count - 1U);
+    bool within_limits = true;
+    for (size_t lane = 0U; lane < DUAL_IMU_ESTIMATOR_LANE_COUNT; ++lane) {
+        float gyro_variance = 0.0f;
+        float accel_variance = 0.0f;
+        for (size_t axis = 0U; axis < 3U; ++axis) {
+            const float gyro_axis_variance =
+                estimator->stationary_gyro_m2_rad2_s2[lane][axis] *
+                inverse_degrees_of_freedom;
+            const float accel_axis_variance =
+                estimator->stationary_accel_m2_m2_s4[lane][axis] *
+                inverse_degrees_of_freedom;
+            if (!isfinite(gyro_axis_variance) ||
+                !isfinite(accel_axis_variance)) {
+                within_limits = false;
+                continue;
+            }
+            gyro_variance += fmaxf(0.0f, gyro_axis_variance);
+            accel_variance += fmaxf(0.0f, accel_axis_variance);
+        }
+        estimator->stationary_temporal_gyro_variance_rad2_s2[lane] =
+            gyro_variance;
+        estimator->stationary_temporal_accel_variance_m2_s4[lane] =
+            accel_variance;
+        if ((gyro_variance >
+             estimator->config
+                 .stationary_gyro_temporal_variance_limit_rad2_s2[lane]) ||
+            (accel_variance >
+             estimator->config
+                 .stationary_accel_temporal_variance_limit_m2_s4))
+            within_limits = false;
+    }
+    return within_limits;
+}
+
+static bool estimator_stationary_candidate(
+    dual_imu_estimator_t *estimator,
+    const dual_imu_estimator_output_t *output)
+{
     for (size_t lane = 0U; lane < DUAL_IMU_ESTIMATOR_LANE_COUNT; ++lane) {
         if ((estimator->hard_fault_flags[lane] != 0U) ||
             !output->lane_window[lane].gyro_valid ||
-            !output->lane_window[lane].accel_valid)
-            continue;
+            !output->lane_window[lane].accel_valid) {
+            return estimator_reject_stationary(
+                estimator, DUAL_IMU_STATIONARY_REJECT_INVALID_OR_FAULT);
+        }
 
-        usable_count++;
-        if ((estimator_vector_norm(output->lane_rate_rad_s[lane]) >
-             estimator->config.stationary_gyro_limit_rad_s) ||
-            (fabsf(estimator_vector_norm(output->lane_specific_force_mps2[lane]) -
+        if (estimator_vector_norm(output->lane_rate_rad_s[lane]) >
+            estimator->config.stationary_gyro_limit_rad_s) {
+            return estimator_reject_stationary(
+                estimator, DUAL_IMU_STATIONARY_REJECT_INSTANT_RATE);
+        }
+        if (fabsf(estimator_vector_norm(
+                       output->lane_specific_force_mps2[lane]) -
                    DUAL_IMU_ESTIMATOR_GRAVITY_MPS2) >
-             estimator->config.stationary_accel_norm_tolerance_mps2))
-            return false;
+            estimator->config.stationary_accel_norm_tolerance_mps2) {
+            return estimator_reject_stationary(
+                estimator, DUAL_IMU_STATIONARY_REJECT_ACCEL_NORM);
+        }
+
+        float gyro_variance = 0.0f;
+        for (size_t axis = 0U; axis < 3U; ++axis) {
+            const float mean = output->lane_window[lane].gyro_mean_rad_s[axis];
+            const float variance =
+                output->lane_window[lane].gyro_second_moment_rad2_s2[axis][axis] -
+                (mean * mean);
+            gyro_variance += fmaxf(0.0f, variance);
+        }
+        if (!isfinite(gyro_variance) ||
+            (gyro_variance >
+             (3.0f * estimator->config.stationary_gyro_variance_limit_rad2_s2))) {
+            return estimator_reject_stationary(
+                estimator, DUAL_IMU_STATIONARY_REJECT_WINDOW_GYRO_VARIANCE);
+        }
     }
 
-    if (usable_count == 0U)
-        return false;
-    if ((usable_count == DUAL_IMU_ESTIMATOR_LANE_COUNT) &&
-        (output->accel_pair_residual_mps2 >
-         estimator->config.stationary_accel_pair_limit_mps2))
-        return false;
-    if ((usable_count == DUAL_IMU_ESTIMATOR_LANE_COUNT) &&
-        (!output->selector.residual_valid ||
-         (output->selector.residual_nis >=
-          estimator->config.selector.nis_clear_threshold)))
-        return false;
+    if (output->accel_pair_residual_mps2 >
+        estimator->config.stationary_accel_pair_limit_mps2) {
+        return estimator_reject_stationary(
+            estimator, DUAL_IMU_STATIONARY_REJECT_ACCEL_PAIR);
+    }
+
+    if (!estimator_update_stationary_statistics(estimator, output)) {
+        return estimator_reject_stationary(
+            estimator, DUAL_IMU_STATIONARY_REJECT_TEMPORAL_VARIANCE);
+    }
+
+    const uint32_t warmup_windows =
+        estimator_stationary_warmup_windows(estimator);
+    if (estimator->stationary_statistics_count < warmup_windows)
+        return true;
+
+    for (size_t lane = 0U; lane < DUAL_IMU_ESTIMATOR_LANE_COUNT; ++lane) {
+        for (size_t axis = 0U; axis < 3U; ++axis) {
+            if (fabsf(estimator->stationary_gyro_mean_rad_s[lane][axis]) >
+                estimator->config.zaru_target_residual_limit_rad_s) {
+                return estimator_reject_stationary(
+                    estimator, DUAL_IMU_STATIONARY_REJECT_MEAN_RATE);
+            }
+        }
+
+        const float norm = estimator_vector_norm(
+            estimator->stationary_accel_mean_mps2[lane]);
+        if (!isfinite(norm) || (norm <= 0.0f)) {
+            return estimator_reject_stationary(
+                estimator, DUAL_IMU_STATIONARY_REJECT_GRAVITY_DIRECTION);
+        }
+        float gravity_direction[3];
+        for (size_t axis = 0U; axis < 3U; ++axis)
+            gravity_direction[axis] =
+                estimator->stationary_accel_mean_mps2[lane][axis] / norm;
+
+        if (!estimator->stationary_gravity_reference_valid[lane]) {
+            memcpy(estimator->stationary_gravity_reference[lane],
+                   gravity_direction, sizeof(gravity_direction));
+            estimator->stationary_gravity_reference_valid[lane] = true;
+            continue;
+        }
+        if (estimator_vector_distance(
+                gravity_direction,
+                estimator->stationary_gravity_reference[lane]) >
+            estimator->config.stationary_accel_direction_limit) {
+            return estimator_reject_stationary(
+                estimator, DUAL_IMU_STATIONARY_REJECT_GRAVITY_DIRECTION);
+        }
+    }
     return true;
 }
 
@@ -566,38 +806,92 @@ static float estimator_accel_variance_scale(
     return fminf(DUAL_IMU_ESTIMATOR_MAX_SCALE, fmaxf(1.0f, scale));
 }
 
+static bool estimator_split_output_alignment(const float alignment[4],
+                                             float yaw_alignment[4],
+                                             float tilt_alignment[4])
+{
+    float canonical[4] = {
+        alignment[0], alignment[1], alignment[2], alignment[3],
+    };
+    if (!estimator_quaternion_normalize(canonical))
+        return false;
+    if (canonical[0] < 0.0f) {
+        for (size_t index = 0U; index < 4U; ++index)
+            canonical[index] = -canonical[index];
+    }
+
+    /* output_alignment left-multiplies a body-to-world attitude.  Its
+     * unobservable component is therefore the twist about world gravity. */
+    const float yaw_norm = sqrtf((canonical[0] * canonical[0]) +
+                                 (canonical[3] * canonical[3]));
+    if (!isfinite(yaw_norm) || (yaw_norm <= 1.0e-7f))
+        return false;
+
+    yaw_alignment[0] = canonical[0] / yaw_norm;
+    yaw_alignment[1] = 0.0f;
+    yaw_alignment[2] = 0.0f;
+    yaw_alignment[3] = canonical[3] / yaw_norm;
+
+    float inverse_yaw[4];
+    estimator_quaternion_inverse(yaw_alignment, inverse_yaw);
+    estimator_quaternion_multiply(inverse_yaw, canonical, tilt_alignment);
+    /* The exact twist-swing decomposition has no residual Z twist. */
+    tilt_alignment[3] = 0.0f;
+    return estimator_quaternion_normalize(tilt_alignment);
+}
+
+static bool estimator_output_alignment_has_tilt(const float alignment[4])
+{
+    float yaw_alignment[4];
+    float tilt_alignment[4];
+    if (!estimator_split_output_alignment(alignment,
+                                          yaw_alignment,
+                                          tilt_alignment))
+        return true;
+
+    return (fabsf(tilt_alignment[1]) > 1.0e-7f) ||
+           (fabsf(tilt_alignment[2]) > 1.0e-7f);
+}
+
 static bool estimator_decay_output_alignment(dual_imu_estimator_t *estimator,
                                              float dt_s)
 {
-    float *const alignment = estimator->output_alignment;
-    if (alignment[0] < 0.0f) {
-        for (size_t index = 0U; index < 4U; ++index)
-            alignment[index] = -alignment[index];
-    }
+    float yaw_alignment[4];
+    float tilt_alignment[4];
+    if (!estimator_split_output_alignment(estimator->output_alignment,
+                                          yaw_alignment,
+                                          tilt_alignment))
+        return true;
 
-    const float vector_norm = sqrtf((alignment[1] * alignment[1]) +
-                                    (alignment[2] * alignment[2]) +
-                                    (alignment[3] * alignment[3]));
+    const float vector_norm = sqrtf((tilt_alignment[1] * tilt_alignment[1]) +
+                                    (tilt_alignment[2] * tilt_alignment[2]));
     const float angle = 2.0f * atan2f(vector_norm,
-                                     fmaxf(0.0f, alignment[0]));
+                                     fmaxf(0.0f, tilt_alignment[0]));
     const float maximum_step =
         estimator->config.output_alignment_slew_rad_s * dt_s;
     if (!isfinite(angle) || !isfinite(maximum_step) ||
         (maximum_step <= 0.0f))
         return vector_norm > 1.0e-7f;
     if ((angle <= maximum_step) || (vector_norm <= 1.0e-7f)) {
-        estimator_quaternion_identity(alignment);
+        memcpy(estimator->output_alignment, yaw_alignment,
+               sizeof(estimator->output_alignment));
         return false;
     }
 
     const float remaining_angle = angle - maximum_step;
     const float vector_scale = sinf(0.5f * remaining_angle) / vector_norm;
-    alignment[0] = cosf(0.5f * remaining_angle);
-    alignment[1] *= vector_scale;
-    alignment[2] *= vector_scale;
-    alignment[3] *= vector_scale;
-    if (!estimator_quaternion_normalize(alignment)) {
-        estimator_quaternion_identity(alignment);
+    float remaining_tilt[4] = {
+        cosf(0.5f * remaining_angle),
+        tilt_alignment[1] * vector_scale,
+        tilt_alignment[2] * vector_scale,
+        0.0f,
+    };
+    estimator_quaternion_multiply(yaw_alignment,
+                                  remaining_tilt,
+                                  estimator->output_alignment);
+    if (!estimator_quaternion_normalize(estimator->output_alignment)) {
+        memcpy(estimator->output_alignment, yaw_alignment,
+               sizeof(estimator->output_alignment));
         return false;
     }
     return true;
@@ -611,6 +905,7 @@ static void estimator_update_output_alignment(dual_imu_estimator_t *estimator,
                                               bool *alignment_active)
 {
     bool switched = false;
+    bool tilt_alignment_active = false;
     if (!estimator->output_initialized) {
         memcpy(estimator->output_quaternion, lane_quaternion,
                sizeof(estimator->output_quaternion));
@@ -636,10 +931,13 @@ static void estimator_update_output_alignment(dual_imu_estimator_t *estimator,
                                       estimator->output_alignment);
         if (!estimator_quaternion_normalize(estimator->output_alignment))
             estimator_quaternion_identity(estimator->output_alignment);
+        tilt_alignment_active = estimator_output_alignment_has_tilt(
+            estimator->output_alignment);
     }
 
     if (!switched && estimator->output_initialized)
-        (void)estimator_decay_output_alignment(estimator, dt_s);
+        tilt_alignment_active =
+            estimator_decay_output_alignment(estimator, dt_s);
 
     float aligned[4];
     estimator_quaternion_multiply(estimator->output_alignment,
@@ -649,12 +947,8 @@ static void estimator_update_output_alignment(dual_imu_estimator_t *estimator,
         memcpy(estimator->output_quaternion, aligned, sizeof(aligned));
 
     estimator->previous_selected_lane = selected_lane;
-    if (alignment_active != NULL) {
-        *alignment_active =
-            (fabsf(estimator->output_alignment[1]) > 1.0e-7f) ||
-            (fabsf(estimator->output_alignment[2]) > 1.0e-7f) ||
-            (fabsf(estimator->output_alignment[3]) > 1.0e-7f);
-    }
+    if (alignment_active != NULL)
+        *alignment_active = tilt_alignment_active;
 }
 
 imu_preintegrator_result_t dual_imu_estimator_process_next(
@@ -915,12 +1209,18 @@ imu_preintegrator_result_t dual_imu_estimator_process_next(
         }
     }
 
-    output->stationary_candidate = !output->accel_inhibited &&
-                                   estimator_stationary_candidate(estimator, output);
-    const bool zaru_allowed = estimator->stationary_hint;
-    if (output->stationary_candidate && zaru_allowed) {
+    if (output->accel_inhibited) {
+        output->stationary_candidate = estimator_reject_stationary(
+            estimator, DUAL_IMU_STATIONARY_REJECT_INHIBITED);
+    } else {
+        output->stationary_candidate =
+            estimator_stationary_candidate(estimator, output);
+    }
+    if (output->stationary_candidate) {
         if (estimator->stationary_streak < UINT16_MAX)
             estimator->stationary_streak++;
+        if (estimator->stationary_streak > estimator->stationary_max_streak)
+            estimator->stationary_max_streak = estimator->stationary_streak;
     } else {
         estimator->stationary_streak = 0U;
         for (size_t lane = 0U; lane < DUAL_IMU_ESTIMATOR_LANE_COUNT; ++lane) {
@@ -928,14 +1228,30 @@ imu_preintegrator_result_t dual_imu_estimator_process_next(
                 estimator->zaru_accept_count[lane] = 0U;
         }
     }
+    output->stationary_last_reject_reason =
+        estimator->stationary_last_reject_reason;
+    memcpy(output->stationary_temporal_gyro_variance_rad2_s2,
+           estimator->stationary_temporal_gyro_variance_rad2_s2,
+           sizeof(output->stationary_temporal_gyro_variance_rad2_s2));
+    memcpy(output->stationary_temporal_accel_variance_m2_s4,
+           estimator->stationary_temporal_accel_variance_m2_s4,
+           sizeof(output->stationary_temporal_accel_variance_m2_s4));
+    output->stationary_streak = estimator->stationary_streak;
+    output->stationary_max_streak = estimator->stationary_max_streak;
+    const uint16_t required_stationary_windows = estimator->stationary_hint
+        ? estimator->config.stationary_hint_dwell_windows
+        : estimator->config.stationary_dwell_windows;
     output->stationary_confirmed =
-        estimator->stationary_streak >= estimator->config.stationary_dwell_windows;
-    if (output->stationary_confirmed && zaru_allowed) {
+        estimator->stationary_streak >= required_stationary_windows;
+    if (output->stationary_confirmed) {
         for (size_t lane = 0U; lane < DUAL_IMU_ESTIMATOR_LANE_COUNT; ++lane) {
             if (!estimator->lane_seeded[lane] ||
                 !windows[lane].gyro_valid ||
-                (estimator->hard_fault_flags[lane] != 0U))
+                (estimator->hard_fault_flags[lane] != 0U)) {
+                if (!estimator->lane_calibrated[lane])
+                    estimator->zaru_accept_count[lane] = 0U;
                 continue;
+            }
 
             const float variance =
                 estimator->config.zaru_rate_std_rad_s[lane] *
@@ -945,14 +1261,36 @@ imu_preintegrator_result_t dual_imu_estimator_process_next(
                 {0.0f, variance, 0.0f},
                 {0.0f, 0.0f, variance},
             };
-            output->zaru_result[lane] = attitude_mekf_update_zero_rate(
-                &estimator->mekf[lane], output->lane_rate_rad_s[lane], covariance);
-            if (output->zaru_result[lane] == ATTITUDE_MEKF_ZARU_ACCEPTED) {
-                if (estimator->zaru_accept_count[lane] < UINT16_MAX)
-                    estimator->zaru_accept_count[lane]++;
-                if (estimator->zaru_accept_count[lane] >=
-                    estimator->config.calibration_accept_windows)
-                    estimator->lane_calibrated[lane] = true;
+            float bounded_target_rad_s[3];
+            const float maximum_bias_correction_rad_s =
+                estimator->config.zaru_bias_slew_limit_rad_s2 * dt_s;
+            /* The dwell mean is the stationary pseudo-measurement; using the
+             * noisy 2.5 ms window here would make the 0.05 dps convergence
+             * criterion unattainable on the BMI lane. */
+            output->zaru_result[lane] =
+                attitude_mekf_update_zero_rate_bounded(
+                    &estimator->mekf[lane],
+                    estimator->stationary_gyro_mean_rad_s[lane],
+                    covariance,
+                    estimator->config.zaru_target_residual_limit_rad_s,
+                    maximum_bias_correction_rad_s,
+                    bounded_target_rad_s);
+            if (!estimator->lane_calibrated[lane] &&
+                (output->zaru_result[lane] == ATTITUDE_MEKF_ZARU_ACCEPTED)) {
+                float learned_bias_rad_s[3];
+                if (attitude_mekf_get_bias(&estimator->mekf[lane],
+                                           learned_bias_rad_s) &&
+                    (estimator_vector_distance(bounded_target_rad_s,
+                                               learned_bias_rad_s) <
+                     estimator->config.zaru_calibration_tolerance_rad_s)) {
+                    if (estimator->zaru_accept_count[lane] < UINT16_MAX)
+                        estimator->zaru_accept_count[lane]++;
+                    if (estimator->zaru_accept_count[lane] >=
+                        estimator->config.calibration_accept_windows)
+                        estimator->lane_calibrated[lane] = true;
+                } else {
+                    estimator->zaru_accept_count[lane] = 0U;
+                }
             } else if (!estimator->lane_calibrated[lane]) {
                 estimator->zaru_accept_count[lane] = 0U;
             }

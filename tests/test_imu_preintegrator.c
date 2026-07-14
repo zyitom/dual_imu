@@ -419,7 +419,8 @@ static void test_queue_overflow_is_visible_to_window(void)
     }
 
     const imu_gyro_sample_t overflow = {
-        .timestamp_us = 7000U,
+        .timestamp_us =
+            (uint64_t)IMU_PREINTEGRATOR_QUEUE_CAPACITY * 100U,
         .sequence = IMU_PREINTEGRATOR_QUEUE_CAPACITY,
         .gyro_rad_s = {0.0f, 0.0f, 0.1f},
         .source = IMU_SOURCE_ICM45686,

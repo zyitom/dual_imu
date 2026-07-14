@@ -22,6 +22,7 @@
 #include "usbd_cdc_if.h"
 
 /* USER CODE BEGIN INCLUDE */
+#include <string.h>
 
 /* USER CODE END INCLUDE */
 
@@ -94,6 +95,7 @@ uint8_t UserRxBufferFS[APP_RX_DATA_SIZE];
 uint8_t UserTxBufferFS[APP_TX_DATA_SIZE];
 
 /* USER CODE BEGIN PRIVATE_VARIABLES */
+static volatile uint16_t cdc_control_line_state;
 
 /* USER CODE END PRIVATE_VARIABLES */
 
@@ -152,6 +154,7 @@ USBD_CDC_ItfTypeDef USBD_Interface_fops_FS =
 static int8_t CDC_Init_FS(void)
 {
   /* USER CODE BEGIN 3 */
+  cdc_control_line_state = 0U;
   /* Set Application Buffers */
   USBD_CDC_SetTxBuffer(&hUsbDeviceFS, UserTxBufferFS, 0);
   USBD_CDC_SetRxBuffer(&hUsbDeviceFS, UserRxBufferFS);
@@ -166,6 +169,7 @@ static int8_t CDC_Init_FS(void)
 static int8_t CDC_DeInit_FS(void)
 {
   /* USER CODE BEGIN 4 */
+  cdc_control_line_state = 0U;
   return (USBD_OK);
   /* USER CODE END 4 */
 }
@@ -228,7 +232,12 @@ static int8_t CDC_Control_FS(uint8_t cmd, uint8_t* pbuf, uint16_t length)
     break;
 
     case CDC_SET_CONTROL_LINE_STATE:
-
+      if ((pbuf != NULL) && (length == 0U))
+      {
+        const USBD_SetupReqTypedef *request =
+            (const USBD_SetupReqTypedef *)pbuf;
+        cdc_control_line_state = request->wValue;
+      }
     break;
 
     case CDC_SEND_BREAK:
@@ -285,7 +294,8 @@ uint8_t CDC_Transmit_FS(uint8_t* Buf, uint16_t Len)
   const uint32_t primask = __get_PRIMASK();
 
   __disable_irq();
-  if ((hUsbDeviceFS.dev_state != USBD_STATE_CONFIGURED) ||
+  if ((Buf == NULL) || (Len == 0U) || (Len > sizeof(UserTxBufferFS)) ||
+      (hUsbDeviceFS.dev_state != USBD_STATE_CONFIGURED) ||
       (hUsbDeviceFS.pClassData == NULL))
   {
     result = USBD_FAIL;
@@ -301,7 +311,13 @@ uint8_t CDC_Transmit_FS(uint8_t* Buf, uint16_t Len)
     }
     else
     {
-      USBD_CDC_SetTxBuffer(&hUsbDeviceFS, Buf, Len);
+      /* The USB class keeps only a pointer until transfer completion. Copy into
+       * its owned buffer so callers may immediately reuse queue storage. */
+      if (Buf != UserTxBufferFS)
+      {
+        memcpy(UserTxBufferFS, Buf, Len);
+      }
+      USBD_CDC_SetTxBuffer(&hUsbDeviceFS, UserTxBufferFS, Len);
       result = USBD_CDC_TransmitPacket(&hUsbDeviceFS);
     }
   }
@@ -338,6 +354,11 @@ static int8_t CDC_TransmitCplt_FS(uint8_t *Buf, uint32_t *Len, uint8_t epnum)
 }
 
 /* USER CODE BEGIN PRIVATE_FUNCTIONS_IMPLEMENTATION */
+
+uint8_t CDC_IsPortOpen_FS(void)
+{
+  return ((cdc_control_line_state & 0x0001U) != 0U) ? 1U : 0U;
+}
 
 /* USER CODE END PRIVATE_FUNCTIONS_IMPLEMENTATION */
 

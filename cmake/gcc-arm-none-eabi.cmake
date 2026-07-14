@@ -33,14 +33,19 @@ set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -fdata-sections -ffunction-sections -f
 # set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fcyclomatic-complexity")
 
 set(CMAKE_C_FLAGS_DEBUG "-O0 -g3")
-set(CMAKE_C_FLAGS_RELEASE "-Os -g0")
+set(CMAKE_C_FLAGS_RELEASE "-O2 -g0")
 set(CMAKE_CXX_FLAGS_DEBUG "-O0 -g3")
-set(CMAKE_CXX_FLAGS_RELEASE "-Os -g0")
+set(CMAKE_CXX_FLAGS_RELEASE "-O2 -g0")
 
 set(CMAKE_CXX_FLAGS "${CMAKE_C_FLAGS} -fno-rtti -fno-exceptions -fno-threadsafe-statics")
 
+set(DUAL_IMU_LINKER_SCRIPT "${CMAKE_SOURCE_DIR}/linker/dual_imu_h743.ld")
+if(NOT EXISTS "${DUAL_IMU_LINKER_SCRIPT}")
+    message(FATAL_ERROR "Missing project-owned linker script: ${DUAL_IMU_LINKER_SCRIPT}")
+endif()
+
 set(CMAKE_EXE_LINKER_FLAGS "${TARGET_FLAGS}")
-set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -T \"${CMAKE_SOURCE_DIR}/STM32H743XX_FLASH.ld\"")
+set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -T \"${DUAL_IMU_LINKER_SCRIPT}\"")
 set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} --specs=nano.specs")
 set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,-Map=${CMAKE_PROJECT_NAME}.map -Wl,--gc-sections")
 set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,--print-memory-usage")

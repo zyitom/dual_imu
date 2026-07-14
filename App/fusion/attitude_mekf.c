@@ -1091,6 +1091,34 @@ attitude_mekf_accel_result_t attitude_mekf_update_accel(
                 (covariance_observation_transpose[row][1] *
                  inverse_innovation[1][column]);
         }
+    }
+
+    /* Gravity cannot observe a right attitude error or gyro bias parallel to
+     * its body-frame direction. Keep both gain blocks in the tangent plane so
+     * noise cannot inject either yaw or gravity-axis bias through covariance
+     * cross-correlation. The Joseph update below uses this same gain. */
+    for (size_t block = 0U;
+         block < ATTITUDE_MEKF_STATE_DIM;
+         block += ATTITUDE_MEKF_VECTOR_DIM)
+    {
+        for (size_t column = 0U; column < 2U; ++column)
+        {
+            float parallel_gain = 0.0f;
+            for (size_t axis = 0U; axis < ATTITUDE_MEKF_VECTOR_DIM; ++axis)
+            {
+                parallel_gain += predicted_direction[axis] *
+                                 gain[block + axis][column];
+            }
+            for (size_t axis = 0U; axis < ATTITUDE_MEKF_VECTOR_DIM; ++axis)
+            {
+                gain[block + axis][column] -=
+                    predicted_direction[axis] * parallel_gain;
+            }
+        }
+    }
+
+    for (size_t row = 0U; row < ATTITUDE_MEKF_STATE_DIM; ++row)
+    {
         correction[row] = (gain[row][0] * residual[0]) +
                           (gain[row][1] * residual[1]);
         if (!isfinite(correction[row]))
@@ -1227,11 +1255,15 @@ attitude_mekf_accel_result_t attitude_mekf_update_accel(
     return mekf_record_accel_result(filter, ATTITUDE_MEKF_ACCEL_ACCEPTED);
 }
 
-attitude_mekf_zaru_result_t attitude_mekf_update_zero_rate(
+static attitude_mekf_zaru_result_t mekf_update_zero_rate(
     attitude_mekf_t *filter,
     const float gyro_rad_s[ATTITUDE_MEKF_VECTOR_DIM],
     const float measurement_covariance[ATTITUDE_MEKF_VECTOR_DIM]
-                                      [ATTITUDE_MEKF_VECTOR_DIM])
+                                      [ATTITUDE_MEKF_VECTOR_DIM],
+    bool bounded,
+    float target_residual_limit_rad_s,
+    float max_bias_correction_rad_s,
+    float bounded_target_rad_s[ATTITUDE_MEKF_VECTOR_DIM])
 {
     if ((filter == NULL) || (!filter->initialized))
     {
@@ -1245,17 +1277,36 @@ attitude_mekf_zaru_result_t attitude_mekf_update_zero_rate(
         return mekf_record_zaru_result(filter, ATTITUDE_MEKF_ZARU_NUMERIC_FAILURE);
     }
     if ((!mekf_vector_is_finite(gyro_rad_s)) || (measurement_covariance == NULL) ||
-        (!mekf_matrix3_is_spd(measurement_covariance)))
+        (!mekf_matrix3_is_spd(measurement_covariance)) ||
+        (bounded &&
+         ((!isfinite(target_residual_limit_rad_s)) ||
+          (target_residual_limit_rad_s <= 0.0f) ||
+          (!isfinite(max_bias_correction_rad_s)) ||
+          (max_bias_correction_rad_s <= 0.0f))))
     {
         return mekf_record_zaru_result(filter,
                                        ATTITUDE_MEKF_ZARU_REJECTED_INVALID_INPUT);
+    }
+
+    float target_rad_s[ATTITUDE_MEKF_VECTOR_DIM];
+    for (size_t axis = 0U; axis < ATTITUDE_MEKF_VECTOR_DIM; ++axis)
+    {
+        target_rad_s[axis] = bounded
+                                 ? fmaxf(-target_residual_limit_rad_s,
+                                         fminf(target_residual_limit_rad_s,
+                                               gyro_rad_s[axis]))
+                                 : gyro_rad_s[axis];
+    }
+    if (bounded_target_rad_s != NULL)
+    {
+        memcpy(bounded_target_rad_s, target_rad_s, sizeof(target_rad_s));
     }
 
     float residual[ATTITUDE_MEKF_VECTOR_DIM];
     float innovation_covariance[ATTITUDE_MEKF_VECTOR_DIM][ATTITUDE_MEKF_VECTOR_DIM];
     for (size_t row = 0U; row < ATTITUDE_MEKF_VECTOR_DIM; ++row)
     {
-        residual[row] = gyro_rad_s[row] - filter->gyro_bias_rad_s[row];
+        residual[row] = target_rad_s[row] - filter->gyro_bias_rad_s[row];
         for (size_t column = 0U; column < ATTITUDE_MEKF_VECTOR_DIM; ++column)
         {
             innovation_covariance[row][column] =
@@ -1321,6 +1372,40 @@ attitude_mekf_zaru_result_t attitude_mekf_update_zero_rate(
         if (!isfinite(correction[row]))
         {
             return mekf_record_zaru_result(filter, ATTITUDE_MEKF_ZARU_NUMERIC_FAILURE);
+        }
+    }
+
+    if (bounded)
+    {
+        float bias_correction_sq = 0.0f;
+        for (size_t axis = 0U; axis < ATTITUDE_MEKF_VECTOR_DIM; ++axis)
+        {
+            const float bias_correction =
+                correction[axis + ATTITUDE_MEKF_VECTOR_DIM];
+            bias_correction_sq += bias_correction * bias_correction;
+        }
+        if (!isfinite(bias_correction_sq))
+        {
+            return mekf_record_zaru_result(filter,
+                                           ATTITUDE_MEKF_ZARU_NUMERIC_FAILURE);
+        }
+
+        const float bias_correction_norm = sqrtf(fmaxf(0.0f,
+                                                       bias_correction_sq));
+        if (bias_correction_norm > max_bias_correction_rad_s)
+        {
+            const float gain_scale =
+                max_bias_correction_rad_s / bias_correction_norm;
+            for (size_t row = 0U; row < ATTITUDE_MEKF_STATE_DIM; ++row)
+            {
+                correction[row] *= gain_scale;
+                for (size_t column = 0U;
+                     column < ATTITUDE_MEKF_VECTOR_DIM;
+                     ++column)
+                {
+                    gain[row][column] *= gain_scale;
+                }
+            }
         }
     }
 
@@ -1446,6 +1531,31 @@ attitude_mekf_zaru_result_t attitude_mekf_update_zero_rate(
     memcpy(filter->gyro_bias_rad_s, corrected_bias, sizeof(filter->gyro_bias_rad_s));
     memcpy(filter->covariance, corrected_covariance, sizeof(filter->covariance));
     return mekf_record_zaru_result(filter, ATTITUDE_MEKF_ZARU_ACCEPTED);
+}
+
+attitude_mekf_zaru_result_t attitude_mekf_update_zero_rate(
+    attitude_mekf_t *filter,
+    const float gyro_rad_s[ATTITUDE_MEKF_VECTOR_DIM],
+    const float measurement_covariance[ATTITUDE_MEKF_VECTOR_DIM]
+                                      [ATTITUDE_MEKF_VECTOR_DIM])
+{
+    return mekf_update_zero_rate(filter, gyro_rad_s, measurement_covariance,
+                                 false, 0.0f, 0.0f, NULL);
+}
+
+attitude_mekf_zaru_result_t attitude_mekf_update_zero_rate_bounded(
+    attitude_mekf_t *filter,
+    const float gyro_rad_s[ATTITUDE_MEKF_VECTOR_DIM],
+    const float measurement_covariance[ATTITUDE_MEKF_VECTOR_DIM]
+                                      [ATTITUDE_MEKF_VECTOR_DIM],
+    float target_residual_limit_rad_s,
+    float max_bias_correction_rad_s,
+    float bounded_target_rad_s[ATTITUDE_MEKF_VECTOR_DIM])
+{
+    return mekf_update_zero_rate(filter, gyro_rad_s, measurement_covariance,
+                                 true, target_residual_limit_rad_s,
+                                 max_bias_correction_rad_s,
+                                 bounded_target_rad_s);
 }
 
 bool attitude_mekf_get_quaternion(const attitude_mekf_t *filter, float quaternion[4])

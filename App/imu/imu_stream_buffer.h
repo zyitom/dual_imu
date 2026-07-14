@@ -6,7 +6,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-#define IMU_TIMESTAMP_QUEUE_CAPACITY 32U
+#define IMU_TIMESTAMP_QUEUE_CAPACITY 128U
 #define IMU_SAMPLE_BUFFER_CAPACITY   64U
 
 typedef struct
@@ -16,6 +16,7 @@ typedef struct
     volatile uint32_t write_index;
     volatile uint32_t read_index;
     volatile uint32_t dropped_count;
+    volatile uint32_t discard_generation;
 } imu_timestamp_queue_t;
 
 typedef struct
@@ -35,6 +36,7 @@ typedef struct
 } imu_gyro_buffer_t;
 
 void imu_timestamp_queue_reset(imu_timestamp_queue_t *queue);
+void imu_timestamp_queue_discard(imu_timestamp_queue_t *queue);
 bool imu_timestamp_queue_push_isr(imu_timestamp_queue_t *queue, uint64_t timestamp_us);
 bool imu_timestamp_queue_push_event_isr(imu_timestamp_queue_t *queue,
                                         uint64_t timestamp_us,
@@ -44,6 +46,13 @@ bool imu_timestamp_queue_pop(imu_timestamp_queue_t *queue, uint64_t *timestamp_u
 bool imu_timestamp_queue_pop_event(imu_timestamp_queue_t *queue,
                                    uint64_t *timestamp_us,
                                    uint32_t *sequence);
+uint32_t imu_timestamp_queue_count(const imu_timestamp_queue_t *queue);
+uint32_t imu_timestamp_queue_discard_generation(
+    const imu_timestamp_queue_t *queue);
+bool imu_timestamp_queue_pop_batch(imu_timestamp_queue_t *queue,
+                                   uint64_t *timestamps_us,
+                                   uint32_t *sequences,
+                                   uint32_t count);
 uint32_t imu_timestamp_queue_dropped(const imu_timestamp_queue_t *queue);
 
 void imu_accel_buffer_reset(imu_accel_buffer_t *buffer);

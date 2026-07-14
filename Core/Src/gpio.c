@@ -95,11 +95,17 @@ void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(USB_Detect_GPIO_Port, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : ICM45686_1_GDR_Pin ICM45686_1_ADR_Pin */
-  GPIO_InitStruct.Pin = ICM45686_1_GDR_Pin|ICM45686_1_ADR_Pin;
+  /*Configure GPIO pin : ICM45686_1_GDR_Pin */
+  GPIO_InitStruct.Pin = ICM45686_1_GDR_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(ICM45686_1_GDR_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : ICM45686_1_ADR_Pin */
+  GPIO_InitStruct.Pin = ICM45686_1_ADR_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
-  HAL_GPIO_Init(GPIOE, &GPIO_InitStruct);
+  HAL_GPIO_Init(ICM45686_1_ADR_GPIO_Port, &GPIO_InitStruct);
 
   /*Configure GPIO pin : Baro_I2C1_DR_Pin */
   GPIO_InitStruct.Pin = Baro_I2C1_DR_Pin;
@@ -112,12 +118,6 @@ void MX_GPIO_Init(void)
   GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
-
-  /*Configure GPIO pins : BMI088_0_ADR_Pin BMI088_0_GDR_Pin */
-  GPIO_InitStruct.Pin = BMI088_0_ADR_Pin|BMI088_0_GDR_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
   /*Configure GPIO pin : AUX_PA4_Pin */
   GPIO_InitStruct.Pin = AUX_PA4_Pin;
@@ -157,16 +157,7 @@ void MX_GPIO_Init(void)
   HAL_SYSCFG_AnalogSwitchConfig(SYSCFG_SWITCH_PC2, SYSCFG_SWITCH_PC2_CLOSE);
 
   /* EXTI interrupt init*/
-  HAL_NVIC_SetPriority(EXTI0_IRQn, 5, 0);
-  HAL_NVIC_EnableIRQ(EXTI0_IRQn);
-
-  HAL_NVIC_SetPriority(EXTI1_IRQn, 5, 0);
-  HAL_NVIC_EnableIRQ(EXTI1_IRQn);
-
-  HAL_NVIC_SetPriority(EXTI3_IRQn, 5, 0);
-  HAL_NVIC_EnableIRQ(EXTI3_IRQn);
-
-  HAL_NVIC_SetPriority(EXTI4_IRQn, 5, 0);
+  HAL_NVIC_SetPriority(EXTI4_IRQn, 2, 0);
   HAL_NVIC_EnableIRQ(EXTI4_IRQn);
 
 }

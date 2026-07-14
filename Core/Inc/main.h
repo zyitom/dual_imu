@@ -71,7 +71,6 @@ void Error_Handler(void);
 #define USB_Detect_GPIO_Port GPIOA
 #define ICM45686_1_GDR_Pin GPIO_PIN_3
 #define ICM45686_1_GDR_GPIO_Port GPIOE
-#define ICM45686_1_GDR_EXTI_IRQn EXTI3_IRQn
 #define Baro_I2C1_SCL_Pin GPIO_PIN_6
 #define Baro_I2C1_SCL_GPIO_Port GPIOB
 #define ICM45686_1_ADR_Pin GPIO_PIN_4
@@ -95,7 +94,6 @@ void Error_Handler(void);
 #define FRAM_SPI2_MOSI_GPIO_Port GPIOC
 #define BMI088_0_ADR_Pin GPIO_PIN_0
 #define BMI088_0_ADR_GPIO_Port GPIOA
-#define BMI088_0_ADR_EXTI_IRQn EXTI0_IRQn
 #define AUX_PA4_Pin GPIO_PIN_4
 #define AUX_PA4_GPIO_Port GPIOA
 #define ADC1_INP4_BATT_V_Pin GPIO_PIN_4
@@ -110,7 +108,6 @@ void Error_Handler(void);
 #define LED_BLUE_GPIO_Port GPIOB
 #define BMI088_0_GDR_Pin GPIO_PIN_1
 #define BMI088_0_GDR_GPIO_Port GPIOA
-#define BMI088_0_GDR_EXTI_IRQn EXTI1_IRQn
 #define BMI088_0_SCK_Pin GPIO_PIN_5
 #define BMI088_0_SCK_GPIO_Port GPIOA
 #define ADC2_INP8_BATT_I_Pin GPIO_PIN_5

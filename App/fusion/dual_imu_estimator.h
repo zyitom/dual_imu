@@ -22,6 +22,21 @@ typedef enum
     DUAL_IMU_ESTIMATOR_LANE_NONE = 0xFF
 } dual_imu_estimator_lane_t;
 
+typedef enum
+{
+    DUAL_IMU_STATIONARY_REJECT_NONE = 0,
+    DUAL_IMU_STATIONARY_REJECT_INVALID_OR_FAULT,
+    DUAL_IMU_STATIONARY_REJECT_INSTANT_RATE,
+    DUAL_IMU_STATIONARY_REJECT_ACCEL_NORM,
+    DUAL_IMU_STATIONARY_REJECT_WINDOW_GYRO_VARIANCE,
+    DUAL_IMU_STATIONARY_REJECT_ACCEL_PAIR,
+    DUAL_IMU_STATIONARY_REJECT_TEMPORAL_VARIANCE,
+    DUAL_IMU_STATIONARY_REJECT_MEAN_RATE,
+    DUAL_IMU_STATIONARY_REJECT_GRAVITY_DIRECTION,
+    DUAL_IMU_STATIONARY_REJECT_INHIBITED,
+    DUAL_IMU_STATIONARY_REJECT_COUNT
+} dual_imu_stationary_reject_reason_t;
+
 typedef struct
 {
     imu_preintegrator_config_t preintegrator[DUAL_IMU_ESTIMATOR_LANE_COUNT];
@@ -38,11 +53,24 @@ typedef struct
     float rate_floor_std_rad_s;
     float output_alignment_slew_rad_s;
     float zaru_rate_std_rad_s[DUAL_IMU_ESTIMATOR_LANE_COUNT];
+    float zaru_target_residual_limit_rad_s;
+    float zaru_bias_slew_limit_rad_s2;
+    float zaru_calibration_tolerance_rad_s;
 
     float stationary_gyro_limit_rad_s;
+    /* Per-axis variance limit inside one preintegration window. */
+    float stationary_gyro_variance_limit_rad2_s2;
+    /* Per-lane total 3-D sample variance of window means over the dwell. */
+    float stationary_gyro_temporal_variance_limit_rad2_s2
+        [DUAL_IMU_ESTIMATOR_LANE_COUNT];
     float stationary_accel_norm_tolerance_mps2;
     float stationary_accel_pair_limit_mps2;
+    /* Total 3-D sample variance of accel vectors over the full dwell. */
+    float stationary_accel_temporal_variance_limit_m2_s4;
+    /* Chord distance between unit specific-force directions. */
+    float stationary_accel_direction_limit;
     uint16_t stationary_dwell_windows;
+    uint16_t stationary_hint_dwell_windows;
     uint16_t calibration_accept_windows;
     uint16_t accel_fault_enter_windows;
     uint16_t accel_fault_recovery_windows;
@@ -72,6 +100,11 @@ typedef struct
     float angular_rate_rad_s[3];
     float angular_accel_rad_s2[3];
     float accel_pair_residual_mps2;
+    float stationary_temporal_gyro_variance_rad2_s2[DUAL_IMU_ESTIMATOR_LANE_COUNT];
+    float stationary_temporal_accel_variance_m2_s4[DUAL_IMU_ESTIMATOR_LANE_COUNT];
+    dual_imu_stationary_reject_reason_t stationary_last_reject_reason;
+    uint16_t stationary_streak;
+    uint16_t stationary_max_streak;
     bool lane_seeded[DUAL_IMU_ESTIMATOR_LANE_COUNT];
     bool lane_calibrated[DUAL_IMU_ESTIMATOR_LANE_COUNT];
     bool lane_aided_propagation[DUAL_IMU_ESTIMATOR_LANE_COUNT];
@@ -96,6 +129,18 @@ typedef struct
     uint16_t accel_bad_streak[DUAL_IMU_ESTIMATOR_LANE_COUNT];
     uint16_t accel_good_streak[DUAL_IMU_ESTIMATOR_LANE_COUNT];
     uint16_t stationary_streak;
+    uint16_t stationary_max_streak;
+    dual_imu_stationary_reject_reason_t stationary_last_reject_reason;
+    uint32_t stationary_reject_count[DUAL_IMU_STATIONARY_REJECT_COUNT];
+    float stationary_temporal_gyro_variance_rad2_s2[DUAL_IMU_ESTIMATOR_LANE_COUNT];
+    float stationary_temporal_accel_variance_m2_s4[DUAL_IMU_ESTIMATOR_LANE_COUNT];
+    uint32_t stationary_statistics_count;
+    /* Frozen normalized accel mean after the stationary statistics warmup. */
+    float stationary_gravity_reference[DUAL_IMU_ESTIMATOR_LANE_COUNT][3];
+    float stationary_gyro_mean_rad_s[DUAL_IMU_ESTIMATOR_LANE_COUNT][3];
+    float stationary_gyro_m2_rad2_s2[DUAL_IMU_ESTIMATOR_LANE_COUNT][3];
+    float stationary_accel_mean_mps2[DUAL_IMU_ESTIMATOR_LANE_COUNT][3];
+    float stationary_accel_m2_m2_s4[DUAL_IMU_ESTIMATOR_LANE_COUNT][3];
     uint64_t accel_inhibit_until_us;
     uint64_t windows_processed;
     float output_quaternion[4];
@@ -105,6 +150,7 @@ typedef struct
     bool lane_seeded[DUAL_IMU_ESTIMATOR_LANE_COUNT];
     bool lane_calibrated[DUAL_IMU_ESTIMATOR_LANE_COUNT];
     bool lane_accel_fault[DUAL_IMU_ESTIMATOR_LANE_COUNT];
+    bool stationary_gravity_reference_valid[DUAL_IMU_ESTIMATOR_LANE_COUNT];
     bool stationary_hint;
     bool output_initialized;
     bool initialized;

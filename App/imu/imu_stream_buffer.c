@@ -20,6 +20,17 @@ void imu_timestamp_queue_reset(imu_timestamp_queue_t *queue)
     }
 }
 
+void imu_timestamp_queue_discard(imu_timestamp_queue_t *queue)
+{
+    if (queue == NULL)
+        return;
+
+    queue->read_index = queue->write_index;
+    __DMB();
+    queue->discard_generation++;
+    __DMB();
+}
+
 bool imu_timestamp_queue_push_isr(imu_timestamp_queue_t *queue, uint64_t timestamp_us)
 {
     return imu_timestamp_queue_push_event_isr(queue, timestamp_us, 0U);
@@ -92,6 +103,41 @@ bool imu_timestamp_queue_peek(const imu_timestamp_queue_t *queue, uint64_t *time
 
     __DMB();
     *timestamp_us = queue->entries[read];
+    return true;
+}
+
+uint32_t imu_timestamp_queue_count(const imu_timestamp_queue_t *queue)
+{
+    if (queue == NULL)
+        return 0U;
+
+    return (queue->write_index - queue->read_index) & TIMESTAMP_QUEUE_MASK;
+}
+
+uint32_t imu_timestamp_queue_discard_generation(
+    const imu_timestamp_queue_t *queue)
+{
+    return (queue != NULL) ? queue->discard_generation : 0U;
+}
+
+bool imu_timestamp_queue_pop_batch(imu_timestamp_queue_t *queue,
+                                   uint64_t *timestamps_us,
+                                   uint32_t *sequences,
+                                   uint32_t count)
+{
+    if ((queue == NULL) || (timestamps_us == NULL) || (sequences == NULL) ||
+        (count == 0U) || (imu_timestamp_queue_count(queue) < count))
+        return false;
+
+    uint32_t read = queue->read_index;
+    __DMB();
+    for (uint32_t index = 0U; index < count; ++index)
+    {
+        timestamps_us[index] = queue->entries[read];
+        sequences[index] = queue->sequences[read];
+        read = (read + 1U) & TIMESTAMP_QUEUE_MASK;
+    }
+    queue->read_index = read;
     return true;
 }
 

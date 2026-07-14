@@ -34,6 +34,15 @@ enable_language(C ASM)
 # Create an executable object type
 add_executable(${CMAKE_PROJECT_NAME})
 
+# The IMU DMA staging addresses must remain reserved even after CubeMX
+# regenerates its default linker script. The toolchain must use our layout.
+if(NOT CMAKE_EXE_LINKER_FLAGS MATCHES "dual_imu_h743\\.ld")
+    message(FATAL_ERROR
+        "The project-owned dual_imu_h743.ld linker script is not active")
+endif()
+set_property(TARGET ${CMAKE_PROJECT_NAME} APPEND PROPERTY
+    LINK_DEPENDS "${DUAL_IMU_LINKER_SCRIPT}")
+
 # Add STM32CubeMX generated sources
 add_subdirectory(cmake/stm32cubemx)
 
@@ -48,13 +57,18 @@ set(APPLICATION_SOURCES
     App/imu/bmi088.c
     App/imu/icm45686.c
     App/imu/imu_calibration.c
+    App/imu/imu_clock_sync.c
     App/imu/imu_geometry.c
+    App/imu/imu_spi_dma.c
     App/imu/imu_stream_buffer.c
     App/imu/imu_time.c
     App/fusion/attitude_mekf.c
     App/fusion/dual_imu_estimator.c
+    App/fusion/fast_attitude_predictor.c
     App/fusion/imu_preintegrator.c
     App/fusion/imu_selector.c
+    App/protocol/hi91_frame.c
+    App/protocol/dual_imu_usb_stream.c
 )
 
 # Add sources to executable
