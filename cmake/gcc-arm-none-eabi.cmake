@@ -39,7 +39,12 @@ set(CMAKE_CXX_FLAGS_RELEASE "-O2 -g0")
 
 set(CMAKE_CXX_FLAGS "${CMAKE_C_FLAGS} -fno-rtti -fno-exceptions -fno-threadsafe-statics")
 
-set(DUAL_IMU_LINKER_SCRIPT "${CMAKE_SOURCE_DIR}/linker/dual_imu_h743.ld")
+# CMAKE_SOURCE_DIR points at CMake's scratch project during compiler probes.
+# Resolve project-owned files from this toolchain file so clean configure works.
+get_filename_component(DUAL_IMU_PROJECT_ROOT
+    "${CMAKE_CURRENT_LIST_DIR}/.." ABSOLUTE)
+set(DUAL_IMU_LINKER_SCRIPT
+    "${DUAL_IMU_PROJECT_ROOT}/linker/dual_imu_h743.ld")
 if(NOT EXISTS "${DUAL_IMU_LINKER_SCRIPT}")
     message(FATAL_ERROR "Missing project-owned linker script: ${DUAL_IMU_LINKER_SCRIPT}")
 endif()

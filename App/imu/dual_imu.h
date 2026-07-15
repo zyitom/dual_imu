@@ -3,6 +3,7 @@
 
 #include "imu_types.h"
 #include "imu_calibration.h"
+#include "imu_motion_guard.h"
 #include "imu_selector.h"
 #include "fast_attitude_predictor.h"
 
@@ -125,6 +126,8 @@ typedef struct
     uint32_t lane_zaru_accept_count[IMU_SOURCE_COUNT];
     bool stationary_candidate;
     bool stationary_confirmed;
+    bool stationary_single_lane;
+    uint8_t stationary_lane_mask;
     uint8_t stationary_last_reject_reason;
     uint16_t stationary_streak;
     uint16_t stationary_max_streak;
@@ -132,6 +135,39 @@ typedef struct
     float stationary_temporal_accel_variance_m2_s4[IMU_SOURCE_COUNT];
     bool stationary_hint_active;
     bool accel_update_inhibited;
+    bool rotation_unobserved;
+    bool heading_continuity_lost;
+    uint64_t heading_continuity_lost_timestamp_us;
+    uint64_t estimator_assessed_through_us;
+    bool attitude_aiding_stale;
+    bool attitude_converged;
+    bool post_impact_reacquire_active;
+    uint32_t post_impact_episode_count;
+    uint32_t post_impact_reacquire_count;
+    uint32_t motion_guard_common_impact_count;
+    uint32_t motion_guard_accel_saturation_count[IMU_SOURCE_COUNT];
+    uint32_t motion_guard_gyro_saturation_count[IMU_SOURCE_COUNT];
+    uint32_t motion_guard_accel_subrange_candidate_count[IMU_SOURCE_COUNT];
+    uint32_t motion_guard_accel_subrange_severe_count[IMU_SOURCE_COUNT];
+    uint32_t motion_guard_accel_subrange_common_count;
+    uint32_t motion_guard_accel_disturbance_episode_count;
+    uint32_t motion_guard_accel_disturbance_extension_count;
+    uint64_t motion_guard_last_accel_saturation_us;
+    uint64_t motion_guard_last_gyro_saturation_us;
+    uint64_t motion_guard_last_accel_disturbance_us;
+    imu_motion_guard_saturation_window_t
+        motion_guard_accel_saturation_history
+            [IMU_MOTION_GUARD_SATURATION_HISTORY_COUNT];
+    imu_motion_guard_saturation_window_t
+        motion_guard_gyro_saturation_history
+            [IMU_MOTION_GUARD_SATURATION_HISTORY_COUNT];
+    uint64_t motion_guard_last_impact_us;
+    uint8_t motion_guard_gyro_hard_fault_mask;
+    bool motion_guard_accel_saturation_seen;
+    bool motion_guard_gyro_saturation_seen;
+    bool motion_guard_accel_disturbance_valid;
+    bool motion_guard_accel_disturbance_active;
+    bool motion_guard_gyro_latch_suppressed;
     bool fused_accel_valid;
     bool selection_changed;
     bool alignment_blend_active;
@@ -145,6 +181,8 @@ typedef struct
     uint32_t bmi088_gyro_capture_overrun_count;
     bool bmi088_hardware_timestamp_enabled;
     bool custom_calibration_loaded[IMU_SOURCE_COUNT];
+    imu_calibration_diagnostics_t calibration_diagnostics[IMU_SOURCE_COUNT];
+    bool temperature_stale[IMU_SOURCE_COUNT];
     uint32_t bmi088_accel_event_drop_count;
     uint32_t bmi088_gyro_event_drop_count;
     uint32_t icm45686_event_drop_count;
@@ -155,6 +193,8 @@ typedef struct
     uint32_t bmi088_accel_fifo_batch_count;
     uint32_t bmi088_gyro_fifo_batch_count;
     uint32_t bmi088_fifo_dma_error_count;
+    uint32_t bmi088_temperature_read_count;
+    uint32_t bmi088_temperature_read_error_count;
     uint32_t bmi088_accel_fifo_length_read_count;
     uint32_t bmi088_accel_fifo_empty_length_count;
     uint32_t bmi088_accel_timeline_reset_count;
@@ -162,6 +202,13 @@ typedef struct
     uint32_t bmi088_gyro_capture_queue_overflow_count;
     uint32_t bmi088_gyro_capture_mismatch_reason;
     uint32_t bmi088_gyro_warmup_discard_count;
+    uint32_t bmi088_gyro_recovery_attempt_count;
+    uint32_t bmi088_gyro_recovery_success_count;
+    uint32_t bmi088_gyro_recovery_failure_count;
+    uint32_t bmi088_gyro_last_recovery_reason;
+    uint8_t bmi088_gyro_last_recovery_result;
+    bool bmi088_gyro_recovery_pending;
+    bool bmi088_gyro_recovery_warmup;
     bool bmi088_gyro_capture_sync_fault;
     uint16_t bmi088_accel_fifo_last_bytes;
     uint16_t bmi088_accel_fifo_peak_bytes;
@@ -175,6 +222,7 @@ typedef struct
     bool bmi088_accel_snapshot_valid;
     uint32_t icm45686_fifo_batch_count;
     uint32_t icm45686_fifo_dma_error_count;
+    uint32_t icm45686_temperature_invalid_frame_count;
     bool bmi088_fifo_clock_sync_valid;
     bool icm45686_fifo_clock_sync_valid;
     uint32_t fifo_clock_anchor_accepted_count[IMU_SOURCE_COUNT];
@@ -209,6 +257,12 @@ bool dual_imu_set_calibration(imu_source_t source,
                               const imu_calibration_t *calibration);
 bool dual_imu_get_calibration(imu_source_t source,
                               imu_calibration_t *calibration);
+/* Enabling is pre-stream only; disabling is always allowed as a safe fallback. */
+bool dual_imu_set_temperature_compensation_enabled(imu_source_t source,
+                                                   bool enabled);
+/* Enabling is qualification-only and must happen before the first stream read. */
+bool dual_imu_set_gyro_g_sensitivity_enabled(imu_source_t source,
+                                            bool enabled);
 bool dual_imu_pop_accel(imu_source_t source, imu_accel_sample_t *sample);
 bool dual_imu_pop_gyro(imu_source_t source, imu_gyro_sample_t *sample);
 const dual_imu_state_t *dual_imu_get_state(void);

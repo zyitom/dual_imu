@@ -5,6 +5,10 @@
 #include "fast_attitude_predictor.h"
 #include "icm45686.h"
 #include "imu_calibration.h"
+#if IMU_CALIBRATION_G_SENSITIVITY_BUILD_ENABLE == 1
+#include "imu_causal_accel_history.h"
+#endif
+#include "imu_motion_guard.h"
 #include "imu_spi_dma.h"
 #include "imu_stream_buffer.h"
 #include "imu_time.h"
@@ -30,9 +34,13 @@
     (IMU_ATTITUDE_OUTPUT_QUEUE_CAPACITY - 1U)
 #define IMU_MAX_IMPACT_INHIBIT_US       1000000U
 #define IMU_ISOLATION_HINT_TTL_US        100000U
+#define IMU_BMI_GYRO_RECOVERY_DELAY_US     20000U
+#define IMU_BMI_GYRO_RECOVERY_BUSY_RETRY_US  1000U
+#define IMU_BMI_GYRO_RECOVERY_RETRY_US   1000000U
 #define IMU_STREAM_ACCEL                     0U
 #define IMU_STREAM_GYRO                      1U
 #define IMU_STREAM_COUNT                     2U
+#define IMU_G_SENSITIVITY_ACCEL_MAX_GAP_US 1000U
 
 /* Replace with P2 swept-sine/encoder measurements; zero keeps raw DRDY time. */
 #ifndef BMI088_ACCEL_PIPELINE_DELAY_US
@@ -71,12 +79,25 @@ typedef struct
     bool has_previous_gyro;
 } sample_monitor_t;
 
+typedef struct
+{
+    uint64_t start_us;
+    uint64_t end_us;
+    bool valid;
+} motion_guard_submitted_interval_t;
+
 static dual_imu_state_t state;
 static dual_imu_estimator_t estimator;
 static dual_imu_estimator_output_t estimator_output;
 static fast_attitude_predictor_t fast_predictor;
+static fast_attitude_snapshot_t fast_snapshot_buffers[2];
+static volatile uint32_t fast_snapshot_buffer_index;
+static imu_motion_guard_saturation_snapshot_t
+    motion_guard_saturation_snapshot_buffers[2];
+static volatile uint32_t motion_guard_saturation_snapshot_buffer_index;
 static dual_imu_attitude_output_t fast_output_buffers[2];
 static volatile uint32_t fast_output_buffer_index;
+static volatile uint32_t fast_output_publish_generation;
 static dual_imu_attitude_output_t
     fast_output_queue[IMU_ATTITUDE_OUTPUT_QUEUE_CAPACITY];
 static volatile uint32_t fast_output_queue_head;
@@ -90,7 +111,7 @@ static imu_accel_buffer_t accel_buffers[IMU_SOURCE_COUNT];
 static imu_gyro_buffer_t gyro_buffers[IMU_SOURCE_COUNT];
 static uint32_t bmi_combined_sequence;
 static uint64_t init_time_us;
-static uint8_t read_error_streak[IMU_SOURCE_COUNT][IMU_STREAM_COUNT];
+static imu_motion_guard_t motion_guard;
 static uint64_t estimator_stream_timestamp_us[IMU_SOURCE_COUNT][IMU_STREAM_COUNT];
 static uint32_t coalesced_event_count[IMU_SOURCE_COUNT][IMU_STREAM_COUNT];
 static uint32_t published_stream_sequence[IMU_SOURCE_COUNT][IMU_STREAM_COUNT];
@@ -99,17 +120,77 @@ static uint32_t successful_stream_read_count[IMU_SOURCE_COUNT][IMU_STREAM_COUNT]
 static uint32_t maximum_irq_to_read_us[IMU_SOURCE_COUNT][IMU_STREAM_COUNT];
 static uint32_t capture_overrun_accounted_count[2];
 static uint32_t capture_overrun_reported_count[2];
-static bool bmi_capture_accepting;
+static volatile bool bmi_capture_accepting;
+static volatile bool bmi_gyro_capture_accepting;
+static bool bmi_gyro_recovery_scheduled;
+static uint64_t bmi_gyro_recovery_not_before_us;
 static uint64_t isolation_hint_expires_us;
 static bool estimator_initialized;
 static bool fast_predictor_initialized;
+static uint64_t fast_predictor_last_impact_us;
+static bool fast_predictor_impact_seen;
+static motion_guard_submitted_interval_t submitted_common_impact_interval;
+static motion_guard_submitted_interval_t submitted_accel_disturbance_interval;
 static uint32_t fast_output_sequence;
 static uint32_t fast_tick_missed_compare_count;
 static uint32_t fast_tick_dropped_count;
+#if IMU_CALIBRATION_G_SENSITIVITY_BUILD_ENABLE == 1
+static imu_causal_accel_history_t
+    g_sensitivity_accel_history[IMU_SOURCE_COUNT];
+#endif
 
 _Static_assert((IMU_ATTITUDE_OUTPUT_QUEUE_CAPACITY &
                 IMU_ATTITUDE_OUTPUT_QUEUE_MASK) == 0U,
                "attitude output queue capacity must be a power of two");
+
+static void publish_fast_snapshot(void)
+{
+    const uint32_t next_index = fast_snapshot_buffer_index ^ 1U;
+    (void)fast_attitude_predictor_export_snapshot(
+        &fast_predictor, &fast_snapshot_buffers[next_index]);
+    __DMB();
+    fast_snapshot_buffer_index = next_index;
+    __DMB();
+}
+
+static void publish_motion_guard_saturation_snapshot(void)
+{
+    const uint32_t next_index =
+        motion_guard_saturation_snapshot_buffer_index ^ 1U;
+    (void)imu_motion_guard_export_saturation_snapshot(
+        &motion_guard,
+        &motion_guard_saturation_snapshot_buffers[next_index]);
+    __DMB();
+    motion_guard_saturation_snapshot_buffer_index = next_index;
+    __DMB();
+}
+
+static void invalidate_fast_predictor_for_impact(uint64_t event_timestamp_us)
+{
+    if (!fast_predictor_initialized ||
+        (fast_predictor_impact_seen &&
+         (event_timestamp_us <= fast_predictor_last_impact_us))) {
+        return;
+    }
+
+    fast_predictor_last_impact_us = event_timestamp_us;
+    fast_predictor_impact_seen = true;
+    fast_attitude_predictor_invalidate_anchor(&fast_predictor);
+    publish_fast_snapshot();
+}
+
+static void record_public_heading_continuity_loss(uint64_t event_timestamp_us)
+{
+    if (event_timestamp_us == 0U)
+        return;
+
+    if (!state.heading_continuity_lost ||
+        (state.heading_continuity_lost_timestamp_us == 0U) ||
+        (event_timestamp_us < state.heading_continuity_lost_timestamp_us)) {
+        state.heading_continuity_lost_timestamp_us = event_timestamp_us;
+    }
+    state.heading_continuity_lost = true;
+}
 
 static void record_irq_event_isr(irq_event_t *event,
                                  uint64_t timestamp_us,
@@ -155,6 +236,33 @@ static void reset_irq_event(irq_event_t *event)
     __set_PRIMASK(primask);
 }
 
+static bool reset_bmi_gyro_capture_boundary(void)
+{
+    const uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    bmi_gyro_capture_accepting = false;
+    __DMB();
+    imu_timestamp_queue_reset(&bmi_gyro_irq.timestamps);
+    bmi_gyro_irq.count = 0U;
+    bmi_gyro_irq.timestamp_us = 0U;
+    capture_overrun_accounted_count[1] = 0U;
+    capture_overrun_reported_count[1] = 0U;
+    const bool reset = imu_time_capture_reset_channel(2U);
+    __DMB();
+    __set_PRIMASK(primask);
+    return reset;
+}
+
+static void set_bmi_gyro_capture_accepting(bool accepting)
+{
+    const uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    __DMB();
+    bmi_gyro_capture_accepting = accepting;
+    __DMB();
+    __set_PRIMASK(primask);
+}
+
 static uint64_t compensate_pipeline_delay(uint64_t timestamp_us, uint32_t delay_us)
 {
     return (timestamp_us > delay_us) ? (timestamp_us - delay_us) : 0U;
@@ -168,8 +276,7 @@ static float vector_norm(const float vector[3])
 
 static bool sample_is_sane(const imu_sample_t *sample)
 {
-    if ((sample == NULL) || !sample->valid || !isfinite(sample->temperature_c) ||
-        (sample->temperature_c < -50.0f) || (sample->temperature_c > 125.0f))
+    if ((sample == NULL) || !sample->valid)
         return false;
 
     for (uint32_t axis = 0; axis < 3U; axis++) {
@@ -211,6 +318,12 @@ static void update_accel_monitor(imu_source_t source, const float accel_mps2[3])
     monitor->has_previous_accel = true;
 }
 
+static void reset_accel_monitor(imu_source_t source)
+{
+    sample_monitors[source].repeated_accel_samples = 0U;
+    sample_monitors[source].has_previous_accel = false;
+}
+
 static void update_gyro_monitor(imu_source_t source, const float gyro_rad_s[3])
 {
     sample_monitor_t *monitor = &sample_monitors[source];
@@ -227,6 +340,12 @@ static void update_gyro_monitor(imu_source_t source, const float gyro_rad_s[3])
         monitor->repeated_gyro_samples = 0U;
     }
     monitor->has_previous_gyro = true;
+}
+
+static void reset_gyro_monitor(imu_source_t source)
+{
+    sample_monitors[source].repeated_gyro_samples = 0U;
+    sample_monitors[source].has_previous_gyro = false;
 }
 
 static bool accel_vector_is_saturated(imu_source_t source,
@@ -255,6 +374,90 @@ static bool gyro_vector_is_saturated(imu_source_t source,
             return true;
     }
     return false;
+}
+
+#if IMU_CALIBRATION_G_SENSITIVITY_BUILD_ENABLE == 1
+static void query_g_sensitivity_accel_evidence(
+    imu_source_t source,
+    uint64_t gyro_timestamp_us,
+    imu_calibration_accel_evidence_t *evidence)
+{
+    memset(evidence, 0, sizeof(*evidence));
+    evidence->source = source;
+
+    imu_causal_accel_query_result_t result;
+    if (!imu_causal_accel_history_query(
+            &g_sensitivity_accel_history[source], source,
+            gyro_timestamp_us, &result)) {
+        return;
+    }
+
+    switch (result.status) {
+    case IMU_CAUSAL_ACCEL_QUERY_OK:
+    case IMU_CAUSAL_ACCEL_QUERY_STALE:
+    case IMU_CAUSAL_ACCEL_QUERY_FUTURE_ONLY:
+        evidence->timestamp_us = result.sample.timestamp_us;
+        memcpy(evidence->accel_body_mps2, result.sample.accel_mps2,
+               sizeof(evidence->accel_body_mps2));
+        evidence->source = result.sample.source;
+        evidence->valid = result.sample.valid;
+        break;
+    case IMU_CAUSAL_ACCEL_QUERY_SATURATED:
+        evidence->saturated = true;
+        break;
+    case IMU_CAUSAL_ACCEL_QUERY_EMPTY:
+    case IMU_CAUSAL_ACCEL_QUERY_INVALIDATED:
+    case IMU_CAUSAL_ACCEL_QUERY_SOURCE_MISMATCH:
+    case IMU_CAUSAL_ACCEL_QUERY_INVALID_ARGUMENT:
+    default:
+        break;
+    }
+}
+#endif
+
+static bool motion_guard_interval_changed(
+    const motion_guard_submitted_interval_t *submitted,
+    uint64_t start_us,
+    uint64_t end_us)
+{
+    return !submitted->valid || (submitted->start_us != start_us) ||
+           (submitted->end_us != end_us);
+}
+
+static void apply_motion_guard_inhibit(void)
+{
+    if (!estimator_initialized)
+        return;
+
+    uint64_t start_us;
+    uint64_t end_us;
+    if (imu_motion_guard_accel_disturbance_interval(&motion_guard,
+                                                    &start_us,
+                                                    &end_us) &&
+        motion_guard_interval_changed(&submitted_accel_disturbance_interval,
+                                      start_us, end_us) &&
+        dual_imu_estimator_inhibit_accel_interval(&estimator,
+                                                  start_us,
+                                                  end_us)) {
+        submitted_accel_disturbance_interval =
+            (motion_guard_submitted_interval_t){start_us, end_us, true};
+    }
+    if (imu_motion_guard_accel_inhibit_interval(&motion_guard,
+                                                &start_us,
+                                                &end_us) &&
+        motion_guard_interval_changed(&submitted_common_impact_interval,
+                                      start_us, end_us)) {
+        if (dual_imu_estimator_notify_impact_interval(&estimator,
+                                                      start_us,
+                                                      end_us)) {
+            submitted_common_impact_interval =
+                (motion_guard_submitted_interval_t){start_us, end_us, true};
+            /* The estimator may be processing older windows. Publish the
+             * event-time integrity boundary before that backlog catches up. */
+            record_public_heading_continuity_loss(start_us);
+            invalidate_fast_predictor_for_impact(start_us);
+        }
+    }
 }
 
 static bool estimator_accel_sample_is_eligible(imu_source_t source,
@@ -310,11 +513,9 @@ static uint32_t sample_fault_flags(imu_source_t source,
     else if (health->status != IMU_STATUS_OK)
         faults |= DUAL_IMU_FAULT_HEALTH;
 
-    if ((sample != NULL) && sample->accel_valid &&
-        accel_vector_is_saturated(sample->source, sample->accel_mps2))
+    if (imu_motion_guard_accel_saturated(&motion_guard, (uint8_t)source))
         faults |= DUAL_IMU_FAULT_ACCEL_SATURATED;
-    if ((sample != NULL) && sample->gyro_valid &&
-        gyro_vector_is_saturated(source, sample->gyro_rad_s))
+    if (imu_motion_guard_gyro_saturated(&motion_guard, (uint8_t)source))
         faults |= DUAL_IMU_FAULT_GYRO_SATURATED;
     if (sample_monitors[source].repeated_accel_samples >= IMU_FROZEN_SAMPLE_LIMIT)
         faults |= DUAL_IMU_FAULT_ACCEL_FROZEN;
@@ -361,10 +562,28 @@ static void publish_bmi_sample(void)
            sizeof(sample->accel_mps2));
     memcpy(sample->gyro_rad_s, state.bmi088_gyro_sample.gyro_rad_s,
            sizeof(sample->gyro_rad_s));
-    sample->temperature_c = state.bmi088_accel_sample.temperature_c;
+    const bool gyro_temperature_is_newer =
+        state.bmi088_gyro_sample.temperature_valid &&
+        (!state.bmi088_accel_sample.temperature_valid ||
+         (state.bmi088_gyro_sample.temperature_timestamp_us >=
+          state.bmi088_accel_sample.temperature_timestamp_us));
+    if (gyro_temperature_is_newer) {
+        sample->temperature_c = state.bmi088_gyro_sample.temperature_c;
+        sample->temperature_timestamp_us =
+            state.bmi088_gyro_sample.temperature_timestamp_us;
+        sample->temperature_valid =
+            state.bmi088_gyro_sample.temperature_valid;
+    } else {
+        sample->temperature_c = state.bmi088_accel_sample.temperature_c;
+        sample->temperature_timestamp_us =
+            state.bmi088_accel_sample.temperature_timestamp_us;
+        sample->temperature_valid =
+            state.bmi088_accel_sample.temperature_valid;
+    }
     sample->source = IMU_SOURCE_BMI088;
     sample->accel_valid = state.bmi088_accel_sample.valid;
-    sample->gyro_valid = state.bmi088_gyro_sample.valid;
+    sample->gyro_valid = state.bmi088_gyro_sample.valid &&
+                         bmi088_fifo_gyro_output_ready();
     sample->valid = sample->accel_valid && sample->gyro_valid;
 }
 
@@ -428,27 +647,58 @@ static void ingest_accel_sample(imu_accel_sample_t *sample,
     record_fifo_sample(source, IMU_STREAM_ACCEL, sample->timestamp_us,
                        arrival_timestamp_us, timestamp_trusted);
     rotate_accel_pitch_180(sample);
+    const bool saturated = sample->valid &&
+                           accel_vector_is_saturated(source,
+                                                     sample->accel_mps2);
     sample->valid = sample->valid && (sample->timestamp_us != 0U) &&
                     imu_calibration_apply_accel(source,
+                                                sample->timestamp_us,
                                                 sample->temperature_c,
-                                                sample->accel_mps2);
-    if (sample->valid)
+                                                sample->temperature_timestamp_us,
+                                                sample->temperature_valid,
+                                                sample->accel_mps2, NULL);
+    const uint32_t pipeline_delay_us =
+        (source == IMU_SOURCE_BMI088)
+            ? BMI088_ACCEL_PIPELINE_DELAY_US
+            : ICM45686_ACCEL_PIPELINE_DELAY_US;
+    const uint64_t evidence_timestamp_us = compensate_pipeline_delay(
+        sample->timestamp_us, pipeline_delay_us);
+#if IMU_CALIBRATION_G_SENSITIVITY_BUILD_ENABLE == 1
+    imu_accel_sample_t g_sensitivity_evidence = *sample;
+    g_sensitivity_evidence.timestamp_us = evidence_timestamp_us;
+    (void)imu_causal_accel_history_push(
+        &g_sensitivity_accel_history[source], &g_sensitivity_evidence,
+        timestamp_trusted && (evidence_timestamp_us != 0U), saturated);
+#endif
+    if (sample->valid) {
+        (void)imu_motion_guard_observe_accel_sample(
+            &motion_guard,
+            (uint8_t)source,
+            sample->timestamp_us,
+            saturated,
+            evidence_timestamp_us,
+            timestamp_trusted && (evidence_timestamp_us != 0U),
+            sample->accel_mps2);
+        apply_motion_guard_inhibit();
+    } else {
+        imu_motion_guard_reset_accel_subrange_evidence(
+            &motion_guard, (uint8_t)source);
+    }
+    if (imu_motion_guard_sample_can_update_frozen_monitor(
+            sample->valid, timestamp_trusted, saturated)) {
         update_accel_monitor(source, sample->accel_mps2);
+    } else {
+        reset_accel_monitor(source);
+    }
     imu_accel_buffer_push(&accel_buffers[source], sample);
 
     if (estimator_initialized && timestamp_trusted) {
         imu_accel_sample_t corrected = *sample;
-        const uint32_t pipeline_delay_us =
-            (source == IMU_SOURCE_BMI088)
-                ? BMI088_ACCEL_PIPELINE_DELAY_US
-                : ICM45686_ACCEL_PIPELINE_DELAY_US;
-        corrected.timestamp_us = compensate_pipeline_delay(
-            corrected.timestamp_us, pipeline_delay_us);
+        corrected.timestamp_us = evidence_timestamp_us;
         corrected.valid = corrected.valid &&
                           estimator_accel_sample_is_eligible(
                               source, timestamp_trusted) &&
-                          !accel_vector_is_saturated(source,
-                                                     corrected.accel_mps2);
+                          !saturated;
         if (dual_imu_estimator_push_accel(&estimator, &corrected))
             estimator_stream_timestamp_us[source][IMU_STREAM_ACCEL] =
                 corrected.timestamp_us;
@@ -472,33 +722,61 @@ static void ingest_gyro_sample(imu_gyro_sample_t *sample,
     record_fifo_sample(source, IMU_STREAM_GYRO, sample->timestamp_us,
                        arrival_timestamp_us, timestamp_trusted);
     rotate_gyro_pitch_180(sample);
+    const bool saturated = sample->valid &&
+                           gyro_vector_is_saturated(source,
+                                                    sample->gyro_rad_s);
     sample->valid = sample->valid && (sample->timestamp_us != 0U) &&
                     imu_calibration_apply_gyro(source,
+                                               sample->timestamp_us,
                                                sample->temperature_c,
-                                               sample->gyro_rad_s);
-    if (sample->valid)
+                                               sample->temperature_timestamp_us,
+                                               sample->temperature_valid,
+                                               sample->gyro_rad_s, NULL);
+    const uint32_t pipeline_delay_us =
+        (source == IMU_SOURCE_BMI088)
+            ? BMI088_GYRO_PIPELINE_DELAY_US
+            : ICM45686_GYRO_PIPELINE_DELAY_US;
+    const uint64_t evidence_timestamp_us = compensate_pipeline_delay(
+        sample->timestamp_us, pipeline_delay_us);
+#if IMU_CALIBRATION_G_SENSITIVITY_BUILD_ENABLE == 1
+    if (sample->valid) {
+        imu_calibration_accel_evidence_t accel_evidence;
+        query_g_sensitivity_accel_evidence(source, evidence_timestamp_us,
+                                           &accel_evidence);
+        sample->valid = imu_calibration_apply_gyro_g_sensitivity(
+            source, evidence_timestamp_us, &accel_evidence,
+            sample->gyro_rad_s, NULL);
+    }
+#endif
+    if (sample->valid) {
+        (void)imu_motion_guard_observe_gyro(&motion_guard,
+                                            (uint8_t)source,
+                                            sample->timestamp_us,
+                                            saturated);
+        apply_motion_guard_inhibit();
+    }
+    if (imu_motion_guard_sample_can_update_frozen_monitor(
+            sample->valid, timestamp_trusted, saturated)) {
         update_gyro_monitor(source, sample->gyro_rad_s);
+    } else {
+        reset_gyro_monitor(source);
+    }
     imu_gyro_buffer_push(&gyro_buffers[source], sample);
 
     if (estimator_initialized && timestamp_trusted) {
         imu_gyro_sample_t corrected = *sample;
-        const uint32_t pipeline_delay_us =
-            (source == IMU_SOURCE_BMI088)
-                ? BMI088_GYRO_PIPELINE_DELAY_US
-                : ICM45686_GYRO_PIPELINE_DELAY_US;
-        corrected.timestamp_us = compensate_pipeline_delay(
-            corrected.timestamp_us, pipeline_delay_us);
+        corrected.timestamp_us = evidence_timestamp_us;
         corrected.valid = corrected.valid &&
                           estimator_gyro_sample_is_eligible(
                               source, timestamp_trusted) &&
-                          !gyro_vector_is_saturated(source,
-                                                    corrected.gyro_rad_s);
+                          !saturated;
         if (fast_predictor_initialized) {
-            const uint32_t primask = __get_PRIMASK();
-            __disable_irq();
             (void)fast_attitude_predictor_push_gyro(&fast_predictor,
                                                     &corrected);
-            __set_PRIMASK(primask);
+            if (fast_predictor.anchor_valid &&
+                (fast_predictor.anchor.selected_source == source)) {
+                publish_fast_snapshot();
+            }
         }
         if (dual_imu_estimator_push_gyro(&estimator, &corrected))
             estimator_stream_timestamp_us[source][IMU_STREAM_GYRO] =
@@ -573,15 +851,21 @@ static void ingest_icm_fifo_frame(const icm45686_fifo_frame_t *frame,
     }
 
     const uint64_t timestamp_us = frame->mcu_timestamp_us;
-    if (frame->temperature_valid)
+    if (frame->temperature_valid) {
         state.icm45686_sample.temperature_c = frame->temperature_c;
+        state.icm45686_sample.temperature_timestamp_us = timestamp_us;
+        state.icm45686_sample.temperature_valid = true;
+    }
     state.icm45686_sample.source = IMU_SOURCE_ICM45686;
 
     if (frame->accel_valid) {
         imu_accel_sample_t accel = {
             .timestamp_us = timestamp_us,
+            .temperature_timestamp_us =
+                state.icm45686_sample.temperature_timestamp_us,
             .temperature_c = state.icm45686_sample.temperature_c,
             .source = IMU_SOURCE_ICM45686,
+            .temperature_valid = state.icm45686_sample.temperature_valid,
             .valid = true,
         };
         memcpy(accel.accel_mps2, frame->accel_mps2,
@@ -594,22 +878,21 @@ static void ingest_icm_fifo_frame(const icm45686_fifo_frame_t *frame,
         state.icm45686_sample.accel_valid = accel.valid;
     }
 
-    if (frame->gyro_valid) {
-        imu_gyro_sample_t gyro = {
-            .timestamp_us = timestamp_us,
-            .temperature_c = state.icm45686_sample.temperature_c,
-            .source = IMU_SOURCE_ICM45686,
-            .valid = true,
-        };
-        memcpy(gyro.gyro_rad_s, frame->gyro_rad_s,
-               sizeof(gyro.gyro_rad_s));
+    imu_gyro_sample_t gyro;
+    if (icm45686_fifo_frame_to_gyro_sample(
+            frame, state.icm45686_sample.temperature_c, &gyro)) {
+        gyro.temperature_timestamp_us =
+            state.icm45686_sample.temperature_timestamp_us;
+        gyro.temperature_valid = state.icm45686_sample.temperature_valid;
         ingest_gyro_sample(&gyro, true, arrival_timestamp_us);
         state.icm45686_sample.timestamp_us = gyro.timestamp_us;
         state.icm45686_sample.gyro_timestamp_us = gyro.timestamp_us;
         state.icm45686_sample.sequence = gyro.sequence;
         state.icm45686_sample.gyro_sequence = gyro.sequence;
-        memcpy(state.icm45686_sample.gyro_rad_s, gyro.gyro_rad_s,
-               sizeof(gyro.gyro_rad_s));
+        if (frame->gyro_valid) {
+            memcpy(state.icm45686_sample.gyro_rad_s, gyro.gyro_rad_s,
+                   sizeof(gyro.gyro_rad_s));
+        }
         state.icm45686_sample.gyro_valid = gyro.valid;
     }
 
@@ -676,6 +959,60 @@ static void service_fifo_data(uint64_t now_us)
     icm45686_fifo_service();
 }
 
+static void service_bmi_gyro_recovery(uint64_t now_us)
+{
+    if (!state.bmi088_initialized || !bmi088_fifo_gyro_sync_faulted()) {
+        bmi088_fifo_set_gyro_recovery_quiesced(false);
+        bmi_gyro_recovery_scheduled = false;
+        bmi_gyro_recovery_not_before_us = 0U;
+        return;
+    }
+
+    if (!bmi_gyro_recovery_scheduled) {
+        bmi_gyro_recovery_scheduled = true;
+        bmi_gyro_recovery_not_before_us =
+            now_us + IMU_BMI_GYRO_RECOVERY_DELAY_US;
+        return;
+    }
+    if (now_us < bmi_gyro_recovery_not_before_us)
+        return;
+
+    bmi088_fifo_set_gyro_recovery_quiesced(true);
+    if (!bmi088_fifo_gyro_recovery_ready()) {
+        bmi_gyro_recovery_not_before_us =
+            now_us + IMU_BMI_GYRO_RECOVERY_BUSY_RETRY_US;
+        return;
+    }
+
+    if (!reset_bmi_gyro_capture_boundary()) {
+        bmi088_fifo_set_gyro_recovery_quiesced(false);
+        bmi_gyro_recovery_not_before_us =
+            now_us + IMU_BMI_GYRO_RECOVERY_RETRY_US;
+        return;
+    }
+
+    set_bmi_gyro_capture_accepting(true);
+    const bmi088_gyro_recovery_result_t result =
+        bmi088_fifo_recover_gyro();
+    if (result == BMI088_GYRO_RECOVERY_SUCCEEDED) {
+        bmi088_fifo_set_gyro_recovery_quiesced(false);
+        state.bmi088_gyro_configuration_fault = false;
+        bmi_gyro_recovery_scheduled = false;
+        bmi_gyro_recovery_not_before_us = 0U;
+    } else if (result == BMI088_GYRO_RECOVERY_DEFERRED) {
+        set_bmi_gyro_capture_accepting(false);
+        bmi_gyro_recovery_not_before_us =
+            now_us + IMU_BMI_GYRO_RECOVERY_BUSY_RETRY_US;
+    } else {
+        bmi088_fifo_set_gyro_recovery_quiesced(false);
+        set_bmi_gyro_capture_accepting(false);
+        if (result == BMI088_GYRO_RECOVERY_FAILED_CONFIG)
+            state.bmi088_gyro_configuration_fault = true;
+        bmi_gyro_recovery_not_before_us =
+            time_us() + IMU_BMI_GYRO_RECOVERY_RETRY_US;
+    }
+}
+
 static uint32_t selector_hard_faults(imu_source_t source, uint64_t now_us)
 {
     const bool initialized = (source == IMU_SOURCE_BMI088)
@@ -688,20 +1025,19 @@ static uint32_t selector_hard_faults(imu_source_t source, uint64_t now_us)
         return DUAL_IMU_FAULT_HEALTH;
 
     uint32_t hard = source_faults &
-                    (DUAL_IMU_FAULT_GYRO_SATURATED |
-                     DUAL_IMU_FAULT_GYRO_FROZEN | DUAL_IMU_FAULT_FILTER |
+                    (DUAL_IMU_FAULT_GYRO_FROZEN | DUAL_IMU_FAULT_FILTER |
                      DUAL_IMU_FAULT_GYRO_TIMING);
+    if (imu_motion_guard_gyro_hard_fault_active(&motion_guard,
+                                                (uint8_t)source) &&
+        !imu_motion_guard_gyro_hard_latch_suppressed(&motion_guard, now_us)) {
+        hard |= DUAL_IMU_FAULT_GYRO_SATURATED;
+    }
     if (source == IMU_SOURCE_BMI088) {
-        if ((read_error_streak[IMU_SOURCE_BMI088][IMU_STREAM_GYRO] != 0U) ||
-            state.bmi088_gyro_configuration_fault)
+        if (state.bmi088_gyro_configuration_fault)
             hard |= DUAL_IMU_FAULT_HEALTH;
-    } else if ((read_error_streak[IMU_SOURCE_ICM45686][IMU_STREAM_GYRO] != 0U) ||
-               state.icm45686_gyro_configuration_fault) {
+    } else if (state.icm45686_gyro_configuration_fault) {
         hard |= DUAL_IMU_FAULT_HEALTH;
     }
-    /* Expected impact clipping invalidates data but must not hard-latch a lane. */
-    if (now_us < estimator.accel_inhibit_until_us)
-        hard &= ~((uint32_t)DUAL_IMU_FAULT_GYRO_SATURATED);
     /* A missing/stale window is already excluded by selector window_valid.
      * It is not attributable evidence of a permanent lane failure and must
      * not enter the selector's hard-latched mask. */
@@ -747,6 +1083,8 @@ static void publish_estimator_output(const dual_imu_estimator_output_t *output)
     state.alignment_blend_active = output->output_alignment_active;
     state.stationary_candidate = output->stationary_candidate;
     state.stationary_confirmed = output->stationary_confirmed;
+    state.stationary_single_lane = output->stationary_single_lane;
+    state.stationary_lane_mask = output->stationary_lane_mask;
     state.stationary_last_reject_reason =
         (uint8_t)output->stationary_last_reject_reason;
     state.stationary_streak = output->stationary_streak;
@@ -758,6 +1096,17 @@ static void publish_estimator_output(const dual_imu_estimator_output_t *output)
            output->stationary_temporal_accel_variance_m2_s4,
            sizeof(state.stationary_temporal_accel_variance_m2_s4));
     state.accel_update_inhibited = output->accel_inhibited;
+    state.rotation_unobserved = output->rotation_unobserved;
+    if (output->heading_continuity_lost) {
+        record_public_heading_continuity_loss(
+            estimator.heading_continuity_lost_timestamp_us);
+    }
+    state.attitude_aiding_stale = output->attitude_aiding_stale;
+    state.attitude_converged = output->attitude_converged;
+    state.post_impact_reacquire_active =
+        output->post_impact_reacquire_active;
+    state.post_impact_episode_count = estimator.post_impact_episode_count;
+    state.post_impact_reacquire_count = estimator.post_impact_reacquire_count;
     state.fused_accel_valid = output->specific_force_valid;
     state.accel_residual_mps2 = output->accel_pair_residual_mps2;
 
@@ -794,10 +1143,8 @@ static void publish_estimator_output(const dual_imu_estimator_output_t *output)
 
     if (!output->output_valid ||
         (output->selector.selected_lane >= IMU_SELECTOR_LANE_COUNT)) {
-        const uint32_t primask = __get_PRIMASK();
-        __disable_irq();
         fast_attitude_predictor_invalidate_anchor(&fast_predictor);
-        __set_PRIMASK(primask);
+        publish_fast_snapshot();
         state.mode = DUAL_IMU_MODE_NONE;
         state.selected_source = IMU_SOURCE_FUSED;
         state.fused_sample.valid = false;
@@ -831,7 +1178,26 @@ static void publish_estimator_output(const dual_imu_estimator_output_t *output)
         anchor.timestamp_us = output->end_us;
         anchor.selected_source = selected;
         anchor.degraded = output->output_alignment_active ||
-                          (output->selector.state != IMU_SELECTOR_HEALTHY);
+                          (output->selector.state != IMU_SELECTOR_HEALTHY) ||
+                          output->accel_inhibited ||
+                          !output->attitude_converged ||
+                          output->post_impact_reacquire_active;
+        if (output->attitude_converged) {
+            anchor.quality_flags |=
+                FAST_ATTITUDE_QUALITY_ATTITUDE_CONVERGED;
+        }
+        if (output->post_impact_reacquire_active) {
+            anchor.quality_flags |=
+                FAST_ATTITUDE_QUALITY_POST_IMPACT_REACQUIRE_ACTIVE;
+        }
+        if (output->attitude_aiding_stale) {
+            anchor.quality_flags |=
+                FAST_ATTITUDE_QUALITY_ATTITUDE_AIDING_STALE;
+        }
+        if (output->rotation_unobserved) {
+            anchor.quality_flags |=
+                FAST_ATTITUDE_QUALITY_ROTATION_UNOBSERVED;
+        }
         memcpy(anchor.quaternion, output->quaternion,
                sizeof(anchor.quaternion));
         memcpy(anchor.gyro_rate_rad_s,
@@ -840,19 +1206,15 @@ static void publish_estimator_output(const dual_imu_estimator_output_t *output)
         memcpy(anchor.gyro_bias_rad_s,
                output->lane_bias_rad_s[selected],
                sizeof(anchor.gyro_bias_rad_s));
-        const uint32_t primask = __get_PRIMASK();
-        __disable_irq();
         anchor_accepted =
             fast_attitude_predictor_set_anchor(&fast_predictor, &anchor);
         if (!anchor_accepted)
             fast_attitude_predictor_invalidate_anchor(&fast_predictor);
-        __set_PRIMASK(primask);
+        publish_fast_snapshot();
     }
     else if (fast_predictor_initialized) {
-        const uint32_t primask = __get_PRIMASK();
-        __disable_irq();
         fast_attitude_predictor_invalidate_anchor(&fast_predictor);
-        __set_PRIMASK(primask);
+        publish_fast_snapshot();
     }
 
     imu_sample_t fused;
@@ -876,6 +1238,8 @@ static void publish_estimator_output(const dual_imu_estimator_output_t *output)
     memcpy(fused.gyro_rad_s, output->angular_rate_rad_s,
            sizeof(fused.gyro_rad_s));
     fused.temperature_c = latest->temperature_c;
+    fused.temperature_timestamp_us = latest->temperature_timestamp_us;
+    fused.temperature_valid = latest->temperature_valid;
     fused.source = IMU_SOURCE_FUSED;
     fused.accel_valid = output->specific_force_valid;
     fused.gyro_valid = true;
@@ -912,6 +1276,8 @@ static void update_estimator(uint64_t now_us)
             state.filter_reject_count++;
             break;
         }
+        if (estimator_output.end_us > state.estimator_assessed_through_us)
+            state.estimator_assessed_through_us = estimator_output.end_us;
         publish_estimator_output(&estimator_output);
     }
 }
@@ -931,7 +1297,8 @@ static void update_fast_rate_output(void)
     const float *raw_rate;
     uint64_t timestamp_us;
     if (selected == IMU_SOURCE_BMI088) {
-        if (!state.bmi088_gyro_sample.valid)
+        if (!state.bmi088_gyro_sample.valid ||
+            !bmi088_fifo_gyro_output_ready())
             return;
         raw_rate = state.bmi088_gyro_sample.gyro_rad_s;
         timestamp_us = state.bmi088_gyro_sample.timestamp_us;
@@ -972,11 +1339,28 @@ static void publish_fast_attitude_at(uint64_t scheduled_us)
         return;
 
     dual_imu_attitude_output_t output;
-    (void)fast_attitude_predictor_predict(&fast_predictor,
-                                          scheduled_us,
-                                          &output);
+    const uint32_t snapshot_index = fast_snapshot_buffer_index;
+    const uint32_t saturation_snapshot_index =
+        motion_guard_saturation_snapshot_buffer_index;
+    __DMB();
+    (void)fast_attitude_snapshot_predict(
+        &fast_snapshot_buffers[snapshot_index], scheduled_us, &output);
+    output.accel_saturation_recent =
+        imu_motion_guard_snapshot_accel_saturation_status_at(
+            &motion_guard_saturation_snapshot_buffers[
+                saturation_snapshot_index],
+            scheduled_us);
+    output.gyro_saturation_recent =
+        imu_motion_guard_snapshot_gyro_saturation_status_at(
+            &motion_guard_saturation_snapshot_buffers[
+                saturation_snapshot_index],
+            scheduled_us);
     output.sequence = ++fast_output_sequence;
 
+    /* A generation seqlock also protects readers if a copy is delayed across
+     * two 625 us publications and the two-buffer index returns to its origin. */
+    fast_output_publish_generation++;
+    __DMB();
     const uint32_t next_buffer = fast_output_buffer_index ^ 1U;
     fast_output_buffers[next_buffer] = output;
     dual_imu_attitude_output_t *const published =
@@ -995,6 +1379,9 @@ static void publish_fast_attitude_at(uint64_t scheduled_us)
     }
     __DMB();
     fast_output_buffer_index = next_buffer;
+    __DMB();
+    fast_output_publish_generation++;
+    __DMB();
     fast_attitude_queue_push_isr(published);
 
     state.fast_attitude_output_count++;
@@ -1049,13 +1436,17 @@ bool dual_imu_init(void)
     memset(&estimator, 0, sizeof(estimator));
     memset(&estimator_output, 0, sizeof(estimator_output));
     memset(&fast_predictor, 0, sizeof(fast_predictor));
+    memset(fast_snapshot_buffers, 0, sizeof(fast_snapshot_buffers));
+    memset(motion_guard_saturation_snapshot_buffers, 0,
+           sizeof(motion_guard_saturation_snapshot_buffers));
     memset(fast_output_buffers, 0, sizeof(fast_output_buffers));
     memset(fast_output_queue, 0, sizeof(fast_output_queue));
     memset(sample_monitors, 0, sizeof(sample_monitors));
     memset(&bmi_accel_irq, 0, sizeof(bmi_accel_irq));
     memset(&bmi_gyro_irq, 0, sizeof(bmi_gyro_irq));
     memset(&icm_irq, 0, sizeof(icm_irq));
-    memset(read_error_streak, 0, sizeof(read_error_streak));
+    if (!imu_motion_guard_init(&motion_guard, NULL))
+        return false;
     memset(estimator_stream_timestamp_us, 0,
            sizeof(estimator_stream_timestamp_us));
     memset(coalesced_event_count, 0, sizeof(coalesced_event_count));
@@ -1071,15 +1462,38 @@ bool dual_imu_init(void)
     for (uint32_t source = 0U; source < IMU_SOURCE_COUNT; source++) {
         imu_accel_buffer_reset(&accel_buffers[source]);
         imu_gyro_buffer_reset(&gyro_buffers[source]);
+#if IMU_CALIBRATION_G_SENSITIVITY_BUILD_ENABLE == 1
+        imu_calibration_t calibration;
+        if (!imu_calibration_get((imu_source_t)source, &calibration) ||
+            !imu_causal_accel_history_init(
+                &g_sensitivity_accel_history[source],
+                (imu_source_t)source,
+                IMU_G_SENSITIVITY_ACCEL_MAX_GAP_US,
+                calibration.maximum_g_sensitivity_accel_age_us)) {
+            return false;
+        }
+#endif
     }
     bmi_combined_sequence = 0U;
     estimator_initialized = false;
     fast_predictor_initialized = false;
+    fast_predictor_last_impact_us = 0U;
+    fast_predictor_impact_seen = false;
+    memset(&submitted_common_impact_interval, 0,
+           sizeof(submitted_common_impact_interval));
+    memset(&submitted_accel_disturbance_interval, 0,
+           sizeof(submitted_accel_disturbance_interval));
     fast_output_sequence = 0U;
     fast_tick_missed_compare_count = 0U;
     fast_tick_dropped_count = 0U;
     bmi_capture_accepting = false;
+    bmi_gyro_capture_accepting = false;
+    bmi_gyro_recovery_scheduled = false;
+    bmi_gyro_recovery_not_before_us = 0U;
+    fast_snapshot_buffer_index = 0U;
+    motion_guard_saturation_snapshot_buffer_index = 0U;
     fast_output_buffer_index = 0U;
+    fast_output_publish_generation = 0U;
     fast_output_queue_head = 0U;
     fast_output_queue_tail = 0U;
     fast_output_queue_drop_count = 0U;
@@ -1110,6 +1524,8 @@ bool dual_imu_init(void)
         fast_attitude_predictor_init(&fast_predictor, &predictor_config);
     if (!fast_predictor_initialized)
         return false;
+    publish_fast_snapshot();
+    publish_motion_guard_saturation_snapshot();
 
     /* ICM startup contains the long blocking settle delay. Run it before BMI
      * starts so the 2 kHz BMI capture queue cannot overflow during init. */
@@ -1119,14 +1535,18 @@ bool dual_imu_init(void)
     if (!imu_time_start_capture_channels_1_2())
         return false;
     bmi_capture_accepting = true;
+    bmi_gyro_capture_accepting = true;
     state.bmi088_initialized = bmi088_init();
-    if (!state.bmi088_initialized)
+    if (!state.bmi088_initialized) {
         bmi_capture_accepting = false;
+        bmi_gyro_capture_accepting = false;
+    }
     state.bmi088_accel_id = bmi088_accel_chip_id();
     state.bmi088_gyro_id = bmi088_gyro_chip_id();
     if (state.bmi088_initialized)
     {
         bmi_capture_accepting = false;
+        bmi_gyro_capture_accepting = false;
         reset_irq_event(&bmi_gyro_irq);
         capture_overrun_accounted_count[1] = 0U;
         capture_overrun_reported_count[1] = 0U;
@@ -1137,10 +1557,14 @@ bool dual_imu_init(void)
         else
         {
             bmi_capture_accepting = true;
+            bmi_gyro_capture_accepting = true;
             if (!bmi088_fifo_start_gyro())
             {
-                bmi_capture_accepting = false;
-                state.bmi088_initialized = false;
+                set_bmi_gyro_capture_accepting(false);
+                if (!bmi088_fifo_gyro_sync_faulted()) {
+                    bmi_capture_accepting = false;
+                    state.bmi088_initialized = false;
+                }
             }
         }
     }
@@ -1150,11 +1574,14 @@ bool dual_imu_init(void)
 
     dual_imu_estimator_config_t estimator_config;
     dual_imu_estimator_default_config(&estimator_config);
-    /* One missed high-rate sample may propagate with inflated Q; two may not. */
+    /* Gyro can bridge one missing high-rate slot with inflated Q. ICM accel
+     * skips expected 3200/1600 FIFO placeholders, but one missing real accel
+     * sample creates a 1250 us gap and must invalidate gravity aiding. */
     estimator_config.preintegrator[IMU_SOURCE_BMI088].max_accel_gap_us = 1500U;
     estimator_config.preintegrator[IMU_SOURCE_BMI088].max_gyro_gap_us = 1250U;
-    estimator_config.preintegrator[IMU_SOURCE_ICM45686].max_accel_gap_us = 1500U;
-    estimator_config.preintegrator[IMU_SOURCE_ICM45686].max_gyro_gap_us = 1500U;
+    estimator_config.preintegrator[IMU_SOURCE_ICM45686].max_accel_gap_us =
+        ICM45686_CONFIG_ACCEL_MAX_GAP_US;
+    estimator_config.preintegrator[IMU_SOURCE_ICM45686].max_gyro_gap_us = 800U;
     const uint64_t window_us =
         estimator_config.preintegrator[IMU_SOURCE_BMI088].window_us;
     const uint64_t remainder_us = init_time_us % window_us;
@@ -1193,6 +1620,8 @@ void dual_imu_process(void)
     update_fast_tick_diagnostics();
     const uint64_t fifo_service_start_us = time_us();
     service_fifo_data(now_us);
+    publish_motion_guard_saturation_snapshot();
+    service_bmi_gyro_recovery(time_us());
     const uint64_t fifo_service_duration_us =
         time_us() - fifo_service_start_us;
     state.fifo_service_last_us =
@@ -1201,6 +1630,11 @@ void dual_imu_process(void)
             : (uint32_t)fifo_service_duration_us;
     if (state.fifo_service_last_us > state.fifo_service_max_us)
         state.fifo_service_max_us = state.fifo_service_last_us;
+    if (!bmi088_fifo_gyro_output_ready()) {
+        state.bmi088_gyro_sample.valid = false;
+        state.bmi088_sample.gyro_valid = false;
+        state.bmi088_sample.valid = false;
+    }
     now_us = time_us();
     if ((isolation_hint_expires_us != 0U) &&
         (now_us >= isolation_hint_expires_us)) {
@@ -1253,19 +1687,17 @@ void dual_imu_process(void)
     /* BMI accel/gyro are independent dies; never derive gyro clipping from
        the combined sample, which may be stale when only accel has failed. */
     state.bmi088_fault_flags &= ~((uint32_t)DUAL_IMU_FAULT_SATURATED);
-    if (state.bmi088_accel_sample.valid &&
-        accel_vector_is_saturated(IMU_SOURCE_BMI088,
-                                  state.bmi088_accel_sample.accel_mps2))
+    if (imu_motion_guard_accel_saturated(&motion_guard,
+                                         IMU_SOURCE_BMI088))
         state.bmi088_fault_flags |= DUAL_IMU_FAULT_ACCEL_SATURATED;
-    if (state.bmi088_gyro_sample.valid &&
-        gyro_vector_is_saturated(IMU_SOURCE_BMI088,
-                                 state.bmi088_gyro_sample.gyro_rad_s))
+    if (imu_motion_guard_gyro_saturated(&motion_guard,
+                                        IMU_SOURCE_BMI088))
         state.bmi088_fault_flags |= DUAL_IMU_FAULT_GYRO_SATURATED;
     if (state.bmi088_accel_configuration_fault)
         state.bmi088_fault_flags |= DUAL_IMU_FAULT_ACCEL_TIMING;
     if (state.bmi088_gyro_configuration_fault)
         state.bmi088_fault_flags |= DUAL_IMU_FAULT_HEALTH;
-    if (bmi088_fifo_gyro_sync_faulted())
+    if (!bmi088_fifo_gyro_output_ready())
         state.bmi088_fault_flags |= DUAL_IMU_FAULT_GYRO_TIMING;
     if (state.icm45686_accel_configuration_fault)
         state.icm45686_fault_flags |= DUAL_IMU_FAULT_ACCEL_TIMING;
@@ -1330,6 +1762,57 @@ void dual_imu_process(void)
     state.icm45686_gyro_buffer_overwrite_count =
         imu_gyro_buffer_overwritten(&gyro_buffers[IMU_SOURCE_ICM45686]);
 
+    imu_motion_guard_diagnostics_t motion_diagnostics;
+    imu_motion_guard_get_diagnostics(&motion_guard, now_us,
+                                     &motion_diagnostics);
+    state.motion_guard_common_impact_count =
+        motion_diagnostics.counters.common_impact_episode_count;
+    memcpy(state.motion_guard_accel_saturation_count,
+           motion_diagnostics.counters.accel_saturation_count,
+           sizeof(state.motion_guard_accel_saturation_count));
+    memcpy(state.motion_guard_gyro_saturation_count,
+           motion_diagnostics.counters.gyro_saturation_count,
+           sizeof(state.motion_guard_gyro_saturation_count));
+    memcpy(state.motion_guard_accel_subrange_candidate_count,
+           motion_diagnostics.counters.accel_subrange_candidate_count,
+           sizeof(state.motion_guard_accel_subrange_candidate_count));
+    memcpy(state.motion_guard_accel_subrange_severe_count,
+           motion_diagnostics.counters
+               .accel_subrange_severe_observation_count,
+           sizeof(state.motion_guard_accel_subrange_severe_count));
+    state.motion_guard_accel_subrange_common_count =
+        motion_diagnostics.counters.accel_subrange_common_observation_count;
+    state.motion_guard_accel_disturbance_episode_count =
+        motion_diagnostics.counters.accel_disturbance_episode_count;
+    state.motion_guard_accel_disturbance_extension_count =
+        motion_diagnostics.counters.accel_disturbance_extension_count;
+    state.motion_guard_last_accel_saturation_us =
+        motion_diagnostics.last_accel_saturation_us;
+    state.motion_guard_last_gyro_saturation_us =
+        motion_diagnostics.last_gyro_saturation_us;
+    state.motion_guard_last_accel_disturbance_us =
+        motion_diagnostics.last_accel_disturbance_us;
+    memcpy(state.motion_guard_accel_saturation_history,
+           motion_diagnostics.accel_saturation_history,
+           sizeof(state.motion_guard_accel_saturation_history));
+    memcpy(state.motion_guard_gyro_saturation_history,
+           motion_diagnostics.gyro_saturation_history,
+           sizeof(state.motion_guard_gyro_saturation_history));
+    state.motion_guard_last_impact_us =
+        motion_diagnostics.last_common_impact_us;
+    state.motion_guard_gyro_hard_fault_mask =
+        motion_diagnostics.gyro_hard_fault_mask;
+    state.motion_guard_accel_saturation_seen =
+        motion_diagnostics.accel_saturation_seen;
+    state.motion_guard_gyro_saturation_seen =
+        motion_diagnostics.gyro_saturation_seen;
+    state.motion_guard_accel_disturbance_valid =
+        motion_diagnostics.accel_disturbance_valid;
+    state.motion_guard_accel_disturbance_active =
+        motion_diagnostics.accel_disturbance_inhibited;
+    state.motion_guard_gyro_latch_suppressed =
+        motion_diagnostics.gyro_hard_latch_suppressed;
+
     bmi088_fifo_diagnostics_t bmi_fifo_diagnostics;
     icm45686_fifo_diagnostics_t icm_fifo_diagnostics;
     imu_clock_sync_diagnostics_t bmi_clock_diagnostics;
@@ -1342,6 +1825,10 @@ void dual_imu_process(void)
         bmi_fifo_diagnostics.gyro_batch_count;
     state.bmi088_fifo_dma_error_count =
         bmi_fifo_diagnostics.dma_error_count;
+    state.bmi088_temperature_read_count =
+        bmi_fifo_diagnostics.temperature_read_count;
+    state.bmi088_temperature_read_error_count =
+        bmi_fifo_diagnostics.temperature_read_error_count;
     state.bmi088_accel_fifo_length_read_count =
         bmi_fifo_diagnostics.accel_length_read_count;
     state.bmi088_accel_fifo_empty_length_count =
@@ -1411,6 +1898,8 @@ void dual_imu_process(void)
     state.icm45686_fifo_batch_count = icm_fifo_diagnostics.dma_batch_count;
     state.icm45686_fifo_dma_error_count =
         icm_fifo_diagnostics.dma_error_count;
+    state.icm45686_temperature_invalid_frame_count =
+        icm_fifo_diagnostics.temperature_invalid_frame_count;
     state.icm45686_fifo_clock_sync_valid =
         icm_fifo_diagnostics.clock_sync_valid;
     state.fifo_clock_anchor_accepted_count[IMU_SOURCE_ICM45686] =
@@ -1443,6 +1932,34 @@ void dual_imu_process(void)
         icm_fifo_diagnostics.timestamp_discontinuity_count;
     state.icm45686_fifo_last_frames = icm_fifo_diagnostics.last_fifo_count;
     state.icm45686_fifo_peak_frames = icm_fifo_diagnostics.peak_fifo_count;
+    state.bmi088_gyro_recovery_attempt_count =
+        bmi_fifo_diagnostics.gyro_recovery_attempt_count;
+    state.bmi088_gyro_recovery_success_count =
+        bmi_fifo_diagnostics.gyro_recovery_success_count;
+    state.bmi088_gyro_recovery_failure_count =
+        bmi_fifo_diagnostics.gyro_recovery_failure_count;
+    state.bmi088_gyro_last_recovery_reason =
+        bmi_fifo_diagnostics.gyro_last_recovery_reason;
+    state.bmi088_gyro_last_recovery_result =
+        (uint8_t)bmi_fifo_diagnostics.gyro_last_recovery_result;
+    state.bmi088_gyro_recovery_pending = bmi_gyro_recovery_scheduled;
+    state.bmi088_gyro_recovery_warmup =
+        bmi_fifo_diagnostics.gyro_recovery_warmup;
+    const imu_sample_t *temperature_samples[IMU_SOURCE_COUNT] = {
+        &state.bmi088_sample,
+        &state.icm45686_sample,
+    };
+    for (uint32_t source = 0U; source < IMU_SOURCE_COUNT; ++source) {
+        (void)imu_calibration_get_diagnostics(
+            (imu_source_t)source, &state.calibration_diagnostics[source]);
+        const imu_sample_t *sample = temperature_samples[source];
+        state.temperature_stale[source] =
+            !sample->temperature_valid ||
+            (sample->temperature_timestamp_us == 0U) ||
+            (now_us < sample->temperature_timestamp_us) ||
+            ((now_us - sample->temperature_timestamp_us) >
+             IMU_CALIBRATION_TEMPERATURE_MAX_AGE_US);
+    }
 }
 
 void dual_imu_handle_exti(uint16_t gpio_pin)
@@ -1464,7 +1981,8 @@ void dual_imu_handle_exti(uint16_t gpio_pin)
 
 void imu_time_capture_callback(uint32_t channel, uint64_t timestamp_us)
 {
-    if ((channel < 1U) || (channel > 2U) || !bmi_capture_accepting)
+    if ((channel < 1U) || (channel > 2U) || !bmi_capture_accepting ||
+        ((channel == 2U) && !bmi_gyro_capture_accepting))
         return;
 
     const uint32_t index = channel - 1U;
@@ -1487,8 +2005,16 @@ void dual_imu_notify_impact(uint32_t inhibit_duration_us)
     if (inhibit_duration_us > IMU_MAX_IMPACT_INHIBIT_US)
         inhibit_duration_us = IMU_MAX_IMPACT_INHIBIT_US;
     const uint64_t now_us = time_us();
-    dual_imu_estimator_inhibit_accel_until(&estimator,
-                                           now_us + inhibit_duration_us);
+    const uint64_t end_us =
+        (UINT64_MAX - now_us < inhibit_duration_us)
+            ? UINT64_MAX
+            : now_us + inhibit_duration_us;
+    if (dual_imu_estimator_notify_impact_interval(&estimator,
+                                                  now_us,
+                                                  end_us)) {
+        record_public_heading_continuity_loss(now_us);
+        invalidate_fast_predictor_for_impact(now_us);
+    }
 }
 
 void dual_imu_set_stationary_hint(bool stationary)
@@ -1520,11 +2046,19 @@ bool dual_imu_get_control_gyro(imu_gyro_sample_t *sample)
         (state.selected_source >= IMU_SOURCE_COUNT))
         return false;
 
+    const uint64_t now_us = time_us();
+    if ((now_us < state.control_gyro_timestamp_us) ||
+        ((now_us - state.control_gyro_timestamp_us) > IMU_STALE_TIMEOUT_US) ||
+        ((state.selected_source == IMU_SOURCE_BMI088) &&
+         !bmi088_fifo_gyro_output_ready())) {
+        return false;
+    }
+
     const uint32_t source_faults =
         (state.selected_source == IMU_SOURCE_BMI088)
             ? state.bmi088_fault_flags
             : state.icm45686_fault_flags;
-    if ((selector_hard_faults(state.selected_source, time_us()) != 0U) ||
+    if ((selector_hard_faults(state.selected_source, now_us) != 0U) ||
         ((source_faults & DUAL_IMU_FAULT_GYRO_SATURATED) != 0U))
         return false;
 
@@ -1536,9 +2070,16 @@ bool dual_imu_get_control_gyro(imu_gyro_sample_t *sample)
     if (state.selected_source == IMU_SOURCE_BMI088) {
         sample->sequence = state.bmi088_gyro_sample.sequence;
         sample->temperature_c = state.bmi088_gyro_sample.temperature_c;
+        sample->temperature_timestamp_us =
+            state.bmi088_gyro_sample.temperature_timestamp_us;
+        sample->temperature_valid =
+            state.bmi088_gyro_sample.temperature_valid;
     } else {
         sample->sequence = state.icm45686_sample.gyro_sequence;
         sample->temperature_c = state.icm45686_sample.temperature_c;
+        sample->temperature_timestamp_us =
+            state.icm45686_sample.temperature_timestamp_us;
+        sample->temperature_valid = state.icm45686_sample.temperature_valid;
     }
     sample->valid = true;
     return true;
@@ -1549,13 +2090,20 @@ bool dual_imu_get_attitude(dual_imu_attitude_output_t *output)
     if (output == NULL)
         return false;
 
-    uint32_t index;
-    do {
-        index = fast_output_buffer_index;
+    for (;;) {
+        const uint32_t generation_before = fast_output_publish_generation;
         __DMB();
+        if ((generation_before & 1U) != 0U)
+            continue;
+        const uint32_t index = fast_output_buffer_index;
         *output = fast_output_buffers[index];
         __DMB();
-    } while (index != fast_output_buffer_index);
+        const uint32_t generation_after = fast_output_publish_generation;
+        if ((generation_before == generation_after) &&
+            ((generation_after & 1U) == 0U)) {
+            break;
+        }
+    }
 
     if (output->valid) {
         const uint64_t now_us = time_us();
@@ -1599,8 +2147,19 @@ bool dual_imu_set_calibration(imu_source_t source,
             return false;
     }
     const bool accepted = imu_calibration_set(source, calibration);
-    if (accepted)
+    if (accepted) {
+#if IMU_CALIBRATION_G_SENSITIVITY_BUILD_ENABLE == 1
+        if (!imu_causal_accel_history_init(
+                &g_sensitivity_accel_history[source], source,
+                IMU_G_SENSITIVITY_ACCEL_MAX_GAP_US,
+                calibration->maximum_g_sensitivity_accel_age_us)) {
+            return false;
+        }
+#endif
         state.custom_calibration_loaded[source] = true;
+        (void)imu_calibration_get_diagnostics(
+            source, &state.calibration_diagnostics[source]);
+    }
     return accepted;
 }
 
@@ -1608,6 +2167,46 @@ bool dual_imu_get_calibration(imu_source_t source,
                               imu_calibration_t *calibration)
 {
     return imu_calibration_get(source, calibration);
+}
+
+bool dual_imu_set_temperature_compensation_enabled(imu_source_t source,
+                                                   bool enabled)
+{
+    if (source >= IMU_SOURCE_COUNT)
+        return false;
+    if (enabled) {
+        for (uint32_t stream = 0U; stream < IMU_STREAM_COUNT; ++stream) {
+            if (successful_stream_read_count[source][stream] != 0U)
+                return false;
+        }
+    }
+    const bool accepted =
+        imu_calibration_set_temperature_compensation_enabled(source, enabled);
+    if (accepted) {
+        (void)imu_calibration_get_diagnostics(
+            source, &state.calibration_diagnostics[source]);
+    }
+    return accepted;
+}
+
+bool dual_imu_set_gyro_g_sensitivity_enabled(imu_source_t source,
+                                             bool enabled)
+{
+    if (source >= IMU_SOURCE_COUNT)
+        return false;
+    if (enabled) {
+        for (uint32_t stream = 0U; stream < IMU_STREAM_COUNT; ++stream) {
+            if (successful_stream_read_count[source][stream] != 0U)
+                return false;
+        }
+    }
+    const bool accepted =
+        imu_calibration_set_gyro_g_sensitivity_enabled(source, enabled);
+    if (accepted) {
+        (void)imu_calibration_get_diagnostics(
+            source, &state.calibration_diagnostics[source]);
+    }
+    return accepted;
 }
 
 bool dual_imu_pop_accel(imu_source_t source, imu_accel_sample_t *sample)

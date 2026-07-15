@@ -18,6 +18,9 @@
 #define BMI088_ACCEL_SCALE_MPS2_PER_LSB      ((24.0f * 9.80665f) / 32768.0f)
 #define BMI088_GYRO_SCALE_RAD_S_PER_LSB      ((2000.0f * 0.017453292519943295f) / 32768.0f)
 #define BMI088_TEMPERATURE_READ_DIVIDER       UINT32_C(512)
+#define BMI088_TEMPERATURE_RETRY_DIVIDER      UINT32_C(128)
+#define BMI088_TEMPERATURE_MIN_VALID_C        (-50.0f)
+#define BMI088_TEMPERATURE_MAX_VALID_C        (125.0f)
 #define BMI088_FIFO_DMA_TIMEOUT_MS             UINT32_C(5)
 #define BMI088_ACCEL_FIFO_FRAME_BYTES          UINT16_C(7)
 #define BMI088_GYRO_FIFO_FRAME_BYTES           UINT16_C(6)
@@ -47,6 +50,7 @@
 #define BMI088_GYRO_FIFO_WM_INTERRUPT_DISABLED   UINT8_C(0x08)
 #define BMI088_GYRO_START_SYNC_MAX_ATTEMPTS      UINT32_C(4)
 #define BMI088_GYRO_START_SYNC_TIMEOUT_US        UINT64_C(2000)
+#define BMI088_GYRO_BYPASS_QUIESCE_US              UINT32_C(1000)
 #define BMI088_ACCEL_FIFO_DOWNS_REGISTER          UINT8_C(0x80)
 #define BMI088_ACCEL_FIFO_CONFIG_0_REGISTER       UINT8_C(0x02)
 #define BMI088_ACCEL_FIFO_CONFIG_1_REGISTER       UINT8_C(0x50)
@@ -58,6 +62,26 @@
 #define BMI088_GYRO_CAPTURE_REASON_FIFO_OVERRUN   (UINT32_C(1) << 5)
 #define BMI088_GYRO_CAPTURE_REASON_QUEUE_OVERFLOW (UINT32_C(1) << 6)
 #define BMI088_GYRO_CAPTURE_REASON_DMA_TRANSFER   (UINT32_C(1) << 7)
+#define BMI088_GYRO_CAPTURE_REASON_RECOVERY_IO     (UINT32_C(1) << 8)
+#define BMI088_GYRO_CAPTURE_REASON_RECOVERY_CONFIG (UINT32_C(1) << 9)
+#define BMI088_GYRO_CAPTURE_REASON_RECOVERY_STATUS_API \
+    (UINT32_C(1) << 10)
+#define BMI088_GYRO_CAPTURE_REASON_RECOVERY_BYPASS_API \
+    (UINT32_C(1) << 11)
+#define BMI088_GYRO_CAPTURE_REASON_RECOVERY_BYPASS_MODE \
+    (UINT32_C(1) << 12)
+#define BMI088_GYRO_CAPTURE_REASON_RECOVERY_BYPASS_COUNT \
+    (UINT32_C(1) << 13)
+#define BMI088_GYRO_CAPTURE_REASON_RECOVERY_ID \
+    (UINT32_C(1) << 14)
+#define BMI088_GYRO_CAPTURE_REASON_RECOVERY_CORE \
+    (UINT32_C(1) << 15)
+#define BMI088_GYRO_CAPTURE_REASON_RECOVERY_INTERRUPT \
+    (UINT32_C(1) << 16)
+#define BMI088_GYRO_CAPTURE_REASON_RECOVERY_FIFO_API \
+    (UINT32_C(1) << 17)
+#define BMI088_GYRO_CAPTURE_REASON_RECOVERY_FIFO_VALUE \
+    (UINT32_C(1) << 18)
 
 #if BMI088_USE_ROBUST_HIGH_RATE_PROFILE
 #define BMI088_ACCEL_ODR_SETTING              BMI08_ACCEL_ODR_1600_HZ
@@ -87,6 +111,12 @@ typedef enum
     BMI088_DMA_GYRO_DATA
 } bmi088_dma_state_t;
 
+typedef enum
+{
+    BMI088_GYRO_BYPASS_QUIESCE = 0,
+    BMI088_GYRO_BYPASS_STRICT_BOUNDARY
+} bmi088_gyro_bypass_phase_t;
+
 static struct bmi08_dev bmi088_device;
 static imu_health_t bmi088_health = { .status = IMU_STATUS_NOT_INITIALIZED };
 static bool bmi088_initialized;
@@ -95,9 +125,12 @@ static uint32_t bmi088_accel_sequence;
 static uint32_t bmi088_gyro_sequence;
 static uint32_t bmi088_temperature_countdown;
 static float bmi088_temperature_c;
+static uint64_t bmi088_temperature_timestamp_us;
+static bool bmi088_temperature_valid;
 static uint8_t bmi088_spi_tx_buffer[BMI08_MAX_LEN + 1U];
 static uint8_t bmi088_spi_rx_buffer[BMI08_MAX_LEN + 1U];
 static bmi088_configuration_t bmi088_configuration;
+static bool bmi088_accel_register_readback_verified;
 static volatile bmi088_dma_state_t bmi088_dma_state;
 static volatile bool bmi088_accel_request_pending;
 static volatile bool bmi088_gyro_request_pending;
@@ -133,6 +166,9 @@ static bmi088_fifo_diagnostics_t bmi088_fifo_diagnostics;
 static imu_timestamp_queue_t bmi088_gyro_capture_queue;
 static volatile bool bmi088_gyro_capture_armed;
 static volatile bool bmi088_gyro_capture_sync_fault;
+static volatile bool bmi088_gyro_recovery_in_progress;
+static volatile bool bmi088_gyro_recovery_warmup;
+static volatile bool bmi088_gyro_recovery_quiesced;
 static uint64_t bmi088_gyro_capture_timestamps[BMI088_FIFO_MAX_BATCH_SAMPLES];
 static uint32_t bmi088_gyro_capture_sequences[BMI088_FIFO_MAX_BATCH_SAMPLES];
 static imu_clock_sync_t bmi088_accel_clock_sync;
@@ -191,10 +227,15 @@ static bool bmi088_init_step(int8_t result, imu_status_t failure_status);
 static bool bmi088_read_step(int8_t result);
 static bool bmi088_verify_accel_configuration(void);
 static bool bmi088_verify_gyro_configuration(void);
+static bool bmi088_verify_gyro_fifo_configuration(uint32_t *mismatch_reason);
+static bool bmi088_verify_gyro_runtime_configuration(
+    uint32_t *mismatch_reason);
 static bool bmi088_verify_fifo_configuration(void);
 static bool bmi088_verify_configuration(void);
 static bool bmi088_configure_fifo(void);
-static bool bmi088_set_gyro_fifo_bypass(void);
+static bool bmi088_set_gyro_fifo_bypass(
+    bmi088_gyro_bypass_phase_t phase,
+    uint32_t *mismatch_reason);
 static bool bmi088_sync_gyro_fifo_to_capture(uint32_t *mismatch_reason);
 static bool bmi088_soft_reset_devices(void);
 static bool bmi088_blocking_bus_available(void);
@@ -221,6 +262,10 @@ static void bmi088_requeue_active_request(bmi088_dma_state_t failed_state);
 static bool bmi088_capture_accel_diagnostics(void);
 static void bmi088_latch_gyro_capture_fault(uint32_t reason);
 static bool bmi088_gyro_capture_epoch_is_current(uint32_t expected_epoch);
+static bool bmi088_gyro_recovery_ready_locked(void);
+static bool bmi088_store_temperature(int32_t temperature_milli_c,
+                                     uint64_t timestamp_us);
+static void bmi088_record_temperature_error(void);
 
 bool bmi088_init(void)
 {
@@ -264,6 +309,9 @@ bool bmi088_init(void)
     bmi088_gyro_sequence = 0U;
     bmi088_temperature_countdown = 0U;
     bmi088_temperature_c = 0.0f;
+    bmi088_temperature_timestamp_us = 0U;
+    bmi088_temperature_valid = false;
+    bmi088_accel_register_readback_verified = false;
     bmi088_dma_state = BMI088_DMA_IDLE;
     bmi088_accel_request_pending = false;
     bmi088_gyro_request_pending = false;
@@ -295,6 +343,9 @@ bool bmi088_init(void)
     imu_timestamp_queue_reset(&bmi088_gyro_capture_queue);
     bmi088_gyro_capture_armed = false;
     bmi088_gyro_capture_sync_fault = false;
+    bmi088_gyro_recovery_in_progress = false;
+    bmi088_gyro_recovery_warmup = false;
+    bmi088_gyro_recovery_quiesced = false;
     memset(bmi088_dma_tx, 0, sizeof(bmi088_dma_tx));
     memset(bmi088_dma_control_rx, 0, sizeof(bmi088_dma_control_rx));
     memset(bmi088_accel_raw_rx, 0, sizeof(bmi088_accel_raw_rx));
@@ -472,7 +523,8 @@ bool bmi088_fifo_start_gyro(void)
     if (!bmi088_initialized ||
         (bmi088_device.gyro_cfg.power != BMI08_GYRO_PM_SUSPEND) ||
         (bmi088_dma_state != BMI088_DMA_IDLE) ||
-        imu_spi_dma_is_busy(&hspi1))
+        imu_spi_dma_is_busy(&hspi1) ||
+        (HAL_SPI_GetState(&hspi1) != HAL_SPI_STATE_READY))
     {
         return false;
     }
@@ -482,6 +534,7 @@ bool bmi088_fifo_start_gyro(void)
     bmi088_gyro_capture_armed = false;
     imu_timestamp_queue_reset(&bmi088_gyro_capture_queue);
     bmi088_gyro_capture_sync_fault = false;
+    bmi088_gyro_recovery_warmup = false;
     bmi088_gyro_request_pending = false;
     bmi088_gyro_request_timestamp_us = 0U;
     bmi088_gyro_raw_ready = false;
@@ -523,16 +576,176 @@ bool bmi088_fifo_start_gyro(void)
     return true;
 }
 
+static bool bmi088_gyro_recovery_ready_locked(void)
+{
+    return bmi088_initialized && bmi088_gyro_capture_sync_fault &&
+           !bmi088_gyro_recovery_in_progress &&
+           (bmi088_dma_state == BMI088_DMA_IDLE) &&
+           !imu_spi_dma_is_busy(&hspi1) &&
+           (HAL_SPI_GetState(&hspi1) == HAL_SPI_STATE_READY) &&
+           !bmi088_accel_raw_ready && !bmi088_gyro_raw_ready &&
+           !bmi088_accel_batch_ready && !bmi088_gyro_batch_ready;
+}
+
+bool bmi088_fifo_gyro_recovery_ready(void)
+{
+    const uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    const bool ready = bmi088_gyro_recovery_ready_locked();
+    __set_PRIMASK(primask);
+    return ready;
+}
+
+void bmi088_fifo_set_gyro_recovery_quiesced(bool quiesced)
+{
+    const uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    bmi088_gyro_recovery_quiesced = quiesced;
+    __DMB();
+    __set_PRIMASK(primask);
+}
+
+bmi088_gyro_recovery_result_t bmi088_fifo_recover_gyro(void)
+{
+    const uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    if (!bmi088_gyro_recovery_ready_locked())
+    {
+        __set_PRIMASK(primask);
+        return BMI088_GYRO_RECOVERY_DEFERRED;
+    }
+
+    bmi088_gyro_recovery_in_progress = true;
+    bmi088_gyro_recovery_warmup = false;
+    bmi088_gyro_capture_armed = false;
+    bmi088_gyro_request_pending = false;
+    bmi088_gyro_request_timestamp_us = 0U;
+    bmi088_last_gyro_capture_sequence_valid = false;
+    bmi088_last_gyro_sample_us_valid = false;
+    imu_timestamp_queue_discard(&bmi088_gyro_capture_queue);
+    bmi088_fifo_diagnostics.gyro_recovery_attempt_count++;
+    bmi088_fifo_diagnostics.gyro_last_recovery_reason =
+        bmi088_fifo_diagnostics.gyro_capture_mismatch_reason;
+    bmi088_fifo_diagnostics.gyro_capture_mismatch_reason = 0U;
+    bmi088_configuration.register_readback_verified = false;
+    const uint32_t bus_error_count_before = bmi088_health.bus_error_count;
+    __set_PRIMASK(primask);
+
+    bmi088_gyro_recovery_result_t result = BMI088_GYRO_RECOVERY_FAILED_CONFIG;
+    uint32_t mismatch_reason = 0U;
+    uint8_t pre_bypass_status = 0U;
+    if (!bmi088_init_step(
+            bmi08g_get_regs(BMI08_REG_GYRO_FIFO_STATUS, &pre_bypass_status,
+                            1U, &bmi088_device),
+            IMU_STATUS_CONFIG_ERROR)) {
+        result = (bmi088_health.bus_error_count != bus_error_count_before)
+                     ? BMI088_GYRO_RECOVERY_FAILED_IO
+                     : BMI088_GYRO_RECOVERY_FAILED_CONFIG;
+        mismatch_reason |= BMI088_GYRO_CAPTURE_REASON_RECOVERY_STATUS_API;
+    } else if (!bmi088_set_gyro_fifo_bypass(
+                   BMI088_GYRO_BYPASS_QUIESCE, &mismatch_reason)) {
+        result = (bmi088_health.bus_error_count != bus_error_count_before)
+                     ? BMI088_GYRO_RECOVERY_FAILED_IO
+                     : BMI088_GYRO_RECOVERY_FAILED_CONFIG;
+    } else {
+        const bool pre_bypass_overrun =
+            (pre_bypass_status & BMI08_GYRO_FIFO_OVERRUN_MASK) != 0U;
+        const uint16_t pre_bypass_frames =
+            pre_bypass_status & BMI08_GYRO_FIFO_FRAME_COUNT_MASK;
+        const uint32_t recovery_gap =
+            bmi088_fifo_gyro_recovery_gap_count(pre_bypass_frames,
+                                                pre_bypass_overrun);
+        bmi088_gyro_sequence += recovery_gap;
+        bmi088_fifo_diagnostics.gyro_warmup_discard_count += recovery_gap;
+        if (pre_bypass_overrun)
+            bmi088_fifo_diagnostics.gyro_overrun_count++;
+
+        if (!bmi088_sync_gyro_fifo_to_capture(&mismatch_reason)) {
+            result = (bmi088_health.bus_error_count != bus_error_count_before)
+                         ? BMI088_GYRO_RECOVERY_FAILED_IO
+                         : BMI088_GYRO_RECOVERY_FAILED_SYNC;
+        } else if (!bmi088_verify_gyro_runtime_configuration(
+                       &mismatch_reason)) {
+            result = (bmi088_health.bus_error_count != bus_error_count_before)
+                         ? BMI088_GYRO_RECOVERY_FAILED_IO
+                         : BMI088_GYRO_RECOVERY_FAILED_CONFIG;
+        } else {
+            result = BMI088_GYRO_RECOVERY_SUCCEEDED;
+            bmi088_gyro_valid_after_us = imu_time_now_us();
+            bmi088_last_gyro_request_us = bmi088_gyro_valid_after_us;
+        }
+    }
+
+    if (result != BMI088_GYRO_RECOVERY_SUCCEEDED) {
+        uint32_t failure_reason = mismatch_reason;
+        if (result == BMI088_GYRO_RECOVERY_FAILED_IO)
+            failure_reason |= BMI088_GYRO_CAPTURE_REASON_RECOVERY_IO;
+        else if (result == BMI088_GYRO_RECOVERY_FAILED_CONFIG)
+            failure_reason |= BMI088_GYRO_CAPTURE_REASON_RECOVERY_CONFIG;
+        else if (failure_reason == 0U)
+            failure_reason = BMI088_GYRO_CAPTURE_REASON_SEQUENCE;
+        bmi088_latch_gyro_capture_fault(failure_reason);
+    }
+
+    const uint32_t finish_primask = __get_PRIMASK();
+    __disable_irq();
+    if ((result == BMI088_GYRO_RECOVERY_SUCCEEDED) &&
+        (!bmi088_gyro_capture_armed ||
+         (bmi088_fifo_diagnostics.gyro_capture_mismatch_reason != 0U))) {
+        result = BMI088_GYRO_RECOVERY_FAILED_SYNC;
+        if (bmi088_fifo_diagnostics.gyro_capture_mismatch_reason == 0U) {
+            bmi088_fifo_diagnostics.gyro_capture_mismatch_reason =
+                BMI088_GYRO_CAPTURE_REASON_SEQUENCE;
+        }
+    }
+    if (result == BMI088_GYRO_RECOVERY_SUCCEEDED) {
+        /* Recovery never writes accel registers. Restore the aggregate flag
+         * only when accel and the complete configuration had already been
+         * verified before this gyro-only boundary rebuild. */
+        bmi088_configuration.register_readback_verified =
+            bmi088_accel_register_readback_verified;
+        bmi088_gyro_capture_sync_fault = false;
+        bmi088_gyro_recovery_warmup = true;
+        bmi088_fifo_diagnostics.gyro_capture_sync_fault = false;
+        bmi088_fifo_diagnostics.gyro_capture_mismatch_reason = 0U;
+        bmi088_fifo_diagnostics.gyro_recovery_success_count++;
+    } else {
+        bmi088_gyro_capture_armed = false;
+        bmi088_gyro_capture_sync_fault = true;
+        bmi088_gyro_recovery_warmup = false;
+        bmi088_gyro_request_pending = false;
+        bmi088_gyro_request_timestamp_us = 0U;
+        bmi088_last_gyro_capture_sequence_valid = false;
+        bmi088_last_gyro_sample_us_valid = false;
+        bmi088_fifo_diagnostics.gyro_capture_sync_fault = true;
+        imu_timestamp_queue_discard(&bmi088_gyro_capture_queue);
+        bmi088_fifo_diagnostics.gyro_recovery_failure_count++;
+    }
+    bmi088_fifo_diagnostics.gyro_last_recovery_result = result;
+    bmi088_gyro_recovery_in_progress = false;
+    __set_PRIMASK(finish_primask);
+    return result;
+}
+
 bool bmi088_check_configuration(void)
 {
     if (!bmi088_initialized)
         return false;
+    if (!bmi088_blocking_bus_available())
+        return bmi088_configuration.register_readback_verified;
 
+    bmi088_configuration.register_readback_verified = false;
     const bool accel_ok = bmi088_check_accel_configuration();
     const bool gyro_ok = bmi088_check_gyro_configuration();
-    if (!accel_ok || !gyro_ok)
+    const bool fifo_ok = accel_ok && gyro_ok &&
+                         bmi088_verify_fifo_configuration();
+    if (!accel_ok || !gyro_ok || !fifo_ok) {
+        bmi088_accel_register_readback_verified = false;
         return false;
+    }
 
+    bmi088_accel_register_readback_verified = true;
+    bmi088_configuration.register_readback_verified = true;
     bmi088_health.status = IMU_STATUS_OK;
     return true;
 }
@@ -598,13 +811,13 @@ bool bmi088_read_accel(uint64_t timestamp_us, imu_accel_sample_t *sample)
     if (bmi088_temperature_countdown == 0U)
     {
         int32_t temperature_milli_c;
-        if (!bmi088_read_step(
-                bmi08a_get_sensor_temperature(&bmi088_device, &temperature_milli_c)))
-        {
-            return false;
+        if (bmi08a_get_sensor_temperature(
+                &bmi088_device, &temperature_milli_c) == BMI08_OK) {
+            (void)bmi088_store_temperature(temperature_milli_c,
+                                           timestamp_us);
+        } else {
+            bmi088_record_temperature_error();
         }
-        bmi088_temperature_c = (float)temperature_milli_c / 1000.0f;
-        bmi088_temperature_countdown = BMI088_TEMPERATURE_READ_DIVIDER;
     }
     else
     {
@@ -615,6 +828,8 @@ bool bmi088_read_accel(uint64_t timestamp_us, imu_accel_sample_t *sample)
     sample->accel_mps2[1] = (float)accel_raw.y * BMI088_ACCEL_SCALE_MPS2_PER_LSB;
     sample->accel_mps2[2] = (float)accel_raw.z * BMI088_ACCEL_SCALE_MPS2_PER_LSB;
     sample->temperature_c = bmi088_temperature_c;
+    sample->temperature_timestamp_us = bmi088_temperature_timestamp_us;
+    sample->temperature_valid = bmi088_temperature_valid;
     sample->sequence = ++bmi088_accel_sequence;
     sample->valid = true;
 
@@ -655,6 +870,8 @@ bool bmi088_read_gyro(uint64_t timestamp_us, imu_gyro_sample_t *sample)
     sample->gyro_rad_s[1] = (float)gyro_raw.y * BMI088_GYRO_SCALE_RAD_S_PER_LSB;
     sample->gyro_rad_s[2] = (float)gyro_raw.z * BMI088_GYRO_SCALE_RAD_S_PER_LSB;
     sample->temperature_c = bmi088_temperature_c;
+    sample->temperature_timestamp_us = bmi088_temperature_timestamp_us;
+    sample->temperature_valid = bmi088_temperature_valid;
     sample->sequence = ++bmi088_gyro_sequence;
     sample->valid = true;
 
@@ -691,6 +908,8 @@ bool bmi088_read(uint64_t timestamp_us, imu_sample_t *sample)
     memcpy(sample->accel_mps2, accel.accel_mps2, sizeof(sample->accel_mps2));
     memcpy(sample->gyro_rad_s, gyro.gyro_rad_s, sizeof(sample->gyro_rad_s));
     sample->temperature_c = accel.temperature_c;
+    sample->temperature_timestamp_us = accel.temperature_timestamp_us;
+    sample->temperature_valid = accel.temperature_valid;
     sample->source = IMU_SOURCE_BMI088;
     sample->accel_valid = true;
     sample->gyro_valid = true;
@@ -725,6 +944,7 @@ static void bmi088_latch_gyro_capture_fault(uint32_t reason)
     __disable_irq();
     bmi088_gyro_capture_armed = false;
     bmi088_gyro_capture_sync_fault = true;
+    bmi088_gyro_recovery_warmup = false;
     bmi088_gyro_request_pending = false;
     bmi088_gyro_request_timestamp_us = 0U;
     bmi088_last_gyro_capture_sequence_valid = false;
@@ -745,12 +965,14 @@ static bool bmi088_gyro_capture_epoch_is_current(uint32_t expected_epoch)
 
 bool bmi088_fifo_request_gyro(uint64_t capture_timestamp_us)
 {
-    if (!bmi088_initialized || bmi088_gyro_capture_sync_fault)
+    if (!bmi088_initialized || bmi088_gyro_capture_sync_fault ||
+        bmi088_gyro_recovery_in_progress)
         return false;
 
     const uint32_t primask = __get_PRIMASK();
     __disable_irq();
-    if (bmi088_gyro_capture_sync_fault)
+    if (bmi088_gyro_capture_sync_fault ||
+        bmi088_gyro_recovery_in_progress)
     {
         __set_PRIMASK(primask);
         return false;
@@ -809,7 +1031,10 @@ void bmi088_fifo_service(uint64_t now_us)
             bmi088_process_gyro_fifo();
     }
 
-    if ((now_us - bmi088_last_accel_request_us >=
+    if (bmi088_fifo_normal_service_allowed(
+            bmi088_gyro_recovery_quiesced,
+            bmi088_gyro_recovery_in_progress) &&
+        (now_us - bmi088_last_accel_request_us >=
          BMI088_ACCEL_FALLBACK_PERIOD_US) &&
         !bmi088_accel_request_pending &&
         (bmi088_dma_state != BMI088_DMA_ACCEL_LENGTH) &&
@@ -886,6 +1111,13 @@ bool bmi088_fifo_gyro_sync_faulted(void)
     return bmi088_gyro_capture_sync_fault;
 }
 
+bool bmi088_fifo_gyro_output_ready(void)
+{
+    return bmi088_initialized && !bmi088_gyro_capture_sync_fault &&
+           !bmi088_gyro_recovery_in_progress &&
+           !bmi088_gyro_recovery_warmup;
+}
+
 void bmi088_fifo_get_diagnostics(bmi088_fifo_diagnostics_t *diagnostics)
 {
     if (diagnostics == NULL)
@@ -894,6 +1126,10 @@ void bmi088_fifo_get_diagnostics(bmi088_fifo_diagnostics_t *diagnostics)
     const uint32_t primask = __get_PRIMASK();
     __disable_irq();
     *diagnostics = bmi088_fifo_diagnostics;
+    diagnostics->gyro_recovery_warmup = bmi088_gyro_recovery_warmup;
+    diagnostics->temperature_timestamp_us = bmi088_temperature_timestamp_us;
+    diagnostics->temperature_c = bmi088_temperature_c;
+    diagnostics->temperature_valid = bmi088_temperature_valid;
     __set_PRIMASK(primask);
 }
 
@@ -1104,6 +1340,69 @@ static bool bmi088_verify_gyro_configuration(void)
     return true;
 }
 
+static bool bmi088_verify_gyro_runtime_configuration(
+    uint32_t *mismatch_reason)
+{
+    if (mismatch_reason == NULL)
+        return false;
+
+    uint8_t chip_id = 0U;
+    uint8_t core_registers[3] = {0U, 0U, 0U};
+    uint8_t interrupt_registers[4] = {0U, 0U, 0U, 0U};
+
+    if (!bmi088_init_step(
+            bmi08g_get_regs(BMI08_REG_GYRO_CHIP_ID, &chip_id,
+                            sizeof(chip_id), &bmi088_device),
+            IMU_STATUS_BAD_ID)) {
+        *mismatch_reason |= BMI088_GYRO_CAPTURE_REASON_RECOVERY_ID;
+        return false;
+    }
+    bmi088_fifo_diagnostics.gyro_runtime_chip_id = chip_id;
+
+    if (!bmi088_init_step(
+            bmi08g_get_regs(BMI08_REG_GYRO_RANGE, core_registers,
+                            sizeof(core_registers), &bmi088_device),
+            IMU_STATUS_CONFIG_ERROR)) {
+        *mismatch_reason |= BMI088_GYRO_CAPTURE_REASON_RECOVERY_CORE;
+        return false;
+    }
+    memcpy(bmi088_fifo_diagnostics.gyro_runtime_core_registers,
+           core_registers, sizeof(core_registers));
+
+    if (!bmi088_init_step(
+            bmi08g_get_regs(BMI08_REG_GYRO_INT_CTRL, interrupt_registers,
+                            sizeof(interrupt_registers), &bmi088_device),
+            IMU_STATUS_CONFIG_ERROR)) {
+        *mismatch_reason |= BMI088_GYRO_CAPTURE_REASON_RECOVERY_INTERRUPT;
+        return false;
+    }
+    memcpy(bmi088_fifo_diagnostics.gyro_runtime_interrupt_registers,
+           interrupt_registers, sizeof(interrupt_registers));
+
+    if (chip_id != BMI08_GYRO_CHIP_ID) {
+        *mismatch_reason |= BMI088_GYRO_CAPTURE_REASON_RECOVERY_ID;
+        bmi088_health.status = IMU_STATUS_BAD_ID;
+        return false;
+    }
+    if (!bmi088_fifo_gyro_core_config_valid(
+            core_registers[0], core_registers[1], core_registers[2],
+            BMI088_GYRO_RANGE_SETTING, BMI088_GYRO_ODR_SETTING,
+            BMI08_GYRO_PM_NORMAL)) {
+        *mismatch_reason |= BMI088_GYRO_CAPTURE_REASON_RECOVERY_CORE;
+        bmi088_health.status = IMU_STATUS_CONFIG_ERROR;
+        return false;
+    }
+    if (!bmi088_fifo_gyro_interrupt_config_valid(
+            interrupt_registers[0], interrupt_registers[1],
+            interrupt_registers[3])) {
+        *mismatch_reason |= BMI088_GYRO_CAPTURE_REASON_RECOVERY_INTERRUPT;
+        bmi088_health.status = IMU_STATUS_CONFIG_ERROR;
+        return false;
+    }
+
+    return bmi088_verify_gyro_fifo_configuration(mismatch_reason);
+}
+
 static bool bmi088_verify_configuration(void)
 {
     if (!bmi088_verify_accel_configuration() ||
@@ -1111,6 +1410,7 @@ static bool bmi088_verify_configuration(void)
         !bmi088_verify_fifo_configuration())
         return false;
 
+    bmi088_accel_register_readback_verified = true;
     bmi088_configuration.register_readback_verified = true;
     return true;
 }
@@ -1161,7 +1461,9 @@ static bool bmi088_configure_fifo(void)
     return bmi088_verify_fifo_configuration();
 }
 
-static bool bmi088_set_gyro_fifo_bypass(void)
+static bool bmi088_set_gyro_fifo_bypass(
+    bmi088_gyro_bypass_phase_t phase,
+    uint32_t *mismatch_reason)
 {
     const struct bmi08_gyr_fifo_config bypass_config = {
         .mode = BMI08_GYRO_FIFO_MODE_BYPASS,
@@ -1171,32 +1473,82 @@ static bool bmi088_set_gyro_fifo_bypass(void)
         .wm_level = BMI088_GYRO_FIFO_WATERMARK_FRAMES,
     };
     struct bmi08_gyr_fifo_config readback = {0};
+    uint8_t boundary_status = 0U;
+    bmi088_fifo_diagnostics.gyro_last_bypass_mode = UINT8_MAX;
+    bmi088_fifo_diagnostics.gyro_last_bypass_frame_count = UINT8_MAX;
 
     if (!bmi088_init_step(
             bmi08g_set_fifo_config(&bypass_config, &bmi088_device),
             IMU_STATUS_CONFIG_ERROR))
     {
+        if (mismatch_reason != NULL)
+            *mismatch_reason |=
+                BMI088_GYRO_CAPTURE_REASON_RECOVERY_BYPASS_API;
         return false;
     }
 
-    /* Gyro register writes need the suspended-mode write delay before they can
-     * be verified. In NORMAL mode this delay would cross multiple 2 kHz DRDY
-     * edges and break the BYPASS-to-STREAM phase handshake. */
-    if (bmi088_device.gyro_cfg.power == BMI08_GYRO_PM_SUSPEND)
-        bmi088_delay_us(UINT32_C(1000), bmi088_device.intf_ptr_gyro);
+    /* QUIESCE intentionally lets an in-flight sample settle while output is
+     * disarmed. STRICT_BOUNDARY relies only on the Bosch driver's register
+     * write delay so no new 2 kHz frame can appear before the empty check. */
+    if ((phase == BMI088_GYRO_BYPASS_QUIESCE) ||
+        (bmi088_device.gyro_cfg.power == BMI08_GYRO_PM_SUSPEND))
+    {
+        bmi088_delay_us(BMI088_GYRO_BYPASS_QUIESCE_US,
+                        bmi088_device.intf_ptr_gyro);
+    }
 
     if (!bmi088_init_step(
             bmi08g_get_fifo_config(&readback, &bmi088_device),
             IMU_STATUS_CONFIG_ERROR))
     {
+        if (mismatch_reason != NULL)
+            *mismatch_reason |=
+                BMI088_GYRO_CAPTURE_REASON_RECOVERY_BYPASS_API;
         return false;
     }
 
-    if ((readback.mode != BMI08_GYRO_FIFO_MODE_BYPASS) ||
-        (readback.frame_count != 0U))
-    {
+    bmi088_fifo_diagnostics.gyro_last_bypass_mode = readback.mode;
+    bmi088_fifo_diagnostics.gyro_last_bypass_frame_count =
+        readback.frame_count;
+
+    if (readback.mode != BMI08_GYRO_FIFO_MODE_BYPASS) {
+        if (mismatch_reason != NULL)
+            *mismatch_reason |=
+                BMI088_GYRO_CAPTURE_REASON_RECOVERY_BYPASS_MODE;
         bmi088_health.status = IMU_STATUS_CONFIG_ERROR;
         return false;
+    }
+
+    if (phase == BMI088_GYRO_BYPASS_STRICT_BOUNDARY) {
+        /* BMI088 Rev1.9 section 5.5.16 guarantees that the preceding
+         * FIFO_CONFIG_1 write clears both the FIFO and its sticky overrun bit.
+         * The Bosch getter exposes only frame_count, so verify the raw status
+         * before treating this as a new capture/FIFO ownership boundary. */
+        if (!bmi088_init_step(
+                bmi08g_get_regs(BMI08_REG_GYRO_FIFO_STATUS,
+                                &boundary_status, 1U, &bmi088_device),
+                IMU_STATUS_CONFIG_ERROR)) {
+            if (mismatch_reason != NULL)
+                *mismatch_reason |=
+                    BMI088_GYRO_CAPTURE_REASON_RECOVERY_STATUS_API;
+            return false;
+        }
+        bmi088_fifo_diagnostics.gyro_last_bypass_frame_count =
+            boundary_status & BMI08_GYRO_FIFO_FRAME_COUNT_MASK;
+        if (!bmi088_fifo_gyro_boundary_status_valid(boundary_status)) {
+            if (mismatch_reason != NULL) {
+                if ((boundary_status & BMI08_GYRO_FIFO_OVERRUN_MASK) != 0U)
+                    *mismatch_reason |=
+                        BMI088_GYRO_CAPTURE_REASON_FIFO_OVERRUN;
+                if ((boundary_status &
+                     BMI08_GYRO_FIFO_FRAME_COUNT_MASK) != 0U) {
+                    *mismatch_reason |=
+                        BMI088_GYRO_CAPTURE_REASON_RECOVERY_BYPASS_COUNT;
+                }
+            }
+            bmi088_health.status = IMU_STATUS_CONFIG_ERROR;
+            return false;
+        }
     }
 
     return true;
@@ -1228,23 +1580,24 @@ static bool bmi088_sync_gyro_fifo_to_capture(uint32_t *mismatch_reason)
         __set_PRIMASK(primask);
 
         uint8_t status = 0U;
-        if (bmi08g_get_regs(BMI08_REG_GYRO_FIFO_STATUS, &status, 1U,
-                            &bmi088_device) != BMI08_OK)
+        if (!bmi088_init_step(
+                bmi08g_get_regs(BMI08_REG_GYRO_FIFO_STATUS, &status, 1U,
+                                &bmi088_device),
+                IMU_STATUS_CONFIG_ERROR))
         {
             *mismatch_reason |= BMI088_GYRO_CAPTURE_REASON_FRAME_COUNT;
             return false;
         }
-        if ((status & BMI08_GYRO_FIFO_OVERRUN_MASK) != 0U)
-        {
-            *mismatch_reason |= BMI088_GYRO_CAPTURE_REASON_FIFO_OVERRUN;
-            return false;
-        }
-
+        /* This is deliberately a pre-clear observation. A sticky overrun is
+         * the reason to rebuild the boundary, not a reason to skip the
+         * FIFO_CONFIG_1 write that clears it. The strict BYPASS readback below
+         * is the first status that must be empty and non-overrun. */
         const uint16_t fifo_frames =
             status & BMI08_GYRO_FIFO_FRAME_COUNT_MASK;
         bmi088_gyro_sequence += fifo_frames;
         bmi088_fifo_diagnostics.gyro_warmup_discard_count += fifo_frames;
-        if (!bmi088_set_gyro_fifo_bypass())
+        if (!bmi088_set_gyro_fifo_bypass(
+                BMI088_GYRO_BYPASS_STRICT_BOUNDARY, mismatch_reason))
         {
             *mismatch_reason |= BMI088_GYRO_CAPTURE_REASON_FRAME_COUNT;
             return false;
@@ -1304,7 +1657,9 @@ static bool bmi088_sync_gyro_fifo_to_capture(uint32_t *mismatch_reason)
 
         const uint32_t seed_sequence =
             bmi088_gyro_capture_sequences[capture_count - 1U];
-        if (bmi08g_set_fifo_config(&stream_config, &bmi088_device) != BMI08_OK)
+        if (!bmi088_init_step(
+                bmi08g_set_fifo_config(&stream_config, &bmi088_device),
+                IMU_STATUS_CONFIG_ERROR))
         {
             *mismatch_reason |= BMI088_GYRO_CAPTURE_REASON_FRAME_COUNT;
             return false;
@@ -1326,14 +1681,54 @@ static bool bmi088_sync_gyro_fifo_to_capture(uint32_t *mismatch_reason)
     return false;
 }
 
+static bool bmi088_verify_gyro_fifo_configuration(uint32_t *mismatch_reason)
+{
+    struct bmi08_gyr_fifo_config gyro_fifo = {0};
+    uint8_t gyro_watermark_interrupt = 0U;
+
+    if (!bmi088_init_step(
+            bmi08g_get_fifo_config(&gyro_fifo, &bmi088_device),
+            IMU_STATUS_CONFIG_ERROR) ||
+        !bmi088_init_step(
+            bmi08g_get_regs(BMI08_REG_GYRO_FIFO_WM_ENABLE,
+                            &gyro_watermark_interrupt, 1U, &bmi088_device),
+            IMU_STATUS_CONFIG_ERROR)) {
+        if (mismatch_reason != NULL)
+            *mismatch_reason |= BMI088_GYRO_CAPTURE_REASON_RECOVERY_FIFO_API;
+        return false;
+    }
+
+    bmi088_fifo_diagnostics.gyro_runtime_fifo_mode = gyro_fifo.mode;
+    bmi088_fifo_diagnostics.gyro_runtime_fifo_data_select =
+        gyro_fifo.data_select;
+    bmi088_fifo_diagnostics.gyro_runtime_fifo_tag = gyro_fifo.tag;
+    bmi088_fifo_diagnostics.gyro_runtime_fifo_watermark =
+        gyro_fifo.wm_level;
+    bmi088_fifo_diagnostics.gyro_runtime_fifo_watermark_interrupt =
+        gyro_watermark_interrupt;
+
+    if ((gyro_fifo.mode != BMI08_GYRO_FIFO_MODE_STREAM) ||
+        (gyro_fifo.data_select != BMI08_GYRO_FIFO_XYZ_AXIS_ENABLED) ||
+        (gyro_fifo.tag != BMI08_GYRO_FIFO_TAG_DISABLED) ||
+        (gyro_fifo.wm_level != BMI088_GYRO_FIFO_WATERMARK_FRAMES) ||
+        (gyro_watermark_interrupt !=
+         BMI088_GYRO_FIFO_WM_INTERRUPT_DISABLED)) {
+        if (mismatch_reason != NULL)
+            *mismatch_reason |=
+                BMI088_GYRO_CAPTURE_REASON_RECOVERY_FIFO_VALUE;
+        bmi088_health.status = IMU_STATUS_CONFIG_ERROR;
+        return false;
+    }
+
+    return true;
+}
+
 static bool bmi088_verify_fifo_configuration(void)
 {
     struct bmi08_accel_fifo_config accel_fifo = { 0 };
-    struct bmi08_gyr_fifo_config gyro_fifo = { 0 };
     uint16_t accel_watermark = 0U;
     uint8_t accel_downsample = 0U;
     uint8_t accel_fifo_config_raw[2] = { 0U, 0U };
-    uint8_t gyro_watermark_interrupt = 0U;
 
     if (!bmi088_init_step(
             bmi08a_get_set_regs(BMI08_FIFO_DOWNS_ADDR, &accel_downsample,
@@ -1353,13 +1748,6 @@ static bool bmi088_verify_fifo_configuration(void)
                                 accel_fifo_config_raw,
                                 sizeof(accel_fifo_config_raw),
                                 &bmi088_device, GET_FUNC),
-            IMU_STATUS_CONFIG_ERROR) ||
-        !bmi088_init_step(
-            bmi08g_get_fifo_config(&gyro_fifo, &bmi088_device),
-            IMU_STATUS_CONFIG_ERROR) ||
-        !bmi088_init_step(
-            bmi08g_get_regs(BMI08_REG_GYRO_FIFO_WM_ENABLE,
-                            &gyro_watermark_interrupt, 1U, &bmi088_device),
             IMU_STATUS_CONFIG_ERROR))
     {
         return false;
@@ -1374,24 +1762,19 @@ static bool bmi088_verify_fifo_configuration(void)
         (accel_fifo.mode != BMI08_ACC_STREAM_MODE) ||
         (accel_fifo.accel_en != BMI08_ENABLE) ||
         (accel_fifo.int1_en != BMI08_DISABLE) ||
-        (accel_fifo.int2_en != BMI08_DISABLE) ||
-        (gyro_fifo.mode != BMI08_GYRO_FIFO_MODE_STREAM) ||
-        (gyro_fifo.data_select != BMI08_GYRO_FIFO_XYZ_AXIS_ENABLED) ||
-        (gyro_fifo.tag != BMI08_GYRO_FIFO_TAG_DISABLED) ||
-        (gyro_fifo.wm_level != BMI088_GYRO_FIFO_WATERMARK_FRAMES) ||
-        (gyro_watermark_interrupt !=
-         BMI088_GYRO_FIFO_WM_INTERRUPT_DISABLED))
+        (accel_fifo.int2_en != BMI08_DISABLE))
     {
         bmi088_health.status = IMU_STATUS_CONFIG_ERROR;
         return false;
     }
 
-    return true;
+    return bmi088_verify_gyro_fifo_configuration(NULL);
 }
 
 static bool bmi088_blocking_bus_available(void)
 {
-    return (bmi088_dma_state == BMI088_DMA_IDLE) &&
+    return !bmi088_gyro_recovery_in_progress &&
+           (bmi088_dma_state == BMI088_DMA_IDLE) &&
            !imu_spi_dma_is_busy(&hspi1) &&
            (HAL_SPI_GetState(&hspi1) == HAL_SPI_STATE_READY);
 }
@@ -1633,7 +2016,13 @@ static bool bmi088_submit_gyro_data(uint16_t fifo_frames)
 
 static void bmi088_fifo_kick(void)
 {
-    if ((bmi088_dma_state != BMI088_DMA_IDLE) ||
+    /* Gyro recovery needs a bounded SPI1 quiescent point. Existing DMA/raw
+     * work is completed and published by bmi088_fifo_service(), but no new
+     * accel fallback or pending request may starve the boundary rebuild. */
+    if (!bmi088_fifo_normal_service_allowed(
+            bmi088_gyro_recovery_quiesced,
+            bmi088_gyro_recovery_in_progress) ||
+        (bmi088_dma_state != BMI088_DMA_IDLE) ||
         imu_spi_dma_is_busy(&hspi1))
     {
         return;
@@ -1935,6 +2324,31 @@ static uint64_t bmi088_backdate_timestamp(uint64_t newest_timestamp_us,
         : 1U;
 }
 
+static bool bmi088_store_temperature(int32_t temperature_milli_c,
+                                     uint64_t timestamp_us)
+{
+    const float temperature_c = (float)temperature_milli_c / 1000.0f;
+    if ((timestamp_us == 0U) ||
+        (temperature_c < BMI088_TEMPERATURE_MIN_VALID_C) ||
+        (temperature_c > BMI088_TEMPERATURE_MAX_VALID_C)) {
+        bmi088_record_temperature_error();
+        return false;
+    }
+
+    bmi088_temperature_c = temperature_c;
+    bmi088_temperature_timestamp_us = timestamp_us;
+    bmi088_temperature_valid = true;
+    bmi088_temperature_countdown = BMI088_TEMPERATURE_READ_DIVIDER;
+    bmi088_fifo_diagnostics.temperature_read_count++;
+    return true;
+}
+
+static void bmi088_record_temperature_error(void)
+{
+    bmi088_fifo_diagnostics.temperature_read_error_count++;
+    bmi088_temperature_countdown = BMI088_TEMPERATURE_RETRY_DIVIDER;
+}
+
 static void bmi088_update_fifo_temperature(uint16_t sample_count)
 {
     if (sample_count == 0U)
@@ -1956,14 +2370,12 @@ static void bmi088_update_fifo_temperature(uint16_t sample_count)
     if (bmi08a_get_sensor_temperature(
             &bmi088_device, &temperature_milli_c) == BMI08_OK)
     {
-        bmi088_temperature_c = (float)temperature_milli_c / 1000.0f;
-        bmi088_temperature_countdown = BMI088_TEMPERATURE_READ_DIVIDER;
+        (void)bmi088_store_temperature(temperature_milli_c,
+                                       imu_time_now_us());
     }
     else
     {
-        bmi088_health.status = IMU_STATUS_BUS_ERROR;
-        bmi088_health.bus_error_count++;
-        bmi088_temperature_countdown = 0U;
+        bmi088_record_temperature_error();
     }
 }
 
@@ -2148,7 +2560,6 @@ static void bmi088_process_accel_fifo(void)
         }
     }
 
-    bmi088_update_fifo_temperature(parsed_count);
     batch.count = parsed_count;
     uint64_t fallback_newest_us = bmi088_accel_raw_request_timestamp_us;
     if (fallback_newest_us == 0U)
@@ -2224,10 +2635,16 @@ static void bmi088_process_accel_fifo(void)
         sample->accel_mps2[2] =
             (float)raw->z * BMI088_ACCEL_SCALE_MPS2_PER_LSB;
         sample->temperature_c = bmi088_temperature_c;
+        sample->temperature_timestamp_us = bmi088_temperature_timestamp_us;
+        sample->temperature_valid = bmi088_temperature_valid;
         sample->sequence = ++bmi088_accel_sequence;
         sample->source = IMU_SOURCE_BMI088;
         sample->valid = true;
     }
+
+    /* Refresh after snapshotting the batch so a newly read observation is
+     * never attached to samples that predate it. */
+    bmi088_update_fifo_temperature(parsed_count);
 
     if (!all_timestamps_mapped && (parsed_count != 0U))
         batch.flags |= BMI088_FIFO_BATCH_FLAG_TIMESTAMP_ESTIMATED;
@@ -2407,6 +2824,8 @@ static void bmi088_process_gyro_fifo(void)
             (float)bmi088_read_i16_le(&raw[4]) *
             BMI088_GYRO_SCALE_RAD_S_PER_LSB;
         sample->temperature_c = bmi088_temperature_c;
+        sample->temperature_timestamp_us = bmi088_temperature_timestamp_us;
+        sample->temperature_valid = bmi088_temperature_valid;
         sample->sequence = physical_sequence;
         sample->source = IMU_SOURCE_BMI088;
         sample->valid = true;
@@ -2435,6 +2854,7 @@ static void bmi088_process_gyro_fifo(void)
     bmi088_health.read_count += valid_count;
     bmi088_health.last_sample_us = batch.latest_capture_timestamp_us;
     bmi088_health.status = IMU_STATUS_OK;
+    bmi088_gyro_recovery_warmup = false;
     bmi088_gyro_batch_ready = true;
     __set_PRIMASK(publish_primask);
 }

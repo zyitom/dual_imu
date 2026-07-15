@@ -34,6 +34,20 @@ enable_language(C ASM)
 # Create an executable object type
 add_executable(${CMAKE_PROJECT_NAME})
 
+set(IMU_CALIBRATION_PRODUCTION_BUILD "1" CACHE STRING
+    "Production interlock for IMU calibration")
+set(IMU_CALIBRATION_HIGH_ORDER_TEMPERATURE_COMPENSATION_BUILD_ENABLE "0"
+    CACHE STRING "Qualification-only passive high-order temperature correction")
+set(IMU_CALIBRATION_G_SENSITIVITY_BUILD_ENABLE "0" CACHE STRING
+    "Qualification-only gyro g-sensitivity correction")
+if(NOT IMU_CALIBRATION_PRODUCTION_BUILD STREQUAL "1" OR
+   NOT IMU_CALIBRATION_HIGH_ORDER_TEMPERATURE_COMPENSATION_BUILD_ENABLE
+       STREQUAL "0" OR
+   NOT IMU_CALIBRATION_G_SENSITIVITY_BUILD_ENABLE STREQUAL "0")
+    message(FATAL_ERROR
+        "ARM firmware requires production=1, high-order=0 and g-sensitivity=0")
+endif()
+
 # The IMU DMA staging addresses must remain reserved even after CubeMX
 # regenerates its default linker script. The toolchain must use our layout.
 if(NOT CMAKE_EXE_LINKER_FLAGS MATCHES "dual_imu_h743\\.ld")
@@ -57,8 +71,10 @@ set(APPLICATION_SOURCES
     App/imu/bmi088.c
     App/imu/icm45686.c
     App/imu/imu_calibration.c
+    App/imu/imu_causal_accel_history.c
     App/imu/imu_clock_sync.c
     App/imu/imu_geometry.c
+    App/imu/imu_motion_guard.c
     App/imu/imu_spi_dma.c
     App/imu/imu_stream_buffer.c
     App/imu/imu_time.c
@@ -97,7 +113,9 @@ target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
 
 # Add project symbols (macros)
 target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE
-    # Add user defined symbols
+    IMU_CALIBRATION_PRODUCTION_BUILD=1
+    IMU_CALIBRATION_HIGH_ORDER_TEMPERATURE_COMPENSATION_BUILD_ENABLE=0
+    IMU_CALIBRATION_G_SENSITIVITY_BUILD_ENABLE=0
 )
 
 # Remove wrong libob.a library dependency when using cpp files

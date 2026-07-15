@@ -9,5 +9,6 @@
 
 uint8_t CDC_Transmit_FS(uint8_t *buffer, uint16_t length);
 uint8_t CDC_IsPortOpen_FS(void);
+uint8_t CDC_TxReady_FS(void);
 
 #endif

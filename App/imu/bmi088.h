@@ -51,6 +51,15 @@ typedef enum
     BMI088_FIFO_BATCH_FLAG_CAPTURE_MISMATCH = (1U << 6)
 } bmi088_fifo_batch_flag_t;
 
+typedef enum
+{
+    BMI088_GYRO_RECOVERY_DEFERRED = 0,
+    BMI088_GYRO_RECOVERY_SUCCEEDED,
+    BMI088_GYRO_RECOVERY_FAILED_SYNC,
+    BMI088_GYRO_RECOVERY_FAILED_IO,
+    BMI088_GYRO_RECOVERY_FAILED_CONFIG
+} bmi088_gyro_recovery_result_t;
+
 typedef struct
 {
     imu_accel_sample_t samples[BMI088_FIFO_MAX_BATCH_SAMPLES];
@@ -92,6 +101,21 @@ typedef struct
     uint32_t gyro_capture_queue_overflow_count;
     uint32_t gyro_capture_mismatch_reason;
     uint32_t gyro_warmup_discard_count;
+    uint32_t gyro_recovery_attempt_count;
+    uint32_t gyro_recovery_success_count;
+    uint32_t gyro_recovery_failure_count;
+    uint32_t gyro_last_recovery_reason;
+    bmi088_gyro_recovery_result_t gyro_last_recovery_result;
+    uint8_t gyro_last_bypass_mode;
+    uint8_t gyro_last_bypass_frame_count;
+    uint8_t gyro_runtime_chip_id;
+    uint8_t gyro_runtime_core_registers[3];
+    uint8_t gyro_runtime_interrupt_registers[4];
+    uint8_t gyro_runtime_fifo_mode;
+    uint8_t gyro_runtime_fifo_data_select;
+    uint8_t gyro_runtime_fifo_tag;
+    uint8_t gyro_runtime_fifo_watermark;
+    uint8_t gyro_runtime_fifo_watermark_interrupt;
     uint32_t accel_clock_stale_reset_count;
     uint32_t accel_clock_causal_reset_count;
     uint32_t accel_timeline_reset_count;
@@ -107,6 +131,12 @@ typedef struct
     uint16_t accel_initial_fifo_bytes;
     bool accel_snapshot_valid;
     bool gyro_capture_sync_fault;
+    bool gyro_recovery_warmup;
+    uint32_t temperature_read_count;
+    uint32_t temperature_read_error_count;
+    uint64_t temperature_timestamp_us;
+    float temperature_c;
+    bool temperature_valid;
 } bmi088_fifo_diagnostics_t;
 
 typedef struct
@@ -132,6 +162,10 @@ extern "C" {
 bool bmi088_init(void);
 /* Starts gyro acquisition from the FIFO/capture boundary prepared by init. */
 bool bmi088_fifo_start_gyro(void);
+/* Recovers only a faulted gyro FIFO/capture lane. Call from thread context. */
+bool bmi088_fifo_gyro_recovery_ready(void);
+void bmi088_fifo_set_gyro_recovery_quiesced(bool quiesced);
+bmi088_gyro_recovery_result_t bmi088_fifo_recover_gyro(void);
 bool bmi088_check_configuration(void);
 bool bmi088_check_accel_configuration(void);
 bool bmi088_check_gyro_configuration(void);
@@ -150,6 +184,8 @@ bool bmi088_fifo_pop_accel_batch(bmi088_accel_fifo_batch_t *batch);
 bool bmi088_fifo_pop_gyro_batch(bmi088_gyro_fifo_batch_t *batch);
 bool bmi088_fifo_dma_busy(void);
 bool bmi088_fifo_gyro_sync_faulted(void);
+/* False after recovery until the first post-boundary gyro batch is published. */
+bool bmi088_fifo_gyro_output_ready(void);
 void bmi088_fifo_get_diagnostics(bmi088_fifo_diagnostics_t *diagnostics);
 void bmi088_fifo_get_clock_sync_diagnostics(
     imu_clock_sync_diagnostics_t *diagnostics);

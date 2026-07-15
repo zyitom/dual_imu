@@ -19,11 +19,13 @@
 #if ICM45686_USE_ROBUST_HIGH_RATE_PROFILE
 #define ICM45686_CONFIG_ACCEL_ODR_HZ          UINT16_C(1600)
 #define ICM45686_CONFIG_ACCEL_BANDWIDTH_HZ    UINT16_C(100)
+#define ICM45686_CONFIG_ACCEL_MAX_GAP_US      UINT32_C(1000)
 #define ICM45686_CONFIG_GYRO_ODR_HZ           UINT16_C(3200)
 #define ICM45686_CONFIG_GYRO_BANDWIDTH_HZ     UINT16_C(200)
 #else
 #define ICM45686_CONFIG_ACCEL_ODR_HZ          UINT16_C(400)
 #define ICM45686_CONFIG_ACCEL_BANDWIDTH_HZ    UINT16_C(50)
+#define ICM45686_CONFIG_ACCEL_MAX_GAP_US      UINT32_C(4000)
 #define ICM45686_CONFIG_GYRO_ODR_HZ           UINT16_C(400)
 #define ICM45686_CONFIG_GYRO_BANDWIDTH_HZ     UINT16_C(50)
 #endif
@@ -78,6 +80,36 @@ typedef struct
     bool fsync_event;
 } icm45686_fifo_frame_t;
 
+/* A valid timestamp identifies a real FIFO sample slot even when the device
+ * encodes the gyro axes with its invalid-data sentinel. Preserve that slot as
+ * a finite invalid node so downstream integration cannot bridge across it. */
+static inline bool icm45686_fifo_frame_to_gyro_sample(
+    const icm45686_fifo_frame_t *frame,
+    float temperature_c,
+    imu_gyro_sample_t *sample)
+{
+    if ((frame == NULL) || (sample == NULL) || !frame->timestamp_valid ||
+        !frame->mcu_timestamp_valid || (frame->mcu_timestamp_us == 0U)) {
+        return false;
+    }
+
+    sample->timestamp_us = frame->mcu_timestamp_us;
+    sample->sequence = 0U;
+    for (size_t axis = 0U; axis < 3U; ++axis) {
+        sample->gyro_rad_s[axis] = frame->gyro_valid
+                                      ? frame->gyro_rad_s[axis]
+                                      : 0.0f;
+    }
+    sample->temperature_c = temperature_c;
+    sample->temperature_timestamp_us = frame->temperature_valid
+                                           ? frame->mcu_timestamp_us
+                                           : 0U;
+    sample->source = IMU_SOURCE_ICM45686;
+    sample->temperature_valid = frame->temperature_valid;
+    sample->valid = frame->gyro_valid;
+    return true;
+}
+
 typedef struct
 {
     uint64_t watermark_anchor_us;
@@ -85,6 +117,7 @@ typedef struct
     uint16_t parsed_frame_count;
     uint16_t accel_frame_count;
     uint16_t gyro_frame_count;
+    uint16_t temperature_invalid_frame_count;
     uint16_t malformed_frame_count;
     uint16_t timestamp_discontinuity_count;
 } icm45686_fifo_batch_report_t;
@@ -101,6 +134,7 @@ typedef struct
     uint32_t timestamp_discontinuity_count;
     uint32_t output_overrun_count;
     uint32_t count_read_error_count;
+    uint32_t temperature_invalid_frame_count;
     uint32_t clock_anchor_accepted_count;
     uint32_t clock_anchor_rejected_count;
     uint32_t clock_nonmonotonic_reject_count;

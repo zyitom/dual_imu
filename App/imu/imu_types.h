@@ -27,6 +27,7 @@ typedef struct
     uint64_t timestamp_us;
     uint64_t accel_timestamp_us;
     uint64_t gyro_timestamp_us;
+    uint64_t temperature_timestamp_us;
     uint32_t sequence;
     uint32_t accel_sequence;
     uint32_t gyro_sequence;
@@ -36,26 +37,31 @@ typedef struct
     imu_source_t source;
     bool accel_valid;
     bool gyro_valid;
+    bool temperature_valid;
     bool valid;
 } imu_sample_t;
 
 typedef struct
 {
     uint64_t timestamp_us;
+    uint64_t temperature_timestamp_us;
     uint32_t sequence;
     float accel_mps2[3];
     float temperature_c;
     imu_source_t source;
+    bool temperature_valid;
     bool valid;
 } imu_accel_sample_t;
 
 typedef struct
 {
     uint64_t timestamp_us;
+    uint64_t temperature_timestamp_us;
     uint32_t sequence;
     float gyro_rad_s[3];
     float temperature_c;
     imu_source_t source;
+    bool temperature_valid;
     bool valid;
 } imu_gyro_sample_t;
 

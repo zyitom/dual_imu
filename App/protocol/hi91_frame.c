@@ -43,17 +43,18 @@ uint16_t hi91_crc16_ccitt_update(uint16_t current_crc,
     if ((source == NULL) && (length != 0U))
         return current_crc;
 
-    uint32_t crc = current_crc;
+    uint16_t crc = current_crc;
     for (size_t byte_index = 0U; byte_index < length; ++byte_index) {
-        crc ^= (uint32_t)source[byte_index] << 8U;
-        for (uint32_t bit_index = 0U; bit_index < 8U; ++bit_index) {
-            const uint32_t polynomial =
-                ((crc & UINT32_C(0x8000)) != 0U) ? UINT32_C(0x1021) : 0U;
-            crc = ((crc << 1U) ^ polynomial) & UINT32_C(0xFFFF);
-        }
+        /* Fold through x^16 + x^12 + x^5 + 1 without an eight-bit loop. */
+        uint8_t folded =
+            (uint8_t)(source[byte_index] ^ (uint8_t)(crc >> 8U));
+        folded ^= (uint8_t)(folded >> 4U);
+        crc = (uint16_t)(((uint32_t)crc << 8U) ^
+                         ((uint32_t)folded << 12U) ^
+                         ((uint32_t)folded << 5U) ^ (uint32_t)folded);
     }
 
-    return (uint16_t)crc;
+    return crc;
 }
 
 size_t hi91_frame_encode(uint8_t *destination,

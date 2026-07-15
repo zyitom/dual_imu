@@ -59,6 +59,7 @@ typedef struct
 {
     uint32_t propagation_count;
     uint32_t propagation_reject_count;
+    uint32_t unobserved_rotation_count;
     uint32_t accel_update_count;
     uint32_t accel_accept_count;
     uint32_t accel_invalid_reject_count;
@@ -117,6 +118,16 @@ bool attitude_mekf_propagate_delta(attitude_mekf_t *filter,
                                    float dt_s);
 
 /*
+ * Records a time interval whose angular displacement was not observed. The
+ * nominal quaternion and bias stay unchanged while the attitude covariance is
+ * enlarged isotropically by rotation_std_rad^2. This is intentionally separate
+ * from propagate_delta(): integrating a clipped gyro value would create a
+ * precise but false attitude.
+ */
+bool attitude_mekf_mark_rotation_unobserved(attitude_mekf_t *filter,
+                                            float rotation_std_rad);
+
+/*
  * The update is rank-two in the gravity tangent plane and cannot observe yaw.
  * variance_scale must be finite and >= 1; use it for caller-detected
  * vibration/dynamics, and skip this call entirely during a hard accel gate.
@@ -140,11 +151,13 @@ attitude_mekf_zaru_result_t attitude_mekf_update_zero_rate(
 
 /*
  * Bounded form for an internally inferred stationary interval.  The input is
- * already fixed/temperature calibrated, so its residual target is clipped
- * around zero before the z=bg+n update.  If the unconstrained Kalman update
- * would move the 3-D bias vector by more than max_bias_correction_rad_s, the
- * complete gain is scaled uniformly and the same gain is used by the Joseph
- * covariance update.  bounded_target_rad_s may be NULL.
+ * already fixed/temperature calibrated. Its residual relative to the current
+ * bias estimate is clipped before the z=bg+n update, so a previously learned
+ * bias outside that residual band is not pulled back toward zero. If the
+ * unconstrained Kalman update would move the 3-D bias vector by more than
+ * max_bias_correction_rad_s, the complete gain is scaled uniformly and the
+ * same gain is used by the Joseph covariance update. bounded_target_rad_s may
+ * be NULL.
  */
 attitude_mekf_zaru_result_t attitude_mekf_update_zero_rate_bounded(
     attitude_mekf_t *filter,

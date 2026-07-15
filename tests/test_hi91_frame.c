@@ -22,11 +22,30 @@ static float float_from_bits(uint32_t bits)
     return value;
 }
 
-static void test_crc_known_vector_and_incremental_update(void)
+static uint16_t crc16_ccitt_bitwise_reference(uint16_t current_crc,
+                                              const uint8_t *source,
+                                              size_t length)
+{
+    uint32_t crc = current_crc;
+    for (size_t byte_index = 0U; byte_index < length; ++byte_index) {
+        crc ^= (uint32_t)source[byte_index] << 8U;
+        for (uint32_t bit_index = 0U; bit_index < 8U; ++bit_index) {
+            const uint32_t polynomial =
+                ((crc & UINT32_C(0x8000)) != 0U) ? UINT32_C(0x1021) : 0U;
+            crc = ((crc << 1U) ^ polynomial) & UINT32_C(0xFFFF);
+        }
+    }
+    return (uint16_t)crc;
+}
+
+static void test_crc_known_vectors(void)
 {
     static const uint8_t check[] = "123456789";
     TEST_EXPECT(hi91_crc16_ccitt_update(0U, check, sizeof(check) - 1U) ==
                 UINT16_C(0x31C3));
+    TEST_EXPECT(hi91_crc16_ccitt_update(UINT16_C(0xFFFF), check,
+                                       sizeof(check) - 1U) ==
+                UINT16_C(0x29B1));
 
     uint16_t crc = hi91_crc16_ccitt_update(0U, check, 4U);
     crc = hi91_crc16_ccitt_update(crc, &check[4], sizeof(check) - 5U);
@@ -35,6 +54,64 @@ static void test_crc_known_vector_and_incremental_update(void)
                 UINT16_C(0x1234));
     TEST_EXPECT(hi91_crc16_ccitt_update(UINT16_C(0x1234), NULL, 1U) ==
                 UINT16_C(0x1234));
+}
+
+static void test_crc_all_single_byte_values(void)
+{
+    static const uint16_t initial_values[] = {
+        UINT16_C(0x0000),
+        UINT16_C(0xFFFF),
+        UINT16_C(0x1D0F),
+        UINT16_C(0xA5C3),
+    };
+
+    for (size_t initial_index = 0U;
+         initial_index < sizeof(initial_values) / sizeof(initial_values[0]);
+         ++initial_index) {
+        for (uint32_t value = 0U; value <= UINT8_MAX; ++value) {
+            const uint8_t byte = (uint8_t)value;
+            const uint16_t expected = crc16_ccitt_bitwise_reference(
+                initial_values[initial_index], &byte, 1U);
+            TEST_EXPECT(hi91_crc16_ccitt_update(initial_values[initial_index],
+                                                &byte, 1U) == expected);
+        }
+    }
+}
+
+static void test_crc_segmented_and_long_data(void)
+{
+    static uint8_t data[4096];
+    uint32_t state = UINT32_C(0xC001D00D);
+    for (size_t index = 0U; index < sizeof(data); ++index) {
+        state = state * UINT32_C(1664525) + UINT32_C(1013904223);
+        data[index] = (uint8_t)(state >> 24U);
+    }
+
+    const uint16_t expected =
+        crc16_ccitt_bitwise_reference(UINT16_C(0xBEEF), data, sizeof(data));
+    TEST_EXPECT(expected == UINT16_C(0xCF1E));
+    const uint16_t one_shot =
+        hi91_crc16_ccitt_update(UINT16_C(0xBEEF), data, sizeof(data));
+    TEST_EXPECT(one_shot == expected);
+
+    for (size_t split = 0U; split <= 256U; ++split) {
+        uint16_t crc =
+            hi91_crc16_ccitt_update(UINT16_C(0xBEEF), data, split);
+        crc = hi91_crc16_ccitt_update(crc, &data[split], sizeof(data) - split);
+        TEST_EXPECT(crc == one_shot);
+    }
+
+    uint16_t chunked = UINT16_C(0xBEEF);
+    size_t offset = 0U;
+    while (offset < sizeof(data)) {
+        size_t chunk_size = ((offset * 17U) % 97U) + 1U;
+        if (chunk_size > (sizeof(data) - offset))
+            chunk_size = sizeof(data) - offset;
+        chunked =
+            hi91_crc16_ccitt_update(chunked, &data[offset], chunk_size);
+        offset += chunk_size;
+    }
+    TEST_EXPECT(chunked == one_shot);
 }
 
 static void test_vendor_example_exact_frame(void)
@@ -117,7 +194,9 @@ static void test_zero_missing_fields_and_bounds(void)
 
 int main(void)
 {
-    test_crc_known_vector_and_incremental_update();
+    test_crc_known_vectors();
+    test_crc_all_single_byte_values();
+    test_crc_segmented_and_long_data();
     test_vendor_example_exact_frame();
     test_zero_missing_fields_and_bounds();
 

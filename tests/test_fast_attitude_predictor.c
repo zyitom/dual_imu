@@ -82,6 +82,14 @@ static fast_attitude_predictor_t make_predictor(uint32_t max_gap_us)
     return predictor;
 }
 
+static void test_default_gap_limits_allow_at_most_one_missing_sample(void)
+{
+    fast_attitude_predictor_config_t config;
+    fast_attitude_predictor_default_config(&config);
+    TEST_EXPECT(config.max_gyro_gap_us[IMU_SOURCE_BMI088] == 1250U);
+    TEST_EXPECT(config.max_gyro_gap_us[IMU_SOURCE_ICM45686] == 800U);
+}
+
 static fast_attitude_anchor_t make_anchor(uint64_t timestamp_us,
                                           imu_source_t source,
                                           const float quaternion[4],
@@ -118,6 +126,17 @@ static imu_gyro_sample_t make_sample(imu_source_t source,
     sample.gyro_rad_s[2] = z;
     sample.valid = valid;
     return sample;
+}
+
+static fast_attitude_snapshot_t export_snapshot(
+    const fast_attitude_predictor_t *predictor)
+{
+    fast_attitude_snapshot_t snapshot;
+    memset(&snapshot, 0xA5, sizeof(snapshot));
+    TEST_EXPECT(fast_attitude_predictor_export_snapshot(predictor,
+                                                        &snapshot));
+    TEST_EXPECT(snapshot.valid);
+    return snapshot;
 }
 
 static void expect_yaw_quaternion(const fast_attitude_output_t *output,
@@ -164,6 +183,8 @@ static void test_constant_rate_and_bias(void)
     TEST_EXPECT(nearly_equal(output.gyro_rate_rad_s[2], 1.0f, 1.0e-7f));
     TEST_EXPECT(output.predicted);
     TEST_EXPECT(!output.degraded);
+    TEST_EXPECT(!output.accel_saturation_recent);
+    TEST_EXPECT(!output.gyro_saturation_recent);
 
     sample = make_sample(IMU_SOURCE_BMI088, TEST_EPOCH_US + 625U, 2U,
                          0.0f, 0.0f, 1.1f, true);
@@ -642,8 +663,364 @@ static void test_anchor_validation_and_reset(void)
     TEST_EXPECT((output.integrity_flags & FAST_ATTITUDE_FLAG_NO_ANCHOR) != 0U);
 }
 
+static void expect_snapshot_matches_predictor(
+    const fast_attitude_predictor_t *predictor,
+    const fast_attitude_snapshot_t *snapshot,
+    uint64_t output_timestamp_us)
+{
+    fast_attitude_output_t expected;
+    fast_attitude_output_t actual;
+    const bool expected_valid = fast_attitude_predictor_predict(
+        predictor, output_timestamp_us, &expected);
+    const bool actual_valid = fast_attitude_snapshot_predict(
+        snapshot, output_timestamp_us, &actual);
+    TEST_EXPECT(actual_valid == expected_valid);
+    TEST_EXPECT(actual.valid == expected.valid);
+    TEST_EXPECT(actual.integrity_flags == expected.integrity_flags);
+    TEST_EXPECT(actual.anchor_timestamp_us == expected.anchor_timestamp_us);
+    TEST_EXPECT(actual.latest_gyro_timestamp_us ==
+                expected.latest_gyro_timestamp_us);
+    TEST_EXPECT(actual.output_timestamp_us == expected.output_timestamp_us);
+    TEST_EXPECT(actual.prediction_horizon_us == expected.prediction_horizon_us);
+    TEST_EXPECT(actual.selected_source == expected.selected_source);
+    TEST_EXPECT(actual.predicted == expected.predicted);
+    TEST_EXPECT(actual.degraded == expected.degraded);
+    TEST_EXPECT(actual.attitude_converged == expected.attitude_converged);
+    TEST_EXPECT(actual.post_impact_reacquire_active ==
+                expected.post_impact_reacquire_active);
+    TEST_EXPECT(actual.attitude_aiding_stale ==
+                expected.attitude_aiding_stale);
+    TEST_EXPECT(actual.rotation_unobserved == expected.rotation_unobserved);
+    TEST_EXPECT(actual.euler_singular == expected.euler_singular);
+    if (actual_valid && expected_valid) {
+        for (size_t index = 0U; index < 4U; ++index) {
+            TEST_EXPECT(nearly_equal(actual.quaternion[index],
+                                     expected.quaternion[index], 2.0e-7f));
+        }
+        for (size_t axis = 0U; axis < 3U; ++axis) {
+            TEST_EXPECT(nearly_equal(actual.gyro_rate_rad_s[axis],
+                                     expected.gyro_rate_rad_s[axis],
+                                     2.0e-7f));
+            TEST_EXPECT(nearly_equal(actual.euler_rad[axis],
+                                     expected.euler_rad[axis], 2.0e-7f));
+        }
+    }
+}
+
+static void test_snapshot_endpoint_boundaries_are_causal(void)
+{
+    fast_attitude_predictor_t predictor = make_predictor(600U);
+    const float identity[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+    const float anchor_rate[3] = {0.0f, 0.0f, 0.2f};
+    const float bias[3] = {0.0f, 0.0f, 0.2f};
+    const fast_attitude_anchor_t anchor = make_anchor(
+        TEST_EPOCH_US, IMU_SOURCE_BMI088, identity, anchor_rate, bias, true);
+    TEST_EXPECT(fast_attitude_predictor_set_anchor(&predictor, &anchor));
+
+    imu_gyro_sample_t sample = make_sample(
+        IMU_SOURCE_BMI088, TEST_EPOCH_US + 500U, 1U,
+        0.0f, 0.0f, 1.2f, true);
+    TEST_EXPECT(fast_attitude_predictor_push_gyro(&predictor, &sample));
+    sample = make_sample(IMU_SOURCE_BMI088, TEST_EPOCH_US + 1000U, 2U,
+                         0.0f, 0.0f, 3.2f, true);
+    TEST_EXPECT(fast_attitude_predictor_push_gyro(&predictor, &sample));
+
+    const fast_attitude_snapshot_t snapshot = export_snapshot(&predictor);
+    TEST_EXPECT(sizeof(snapshot) <= 160U);
+    TEST_EXPECT(snapshot.previous_endpoint.timestamp_us ==
+                TEST_EPOCH_US + 500U);
+    TEST_EXPECT(snapshot.current_endpoint.timestamp_us ==
+                TEST_EPOCH_US + 1000U);
+    TEST_EXPECT(snapshot.coverage_timestamp_us == TEST_EPOCH_US + 1000U);
+    TEST_EXPECT(snapshot.selected_source == IMU_SOURCE_BMI088);
+    TEST_EXPECT(snapshot.degraded);
+    TEST_EXPECT(!snapshot.blocked);
+    TEST_EXPECT(snapshot.max_prediction_horizon_us == 1000U);
+    TEST_EXPECT(snapshot.max_gyro_gap_us == 600U);
+    TEST_EXPECT(nearly_equal(snapshot.euler_singularity_threshold_rad,
+                             degrees_to_radians(85.0f), 1.0e-7f));
+    TEST_EXPECT(nearly_equal(snapshot.gyro_bias_rad_s[2], 0.2f, 1.0e-7f));
+
+    fast_attitude_output_t output;
+    TEST_EXPECT(fast_attitude_snapshot_predict(
+        &snapshot, TEST_EPOCH_US, &output));
+    TEST_EXPECT(!output.predicted);
+    TEST_EXPECT(nearly_equal(output.gyro_rate_rad_s[2], 0.0f, 1.0e-7f));
+
+    TEST_EXPECT(!fast_attitude_snapshot_predict(
+        &snapshot, TEST_EPOCH_US + 250U, &output));
+    TEST_EXPECT((output.integrity_flags & FAST_ATTITUDE_FLAG_OUTPUT_STALE) !=
+                0U);
+    TEST_EXPECT(!fast_attitude_snapshot_predict(
+        &snapshot, TEST_EPOCH_US - 1U, &output));
+    TEST_EXPECT((output.integrity_flags &
+                 FAST_ATTITUDE_FLAG_TARGET_BEFORE_ANCHOR) != 0U);
+
+    expect_snapshot_matches_predictor(&predictor, &snapshot,
+                                      TEST_EPOCH_US + 500U);
+    expect_snapshot_matches_predictor(&predictor, &snapshot,
+                                      TEST_EPOCH_US + 750U);
+    TEST_EXPECT(fast_attitude_snapshot_predict(
+        &snapshot, TEST_EPOCH_US + 750U, &output));
+    expect_yaw_quaternion(&output, 0.0005f, 3.0e-7f);
+    TEST_EXPECT(output.latest_gyro_timestamp_us == TEST_EPOCH_US + 500U);
+    TEST_EXPECT(output.prediction_horizon_us == 250U);
+    TEST_EXPECT(nearly_equal(output.gyro_rate_rad_s[2], 1.0f, 1.0e-7f));
+
+    expect_snapshot_matches_predictor(&predictor, &snapshot,
+                                      TEST_EPOCH_US + 1000U);
+    expect_snapshot_matches_predictor(&predictor, &snapshot,
+                                      TEST_EPOCH_US + 1125U);
+    TEST_EXPECT(fast_attitude_snapshot_predict(
+        &snapshot, TEST_EPOCH_US + 1125U, &output));
+    expect_yaw_quaternion(&output, 0.001625f, 3.0e-7f);
+    TEST_EXPECT(output.latest_gyro_timestamp_us == TEST_EPOCH_US + 1000U);
+    TEST_EXPECT(output.prediction_horizon_us == 125U);
+
+    fast_attitude_snapshot_t unchanged = snapshot;
+    TEST_EXPECT(fast_attitude_snapshot_predict(
+        &snapshot, TEST_EPOCH_US + 1125U, &output));
+    TEST_EXPECT(memcmp(&snapshot, &unchanged, sizeof(snapshot)) == 0);
+}
+
+static void test_snapshot_blocked_coverage_and_integrity(void)
+{
+    const float identity[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+    const float rate[3] = {0.0f, 0.0f, 1.0f};
+    const float zero_bias[3] = {0.0f, 0.0f, 0.0f};
+    const fast_attitude_anchor_t anchor = make_anchor(
+        TEST_EPOCH_US, IMU_SOURCE_BMI088,
+        identity, rate, zero_bias, false);
+
+    fast_attitude_predictor_t predictor = make_predictor(600U);
+    TEST_EXPECT(fast_attitude_predictor_set_anchor(&predictor, &anchor));
+    imu_gyro_sample_t sample = make_sample(
+        IMU_SOURCE_BMI088, TEST_EPOCH_US + 500U, 1U,
+        0.0f, 0.0f, 1.0f, true);
+    TEST_EXPECT(fast_attitude_predictor_push_gyro(&predictor, &sample));
+    sample = make_sample(IMU_SOURCE_BMI088, TEST_EPOCH_US + 1200U, 2U,
+                         0.0f, 0.0f, 1.0f, true);
+    TEST_EXPECT(fast_attitude_predictor_push_gyro(&predictor, &sample));
+    fast_attitude_snapshot_t snapshot = export_snapshot(&predictor);
+    TEST_EXPECT(snapshot.blocked);
+    TEST_EXPECT(snapshot.current_endpoint.timestamp_us ==
+                TEST_EPOCH_US + 500U);
+    TEST_EXPECT(snapshot.coverage_timestamp_us == TEST_EPOCH_US + 1200U);
+    TEST_EXPECT((snapshot.integrity_flags & FAST_ATTITUDE_FLAG_GYRO_GAP) !=
+                0U);
+    expect_snapshot_matches_predictor(&predictor, &snapshot,
+                                      TEST_EPOCH_US + 1100U);
+    expect_snapshot_matches_predictor(&predictor, &snapshot,
+                                      TEST_EPOCH_US + 1200U);
+
+    predictor = make_predictor(600U);
+    TEST_EXPECT(fast_attitude_predictor_set_anchor(&predictor, &anchor));
+    sample = make_sample(IMU_SOURCE_BMI088, TEST_EPOCH_US + 500U, 1U,
+                         0.0f, 0.0f, 1.0f, true);
+    TEST_EXPECT(fast_attitude_predictor_push_gyro(&predictor, &sample));
+    sample = make_sample(IMU_SOURCE_BMI088, TEST_EPOCH_US + 1000U, 2U,
+                         0.0f, 0.0f, 1.0f, false);
+    TEST_EXPECT(!fast_attitude_predictor_push_gyro(&predictor, &sample));
+    snapshot = export_snapshot(&predictor);
+    TEST_EXPECT(snapshot.blocked);
+    TEST_EXPECT(snapshot.coverage_timestamp_us == TEST_EPOCH_US + 1000U);
+    TEST_EXPECT((snapshot.integrity_flags & FAST_ATTITUDE_FLAG_GYRO_INVALID) !=
+                0U);
+    expect_snapshot_matches_predictor(&predictor, &snapshot,
+                                      TEST_EPOCH_US + 999U);
+    expect_snapshot_matches_predictor(&predictor, &snapshot,
+                                      TEST_EPOCH_US + 1000U);
+
+    predictor = make_predictor(600U);
+    TEST_EXPECT(fast_attitude_predictor_set_anchor(&predictor, &anchor));
+    sample = make_sample(IMU_SOURCE_BMI088, TEST_EPOCH_US + 500U, 1U,
+                         0.0f, 0.0f, 1.0f, true);
+    TEST_EXPECT(fast_attitude_predictor_push_gyro(&predictor, &sample));
+    sample = make_sample(IMU_SOURCE_BMI088, TEST_EPOCH_US + 1000U, 3U,
+                         0.0f, 0.0f, 2.0f, true);
+    TEST_EXPECT(fast_attitude_predictor_push_gyro(&predictor, &sample));
+    snapshot = export_snapshot(&predictor);
+    TEST_EXPECT(!snapshot.blocked);
+    fast_attitude_output_t output;
+    TEST_EXPECT(fast_attitude_snapshot_predict(
+        &snapshot, TEST_EPOCH_US + 750U, &output));
+    TEST_EXPECT(output.integrity_flags == FAST_ATTITUDE_FLAG_NONE);
+    TEST_EXPECT(!fast_attitude_snapshot_predict(
+        &snapshot, TEST_EPOCH_US + 1000U, &output));
+    TEST_EXPECT((output.integrity_flags &
+                 FAST_ATTITUDE_FLAG_GYRO_SEQUENCE_GAP) != 0U);
+}
+
+static void test_snapshot_invalid_export_and_horizon(void)
+{
+    fast_attitude_predictor_t predictor;
+    memset(&predictor, 0, sizeof(predictor));
+    fast_attitude_snapshot_t snapshot;
+    TEST_EXPECT(!fast_attitude_predictor_export_snapshot(&predictor,
+                                                         &snapshot));
+    TEST_EXPECT(!snapshot.valid);
+    TEST_EXPECT((snapshot.integrity_flags &
+                 FAST_ATTITUDE_FLAG_SNAPSHOT_INVALID) != 0U);
+    TEST_EXPECT((snapshot.integrity_flags &
+                 FAST_ATTITUDE_FLAG_NOT_INITIALIZED) != 0U);
+
+    fast_attitude_output_t output;
+    TEST_EXPECT(!fast_attitude_snapshot_predict(
+        &snapshot, TEST_EPOCH_US, &output));
+    TEST_EXPECT((output.integrity_flags &
+                 FAST_ATTITUDE_FLAG_SNAPSHOT_INVALID) != 0U);
+    TEST_EXPECT(!fast_attitude_snapshot_predict(NULL, TEST_EPOCH_US, &output));
+    TEST_EXPECT((output.integrity_flags &
+                 FAST_ATTITUDE_FLAG_SNAPSHOT_INVALID) != 0U);
+
+    predictor = make_predictor(1250U);
+    TEST_EXPECT(!fast_attitude_predictor_export_snapshot(&predictor,
+                                                         &snapshot));
+    TEST_EXPECT(!snapshot.valid);
+    TEST_EXPECT((snapshot.integrity_flags & FAST_ATTITUDE_FLAG_NO_ANCHOR) !=
+                0U);
+
+    const float identity[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+    const float rate[3] = {0.0f, 0.0f, 1.0f};
+    const float zero_bias[3] = {0.0f, 0.0f, 0.0f};
+    const fast_attitude_anchor_t anchor = make_anchor(
+        TEST_EPOCH_US, IMU_SOURCE_BMI088,
+        identity, rate, zero_bias, false);
+    TEST_EXPECT(fast_attitude_predictor_set_anchor(&predictor, &anchor));
+    snapshot = export_snapshot(&predictor);
+    expect_snapshot_matches_predictor(&predictor, &snapshot,
+                                      TEST_EPOCH_US + 1000U);
+    expect_snapshot_matches_predictor(&predictor, &snapshot,
+                                      TEST_EPOCH_US + 1001U);
+
+    snapshot.current_endpoint.timestamp_us =
+        snapshot.previous_endpoint.timestamp_us - 1U;
+    TEST_EXPECT(!fast_attitude_snapshot_predict(
+        &snapshot, TEST_EPOCH_US, &output));
+    TEST_EXPECT((output.integrity_flags &
+                 FAST_ATTITUDE_FLAG_SNAPSHOT_INVALID) != 0U);
+
+    fast_attitude_predictor_invalidate_anchor(&predictor);
+    TEST_EXPECT(!fast_attitude_predictor_export_snapshot(&predictor,
+                                                         &snapshot));
+    TEST_EXPECT(!snapshot.valid);
+    TEST_EXPECT(!fast_attitude_predictor_export_snapshot(&predictor, NULL));
+    TEST_EXPECT(!fast_attitude_snapshot_predict(&snapshot,
+                                                TEST_EPOCH_US, NULL));
+}
+
+static void test_snapshot_reanchor_rebuilds_endpoints(void)
+{
+    fast_attitude_predictor_t predictor = make_predictor(600U);
+    const float identity[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+    const float initial_rate[3] = {0.0f, 0.0f, 1.0f};
+    const float zero_bias[3] = {0.0f, 0.0f, 0.0f};
+    fast_attitude_anchor_t anchor = make_anchor(
+        TEST_EPOCH_US, IMU_SOURCE_BMI088,
+        identity, initial_rate, zero_bias, false);
+    TEST_EXPECT(fast_attitude_predictor_set_anchor(&predictor, &anchor));
+    imu_gyro_sample_t sample = make_sample(
+        IMU_SOURCE_BMI088, TEST_EPOCH_US + 500U, 1U,
+        0.0f, 0.0f, 1.0f, true);
+    TEST_EXPECT(fast_attitude_predictor_push_gyro(&predictor, &sample));
+    const fast_attitude_snapshot_t old_snapshot = export_snapshot(&predictor);
+
+    sample = make_sample(IMU_SOURCE_ICM45686, TEST_EPOCH_US + 750U, 1U,
+                         0.0f, 0.0f, 2.5f, true);
+    TEST_EXPECT(fast_attitude_predictor_push_gyro(&predictor, &sample));
+    sample = make_sample(IMU_SOURCE_ICM45686, TEST_EPOCH_US + 1000U, 2U,
+                         0.0f, 0.0f, 2.5f, true);
+    TEST_EXPECT(fast_attitude_predictor_push_gyro(&predictor, &sample));
+    float corrected_quaternion[4];
+    quaternion_from_euler(0.0f, 0.0f, 0.1f, corrected_quaternion);
+    const float corrected_rate[3] = {0.0f, 0.0f, 2.5f};
+    const float corrected_bias[3] = {0.0f, 0.0f, 0.5f};
+    anchor = make_anchor(TEST_EPOCH_US + 500U, IMU_SOURCE_ICM45686,
+                         corrected_quaternion, corrected_rate,
+                         corrected_bias, true);
+    TEST_EXPECT(fast_attitude_predictor_set_anchor(&predictor, &anchor));
+
+    const fast_attitude_snapshot_t snapshot = export_snapshot(&predictor);
+    TEST_EXPECT(snapshot.anchor_timestamp_us == TEST_EPOCH_US + 500U);
+    TEST_EXPECT(snapshot.previous_endpoint.timestamp_us ==
+                TEST_EPOCH_US + 750U);
+    TEST_EXPECT(snapshot.current_endpoint.timestamp_us ==
+                TEST_EPOCH_US + 1000U);
+    TEST_EXPECT(snapshot.selected_source == IMU_SOURCE_ICM45686);
+    TEST_EXPECT(snapshot.degraded);
+    TEST_EXPECT(nearly_equal(snapshot.gyro_bias_rad_s[2], 0.5f, 1.0e-7f));
+    expect_snapshot_matches_predictor(&predictor, &snapshot,
+                                      TEST_EPOCH_US + 875U);
+    expect_snapshot_matches_predictor(&predictor, &snapshot,
+                                      TEST_EPOCH_US + 1125U);
+
+    fast_attitude_output_t output;
+    TEST_EXPECT(fast_attitude_snapshot_predict(
+        &snapshot, TEST_EPOCH_US + 1125U, &output));
+    expect_yaw_quaternion(&output, 0.10125f, 8.0e-7f);
+
+    TEST_EXPECT(fast_attitude_snapshot_predict(
+        &old_snapshot, TEST_EPOCH_US + 625U, &output));
+    TEST_EXPECT(output.selected_source == IMU_SOURCE_BMI088);
+    expect_yaw_quaternion(&output, 0.000625f, 3.0e-7f);
+}
+
+static void test_quality_state_is_anchor_and_snapshot_causal(void)
+{
+    fast_attitude_predictor_t predictor = make_predictor(600U);
+    const float identity[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+    const float zero[3] = {0.0f, 0.0f, 0.0f};
+    fast_attitude_anchor_t anchor = make_anchor(
+        TEST_EPOCH_US, IMU_SOURCE_ICM45686, identity, zero, zero, false);
+    anchor.quality_flags = FAST_ATTITUDE_QUALITY_ATTITUDE_CONVERGED;
+    TEST_EXPECT(fast_attitude_predictor_set_anchor(&predictor, &anchor));
+
+    const fast_attitude_snapshot_t old_snapshot = export_snapshot(&predictor);
+    fast_attitude_output_t output;
+    TEST_EXPECT(fast_attitude_predictor_predict(
+        &predictor, TEST_EPOCH_US + 100U, &output));
+    TEST_EXPECT(output.attitude_converged);
+    TEST_EXPECT(!output.post_impact_reacquire_active);
+    TEST_EXPECT(!output.attitude_aiding_stale);
+    TEST_EXPECT(!output.rotation_unobserved);
+
+    anchor.timestamp_us = TEST_EPOCH_US + 500U;
+    anchor.degraded = true;
+    anchor.quality_flags =
+        FAST_ATTITUDE_QUALITY_POST_IMPACT_REACQUIRE_ACTIVE |
+        FAST_ATTITUDE_QUALITY_ATTITUDE_AIDING_STALE |
+        FAST_ATTITUDE_QUALITY_ROTATION_UNOBSERVED;
+    TEST_EXPECT(fast_attitude_predictor_set_anchor(&predictor, &anchor));
+
+    const fast_attitude_snapshot_t new_snapshot = export_snapshot(&predictor);
+    TEST_EXPECT((new_snapshot.quality_flags &
+                 FAST_ATTITUDE_QUALITY_ATTITUDE_CONVERGED) == 0U);
+    TEST_EXPECT((new_snapshot.quality_flags &
+                 FAST_ATTITUDE_QUALITY_POST_IMPACT_REACQUIRE_ACTIVE) != 0U);
+    TEST_EXPECT((new_snapshot.quality_flags &
+                 FAST_ATTITUDE_QUALITY_ATTITUDE_AIDING_STALE) != 0U);
+    TEST_EXPECT((new_snapshot.quality_flags &
+                 FAST_ATTITUDE_QUALITY_ROTATION_UNOBSERVED) != 0U);
+    TEST_EXPECT(fast_attitude_snapshot_predict(
+        &new_snapshot, TEST_EPOCH_US + 600U, &output));
+    TEST_EXPECT(!output.attitude_converged);
+    TEST_EXPECT(output.post_impact_reacquire_active);
+    TEST_EXPECT(output.attitude_aiding_stale);
+    TEST_EXPECT(output.rotation_unobserved);
+
+    /* Re-anchoring cannot retroactively change an already published
+     * snapshot that may still be feeding an older scheduled frame. */
+    TEST_EXPECT(fast_attitude_snapshot_predict(
+        &old_snapshot, TEST_EPOCH_US + 100U, &output));
+    TEST_EXPECT(output.attitude_converged);
+    TEST_EXPECT(!output.post_impact_reacquire_active);
+    TEST_EXPECT(!output.attitude_aiding_stale);
+    TEST_EXPECT(!output.rotation_unobserved);
+}
+
 int main(void)
 {
+    test_default_gap_limits_allow_at_most_one_missing_sample();
     test_constant_rate_and_bias();
     test_linear_ramp_uses_trapezoid();
     test_changing_axis_includes_coning_term();
@@ -656,6 +1033,11 @@ int main(void)
     test_lane_switch_and_quaternion_hemisphere_are_continuous();
     test_euler_singularity_and_yaw_wrapping();
     test_anchor_validation_and_reset();
+    test_snapshot_endpoint_boundaries_are_causal();
+    test_snapshot_blocked_coverage_and_integrity();
+    test_snapshot_invalid_export_and_horizon();
+    test_snapshot_reanchor_rebuilds_endpoints();
+    test_quality_state_is_anchor_and_snapshot_causal();
 
     if (failure_count != 0U) {
         (void)fprintf(stderr, "fast_attitude_predictor: %u test failure(s)\n",

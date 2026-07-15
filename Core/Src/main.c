@@ -97,6 +97,17 @@ int main(void)
 
   /* I-cache is generated from the IOC; D-cache stays off for DMA coherency. */
 
+  /* Drive both IMU heater enables low before clock configuration can enter
+     Error_Handler. MX_GPIO_Init repeats this fail-off configuration later. */
+  __HAL_RCC_GPIOD_CLK_ENABLE();
+  HAL_GPIO_WritePin(GPIOD, BM0_PWM_Pin|BM0_PWMD14_Pin, GPIO_PIN_RESET);
+  GPIO_InitTypeDef heater_off = {0};
+  heater_off.Pin = BM0_PWM_Pin|BM0_PWMD14_Pin;
+  heater_off.Mode = GPIO_MODE_OUTPUT_PP;
+  heater_off.Pull = GPIO_NOPULL;
+  heater_off.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOD, &heater_off);
+
   /* USER CODE END Init */
 
   /* Configure the system clock */

@@ -13,6 +13,12 @@ static bool vector_is_finite(const float vector[3])
     return isfinite(vector[0]) && isfinite(vector[1]) && isfinite(vector[2]);
 }
 
+static bool quaternion_is_finite(const float quaternion[4])
+{
+    return isfinite(quaternion[0]) && isfinite(quaternion[1]) &&
+           isfinite(quaternion[2]) && isfinite(quaternion[3]);
+}
+
 static bool quaternion_normalize(float quaternion[4])
 {
     const float norm_sq = (quaternion[0] * quaternion[0]) +
@@ -179,6 +185,11 @@ static void replay_cache_begin(fast_attitude_predictor_t *predictor)
             predictor->anchor.gyro_bias_rad_s[axis];
     }
     cache->timestamp_us = predictor->anchor.timestamp_us;
+    memcpy(cache->previous_quaternion, cache->quaternion,
+           sizeof(cache->previous_quaternion));
+    memcpy(cache->previous_gyro_rate_rad_s, cache->gyro_rate_rad_s,
+           sizeof(cache->previous_gyro_rate_rad_s));
+    cache->previous_timestamp_us = cache->timestamp_us;
     cache->coverage_timestamp_us = predictor->anchor.timestamp_us;
     cache->valid = true;
     if (!vector_is_finite(cache->gyro_rate_rad_s)) {
@@ -217,7 +228,9 @@ static void replay_cache_append(fast_attitude_predictor_t *predictor,
         right_rate[axis] = node->sample.gyro_rad_s[axis] -
                            predictor->anchor.gyro_bias_rad_s[axis];
     }
-    if (!compose_linear_rate_interval(cache->quaternion,
+    float next_quaternion[4];
+    memcpy(next_quaternion, cache->quaternion, sizeof(next_quaternion));
+    if (!compose_linear_rate_interval(next_quaternion,
                                       cache->gyro_rate_rad_s,
                                       right_rate,
                                       interval_us)) {
@@ -225,9 +238,18 @@ static void replay_cache_append(fast_attitude_predictor_t *predictor,
         cache->blocked = true;
         return;
     }
+
+    memcpy(cache->previous_quaternion, cache->quaternion,
+           sizeof(cache->previous_quaternion));
+    memcpy(cache->previous_gyro_rate_rad_s, cache->gyro_rate_rad_s,
+           sizeof(cache->previous_gyro_rate_rad_s));
+    cache->previous_timestamp_us = cache->timestamp_us;
+    cache->previous_integrity_flags = cache->endpoint_integrity_flags;
+    memcpy(cache->quaternion, next_quaternion, sizeof(cache->quaternion));
     memcpy(cache->gyro_rate_rad_s, right_rate,
            sizeof(cache->gyro_rate_rad_s));
     cache->timestamp_us = node->sample.timestamp_us;
+    cache->endpoint_integrity_flags = cache->integrity_flags;
 }
 
 static void replay_cache_rebuild(fast_attitude_predictor_t *predictor)
@@ -248,7 +270,7 @@ void fast_attitude_predictor_default_config(
     memset(config, 0, sizeof(*config));
     config->max_prediction_horizon_us = 1000U;
     config->max_gyro_gap_us[IMU_SOURCE_BMI088] = 1250U;
-    config->max_gyro_gap_us[IMU_SOURCE_ICM45686] = 1000U;
+    config->max_gyro_gap_us[IMU_SOURCE_ICM45686] = 800U;
     config->euler_singularity_threshold_rad =
         85.0f * FAST_ATTITUDE_DEG_TO_RAD;
 }
@@ -398,6 +420,18 @@ static void initialize_output(const fast_attitude_predictor_t *predictor,
     output->latest_gyro_timestamp_us = predictor->anchor.timestamp_us;
     output->selected_source = predictor->anchor.selected_source;
     output->degraded = predictor->anchor.degraded;
+    output->attitude_converged =
+        (predictor->anchor.quality_flags &
+         FAST_ATTITUDE_QUALITY_ATTITUDE_CONVERGED) != 0U;
+    output->post_impact_reacquire_active =
+        (predictor->anchor.quality_flags &
+         FAST_ATTITUDE_QUALITY_POST_IMPACT_REACQUIRE_ACTIVE) != 0U;
+    output->attitude_aiding_stale =
+        (predictor->anchor.quality_flags &
+         FAST_ATTITUDE_QUALITY_ATTITUDE_AIDING_STALE) != 0U;
+    output->rotation_unobserved =
+        (predictor->anchor.quality_flags &
+         FAST_ATTITUDE_QUALITY_ROTATION_UNOBSERVED) != 0U;
     memcpy(output->quaternion, predictor->anchor.quaternion,
            sizeof(output->quaternion));
 }
@@ -513,4 +547,291 @@ bool fast_attitude_predictor_predict(
         predictor->config.euler_singularity_threshold_rad;
     output->valid = true;
     return true;
+}
+
+static void initialize_snapshot(fast_attitude_snapshot_t *snapshot)
+{
+    memset(snapshot, 0, sizeof(*snapshot));
+    snapshot->selected_source = IMU_SOURCE_FUSED;
+    snapshot->integrity_flags = FAST_ATTITUDE_FLAG_SNAPSHOT_INVALID;
+}
+
+static bool replay_cache_is_exportable(
+    const fast_attitude_predictor_t *predictor)
+{
+    const fast_attitude_replay_cache_t *const cache =
+        &predictor->replay_cache;
+    return cache->valid &&
+           (cache->previous_timestamp_us >= predictor->anchor.timestamp_us) &&
+           (cache->timestamp_us >= cache->previous_timestamp_us) &&
+           (cache->coverage_timestamp_us >= cache->timestamp_us) &&
+           quaternion_is_finite(cache->previous_quaternion) &&
+           quaternion_is_finite(cache->quaternion) &&
+           vector_is_finite(cache->previous_gyro_rate_rad_s) &&
+           vector_is_finite(cache->gyro_rate_rad_s);
+}
+
+static void export_snapshot_endpoint(
+    fast_attitude_snapshot_endpoint_t *endpoint,
+    uint64_t timestamp_us,
+    const float quaternion[4],
+    const float gyro_rate_rad_s[3],
+    uint32_t integrity_flags)
+{
+    endpoint->timestamp_us = timestamp_us;
+    memcpy(endpoint->quaternion, quaternion, sizeof(endpoint->quaternion));
+    memcpy(endpoint->gyro_rate_rad_s, gyro_rate_rad_s,
+           sizeof(endpoint->gyro_rate_rad_s));
+    endpoint->integrity_flags = integrity_flags;
+}
+
+bool fast_attitude_predictor_export_snapshot(
+    const fast_attitude_predictor_t *predictor,
+    fast_attitude_snapshot_t *snapshot)
+{
+    if (snapshot == NULL)
+        return false;
+
+    initialize_snapshot(snapshot);
+    if ((predictor == NULL) || !predictor->initialized) {
+        snapshot->integrity_flags |= FAST_ATTITUDE_FLAG_NOT_INITIALIZED;
+        return false;
+    }
+    if (!predictor->anchor_valid) {
+        snapshot->integrity_flags |= FAST_ATTITUDE_FLAG_NO_ANCHOR;
+        return false;
+    }
+    if (!replay_cache_is_exportable(predictor))
+        return false;
+
+    const fast_attitude_replay_cache_t *const cache =
+        &predictor->replay_cache;
+    export_snapshot_endpoint(&snapshot->previous_endpoint,
+                             cache->previous_timestamp_us,
+                             cache->previous_quaternion,
+                             cache->previous_gyro_rate_rad_s,
+                             cache->previous_integrity_flags);
+    export_snapshot_endpoint(&snapshot->current_endpoint,
+                             cache->timestamp_us,
+                             cache->quaternion,
+                             cache->gyro_rate_rad_s,
+                             cache->endpoint_integrity_flags);
+    snapshot->anchor_timestamp_us = predictor->anchor.timestamp_us;
+    snapshot->coverage_timestamp_us = cache->coverage_timestamp_us;
+    memcpy(snapshot->anchor_quaternion, predictor->anchor.quaternion,
+           sizeof(snapshot->anchor_quaternion));
+    memcpy(snapshot->anchor_gyro_rate_rad_s,
+           predictor->anchor.gyro_rate_rad_s,
+           sizeof(snapshot->anchor_gyro_rate_rad_s));
+    memcpy(snapshot->gyro_bias_rad_s, predictor->anchor.gyro_bias_rad_s,
+           sizeof(snapshot->gyro_bias_rad_s));
+    snapshot->integrity_flags = cache->integrity_flags;
+    snapshot->max_prediction_horizon_us =
+        predictor->config.max_prediction_horizon_us;
+    snapshot->max_gyro_gap_us = predictor->config.max_gyro_gap_us[
+        predictor->anchor.selected_source];
+    snapshot->euler_singularity_threshold_rad =
+        predictor->config.euler_singularity_threshold_rad;
+    snapshot->selected_source = predictor->anchor.selected_source;
+    snapshot->quality_flags = predictor->anchor.quality_flags;
+    snapshot->degraded = predictor->anchor.degraded;
+    snapshot->blocked = cache->blocked;
+    snapshot->valid = true;
+    return true;
+}
+
+static bool snapshot_is_usable(const fast_attitude_snapshot_t *snapshot)
+{
+    return (snapshot != NULL) && snapshot->valid &&
+           (snapshot->selected_source < IMU_SOURCE_COUNT) &&
+           (snapshot->max_prediction_horizon_us != 0U) &&
+           (snapshot->max_gyro_gap_us != 0U) &&
+           isfinite(snapshot->euler_singularity_threshold_rad) &&
+           (snapshot->euler_singularity_threshold_rad > 0.0f) &&
+           (snapshot->euler_singularity_threshold_rad <
+            FAST_ATTITUDE_HALF_PI) &&
+           (snapshot->previous_endpoint.timestamp_us >=
+            snapshot->anchor_timestamp_us) &&
+           (snapshot->current_endpoint.timestamp_us >=
+            snapshot->previous_endpoint.timestamp_us) &&
+           (snapshot->coverage_timestamp_us >=
+            snapshot->current_endpoint.timestamp_us) &&
+           quaternion_is_finite(snapshot->anchor_quaternion) &&
+           quaternion_is_finite(snapshot->previous_endpoint.quaternion) &&
+           quaternion_is_finite(snapshot->current_endpoint.quaternion) &&
+           vector_is_finite(snapshot->anchor_gyro_rate_rad_s) &&
+           vector_is_finite(snapshot->gyro_bias_rad_s) &&
+           vector_is_finite(snapshot->previous_endpoint.gyro_rate_rad_s) &&
+           vector_is_finite(snapshot->current_endpoint.gyro_rate_rad_s);
+}
+
+static bool initialize_snapshot_output(
+    const fast_attitude_snapshot_t *snapshot,
+    uint64_t output_timestamp_us,
+    fast_attitude_output_t *output)
+{
+    memset(output, 0, sizeof(*output));
+    output->output_timestamp_us = output_timestamp_us;
+    output->selected_source = IMU_SOURCE_FUSED;
+    if (!snapshot_is_usable(snapshot)) {
+        output->integrity_flags = FAST_ATTITUDE_FLAG_SNAPSHOT_INVALID;
+        if (snapshot != NULL)
+            output->integrity_flags |= snapshot->integrity_flags;
+        return false;
+    }
+
+    output->anchor_timestamp_us = snapshot->anchor_timestamp_us;
+    output->latest_gyro_timestamp_us = snapshot->anchor_timestamp_us;
+    output->selected_source = snapshot->selected_source;
+    output->degraded = snapshot->degraded;
+    output->attitude_converged =
+        (snapshot->quality_flags &
+         FAST_ATTITUDE_QUALITY_ATTITUDE_CONVERGED) != 0U;
+    output->post_impact_reacquire_active =
+        (snapshot->quality_flags &
+         FAST_ATTITUDE_QUALITY_POST_IMPACT_REACQUIRE_ACTIVE) != 0U;
+    output->attitude_aiding_stale =
+        (snapshot->quality_flags &
+         FAST_ATTITUDE_QUALITY_ATTITUDE_AIDING_STALE) != 0U;
+    output->rotation_unobserved =
+        (snapshot->quality_flags &
+         FAST_ATTITUDE_QUALITY_ROTATION_UNOBSERVED) != 0U;
+    memcpy(output->quaternion, snapshot->anchor_quaternion,
+           sizeof(output->quaternion));
+    return true;
+}
+
+static uint32_t saturate_u64_to_u32(uint64_t value)
+{
+    return (value > UINT32_MAX) ? UINT32_MAX : (uint32_t)value;
+}
+
+static bool snapshot_finalize_output(
+    const fast_attitude_snapshot_t *snapshot,
+    fast_attitude_output_t *output)
+{
+    if (output->integrity_flags != FAST_ATTITUDE_FLAG_NONE)
+        return false;
+
+    quaternion_to_euler(output->quaternion, output->euler_rad);
+    if (!vector_is_finite(output->euler_rad)) {
+        output->integrity_flags |= FAST_ATTITUDE_FLAG_NUMERIC;
+        return false;
+    }
+    output->predicted =
+        output->output_timestamp_us > snapshot->anchor_timestamp_us;
+    output->euler_singular =
+        fabsf(output->euler_rad[1]) >=
+        snapshot->euler_singularity_threshold_rad;
+    output->valid = true;
+    return true;
+}
+
+static bool snapshot_check_horizon(
+    const fast_attitude_snapshot_t *snapshot,
+    uint64_t horizon_us,
+    fast_attitude_output_t *output)
+{
+    output->prediction_horizon_us = saturate_u64_to_u32(horizon_us);
+    if (horizon_us <= snapshot->max_prediction_horizon_us)
+        return true;
+    output->integrity_flags |= FAST_ATTITUDE_FLAG_HORIZON_EXCEEDED;
+    return false;
+}
+
+bool fast_attitude_snapshot_predict(
+    const fast_attitude_snapshot_t *snapshot,
+    uint64_t output_timestamp_us,
+    fast_attitude_output_t *output)
+{
+    if (output == NULL)
+        return false;
+    if (!initialize_snapshot_output(snapshot, output_timestamp_us, output))
+        return false;
+    if (output_timestamp_us < snapshot->anchor_timestamp_us) {
+        output->integrity_flags |= FAST_ATTITUDE_FLAG_TARGET_BEFORE_ANCHOR;
+        return false;
+    }
+
+    if (output_timestamp_us == snapshot->anchor_timestamp_us) {
+        for (size_t axis = 0U; axis < 3U; ++axis) {
+            output->gyro_rate_rad_s[axis] =
+                snapshot->anchor_gyro_rate_rad_s[axis] -
+                snapshot->gyro_bias_rad_s[axis];
+        }
+        if (!vector_is_finite(output->gyro_rate_rad_s)) {
+            output->integrity_flags |= FAST_ATTITUDE_FLAG_NUMERIC;
+            return false;
+        }
+        return snapshot_finalize_output(snapshot, output);
+    }
+
+    const fast_attitude_snapshot_endpoint_t *const previous =
+        &snapshot->previous_endpoint;
+    const fast_attitude_snapshot_endpoint_t *const current =
+        &snapshot->current_endpoint;
+    if (output_timestamp_us < previous->timestamp_us) {
+        output->integrity_flags |= FAST_ATTITUDE_FLAG_OUTPUT_STALE;
+        return false;
+    }
+
+    if (output_timestamp_us == previous->timestamp_us) {
+        memcpy(output->quaternion, previous->quaternion,
+               sizeof(output->quaternion));
+        memcpy(output->gyro_rate_rad_s, previous->gyro_rate_rad_s,
+               sizeof(output->gyro_rate_rad_s));
+        output->latest_gyro_timestamp_us = previous->timestamp_us;
+        output->integrity_flags |= previous->integrity_flags;
+        return snapshot_finalize_output(snapshot, output);
+    }
+
+    if (output_timestamp_us < current->timestamp_us) {
+        /* The current endpoint is in the future for this output epoch. Keep
+         * the public predictor's causal ZOH semantics. */
+        const uint64_t partial_us = output_timestamp_us -
+                                    previous->timestamp_us;
+        output->latest_gyro_timestamp_us = previous->timestamp_us;
+        output->integrity_flags |= previous->integrity_flags;
+        memcpy(output->quaternion, previous->quaternion,
+               sizeof(output->quaternion));
+        memcpy(output->gyro_rate_rad_s, previous->gyro_rate_rad_s,
+               sizeof(output->gyro_rate_rad_s));
+        if (output->integrity_flags != FAST_ATTITUDE_FLAG_NONE)
+            return false;
+        if (!snapshot_check_horizon(snapshot, partial_us, output))
+            return false;
+        if (!compose_linear_rate_interval(output->quaternion,
+                                          previous->gyro_rate_rad_s,
+                                          previous->gyro_rate_rad_s,
+                                          partial_us)) {
+            output->integrity_flags |= FAST_ATTITUDE_FLAG_NUMERIC;
+            return false;
+        }
+        return snapshot_finalize_output(snapshot, output);
+    }
+
+    memcpy(output->quaternion, current->quaternion,
+           sizeof(output->quaternion));
+    memcpy(output->gyro_rate_rad_s, current->gyro_rate_rad_s,
+           sizeof(output->gyro_rate_rad_s));
+    output->latest_gyro_timestamp_us = current->timestamp_us;
+    output->integrity_flags |= current->integrity_flags;
+    if (snapshot->blocked &&
+        (output_timestamp_us >= snapshot->coverage_timestamp_us)) {
+        output->integrity_flags |= snapshot->integrity_flags;
+    }
+    if (output->integrity_flags != FAST_ATTITUDE_FLAG_NONE)
+        return false;
+
+    const uint64_t horizon_us = output_timestamp_us - current->timestamp_us;
+    if (!snapshot_check_horizon(snapshot, horizon_us, output))
+        return false;
+    if (!compose_linear_rate_interval(output->quaternion,
+                                      current->gyro_rate_rad_s,
+                                      current->gyro_rate_rad_s,
+                                      horizon_us)) {
+        output->integrity_flags |= FAST_ATTITUDE_FLAG_NUMERIC;
+        return false;
+    }
+    return snapshot_finalize_output(snapshot, output);
 }

@@ -59,7 +59,10 @@ elseif(STARM_TOOLCHAIN_CONFIG STREQUAL "STARM_PICOLIBC")
 
 endif()
 
-set(DUAL_IMU_LINKER_SCRIPT "${CMAKE_SOURCE_DIR}/linker/dual_imu_h743.ld")
+get_filename_component(DUAL_IMU_PROJECT_ROOT
+  "${CMAKE_CURRENT_LIST_DIR}/.." ABSOLUTE)
+set(DUAL_IMU_LINKER_SCRIPT
+  "${DUAL_IMU_PROJECT_ROOT}/linker/dual_imu_h743.ld")
 if(NOT EXISTS "${DUAL_IMU_LINKER_SCRIPT}")
   message(FATAL_ERROR "Missing project-owned linker script: ${DUAL_IMU_LINKER_SCRIPT}")
 endif()

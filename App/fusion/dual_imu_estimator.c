@@ -11,6 +11,13 @@
 #define DUAL_IMU_ESTIMATOR_FILTER_FAULT  (1UL << 31)
 #define DUAL_IMU_ESTIMATOR_STATIONARY_WARMUP_WINDOWS (40U)
 
+static void estimator_reset_stationary_tracking(
+    dual_imu_estimator_t *estimator);
+static void estimator_clear_stationary_confirmation(
+    dual_imu_estimator_t *estimator);
+static void estimator_enter_post_impact_reacquire(
+    dual_imu_estimator_t *estimator);
+
 static bool estimator_source_to_lane(imu_source_t source, uint32_t *lane)
 {
     if ((lane == NULL) || (source >= IMU_SOURCE_COUNT))
@@ -42,6 +49,24 @@ static float estimator_vector_distance(const float lhs[3], const float rhs[3])
         lhs[2] - rhs[2],
     };
     return estimator_vector_norm(difference);
+}
+
+static uint32_t estimator_sensor_fault_flags(
+    const dual_imu_estimator_t *estimator,
+    size_t lane)
+{
+    return estimator->hard_fault_flags[lane] &
+           ~DUAL_IMU_ESTIMATOR_FILTER_FAULT;
+}
+
+static bool estimator_raw_lane_usable_for_geometry(
+    const dual_imu_estimator_t *estimator,
+    size_t lane)
+{
+    const uint32_t fault_flags = estimator->hard_fault_flags[lane];
+    return (fault_flags == 0U) ||
+           (((fault_flags & DUAL_IMU_ESTIMATOR_FILTER_FAULT) != 0U) &&
+            (estimator_sensor_fault_flags(estimator, lane) == 0U));
 }
 
 static void estimator_quaternion_identity(float quaternion[4])
@@ -128,6 +153,102 @@ static void estimator_quaternion_to_euler(const float quaternion[4], float euler
                       1.0f - (2.0f * ((y * y) + (z * z))));
 }
 
+static bool estimator_reseed_tilt_preserving_heading(
+    attitude_mekf_t *filter,
+    const float specific_force_mps2[3],
+    const float reference_quaternion[4],
+    const float bias_rad_s[3])
+{
+    if ((filter == NULL) || (specific_force_mps2 == NULL) ||
+        (reference_quaternion == NULL) || (bias_rad_s == NULL)) {
+        return false;
+    }
+
+    float reference[4] = {
+        reference_quaternion[0], reference_quaternion[1],
+        reference_quaternion[2], reference_quaternion[3],
+    };
+    if (!estimator_quaternion_normalize(reference))
+        return false;
+
+    attitude_mekf_t candidate = *filter;
+    const attitude_mekf_diagnostics_t saved_diagnostics = filter->diagnostics;
+    if (!attitude_mekf_seed_from_accel(&candidate, specific_force_mps2,
+                                       0.0f, bias_rad_s)) {
+        return false;
+    }
+
+    float tilt_quaternion[4];
+    float inverse_tilt[4];
+    float relative[4];
+    float heading_twist[4];
+    float reacquired[4];
+    if (!attitude_mekf_get_quaternion(&candidate, tilt_quaternion))
+        return false;
+    estimator_quaternion_inverse(tilt_quaternion, inverse_tilt);
+    estimator_quaternion_multiply(reference, inverse_tilt, relative);
+    const float twist_norm = sqrtf((relative[0] * relative[0]) +
+                                   (relative[3] * relative[3]));
+    if (isfinite(twist_norm) && (twist_norm > 1.0e-7f)) {
+        heading_twist[0] = relative[0] / twist_norm;
+        heading_twist[1] = 0.0f;
+        heading_twist[2] = 0.0f;
+        heading_twist[3] = relative[3] / twist_norm;
+        estimator_quaternion_multiply(heading_twist, tilt_quaternion,
+                                      reacquired);
+        if (!estimator_quaternion_normalize(reacquired) ||
+            !attitude_mekf_reset(&candidate, reacquired, bias_rad_s)) {
+            return false;
+        }
+    } else {
+        /* Antipodal gravity makes the closest twist non-unique. Retain the
+         * prior ZYX yaw as a deterministic gauge instead of failing forever. */
+        float reference_euler[3];
+        estimator_quaternion_to_euler(reference, reference_euler);
+        if (!attitude_mekf_seed_from_accel(&candidate, specific_force_mps2,
+                                           reference_euler[2], bias_rad_s)) {
+            return false;
+        }
+    }
+    candidate.diagnostics = saved_diagnostics;
+    *filter = candidate;
+    return true;
+}
+
+#if defined(DUAL_IMU_ESTIMATOR_TESTING) && DUAL_IMU_ESTIMATOR_TESTING
+bool dual_imu_estimator_test_reseed_tilt_preserving_heading(
+    attitude_mekf_t *filter,
+    const float specific_force_mps2[3],
+    const float reference_quaternion[4],
+    const float bias_rad_s[3])
+{
+    return estimator_reseed_tilt_preserving_heading(
+        filter, specific_force_mps2, reference_quaternion, bias_rad_s);
+}
+#endif
+
+static bool estimator_get_recoverable_bias(const attitude_mekf_t *filter,
+                                           float bias_rad_s[3])
+{
+    if ((filter == NULL) || (bias_rad_s == NULL))
+        return false;
+    if (attitude_mekf_get_bias(filter, bias_rad_s))
+        return true;
+
+    bool valid = true;
+    for (size_t axis = 0U; axis < 3U; ++axis) {
+        const float stored_bias = filter->gyro_bias_rad_s[axis];
+        if (!isfinite(stored_bias) ||
+            (fabsf(stored_bias) > filter->config.max_abs_bias_rad_s)) {
+            bias_rad_s[axis] = 0.0f;
+            valid = false;
+        } else {
+            bias_rad_s[axis] = stored_bias;
+        }
+    }
+    return valid;
+}
+
 static bool estimator_config_is_valid(const dual_imu_estimator_config_t *config)
 {
     if ((config == NULL) || (config->preintegrator[0].window_us == 0U) ||
@@ -144,6 +265,8 @@ static bool estimator_config_is_valid(const dual_imu_estimator_config_t *config)
         (config->rate_floor_std_rad_s <= 0.0f) ||
         !isfinite(config->output_alignment_slew_rad_s) ||
         (config->output_alignment_slew_rad_s <= 0.0f) ||
+        !isfinite(config->unobserved_rotation_rate_std_rad_s) ||
+        (config->unobserved_rotation_rate_std_rad_s <= 0.0f) ||
         !isfinite(config->stationary_gyro_limit_rad_s) ||
         (config->stationary_gyro_limit_rad_s <= 0.0f) ||
         !isfinite(config->zaru_target_residual_limit_rad_s) ||
@@ -155,6 +278,11 @@ static bool estimator_config_is_valid(const dual_imu_estimator_config_t *config)
         !isfinite(config->zaru_calibration_tolerance_rad_s) ||
         (config->zaru_calibration_tolerance_rad_s <= 0.0f) ||
         (config->zaru_calibration_tolerance_rad_s >=
+         config->zaru_target_residual_limit_rad_s) ||
+        !isfinite(config->zaru_calibration_revoke_tolerance_rad_s) ||
+        (config->zaru_calibration_revoke_tolerance_rad_s <=
+         config->zaru_calibration_tolerance_rad_s) ||
+        (config->zaru_calibration_revoke_tolerance_rad_s >=
          config->zaru_target_residual_limit_rad_s) ||
         !isfinite(config->stationary_gyro_variance_limit_rad2_s2) ||
         (config->stationary_gyro_variance_limit_rad2_s2 <= 0.0f) ||
@@ -171,7 +299,23 @@ static bool estimator_config_is_valid(const dual_imu_estimator_config_t *config)
         (config->stationary_hint_dwell_windows < 2U) ||
         (config->stationary_hint_dwell_windows >
          config->stationary_dwell_windows) ||
+        (config->stationary_single_lane_dwell_windows <
+         config->stationary_dwell_windows) ||
+        (config->stationary_single_lane_hint_dwell_windows <
+         config->stationary_hint_dwell_windows) ||
+        (config->stationary_single_lane_hint_dwell_windows >
+         config->stationary_single_lane_dwell_windows) ||
+        (config->stationary_soft_exit_windows == 0U) ||
+        (config->stationary_rate_exit_windows == 0U) ||
+        (config->attitude_convergence_windows == 0U) ||
+        (config->attitude_aiding_timeout_windows <
+         config->attitude_convergence_windows) ||
+        (config->post_impact_reacquire_dwell_windows < 2U) ||
+        (config->post_impact_reacquire_single_lane_dwell_windows <
+         config->post_impact_reacquire_dwell_windows) ||
+        (config->impact_gyro_disagreement_confirm_windows < 2U) ||
         (config->calibration_accept_windows == 0U) ||
+        (config->calibration_revoke_windows == 0U) ||
         (config->accel_fault_enter_windows == 0U) ||
         (config->accel_fault_recovery_windows == 0U) ||
         !isfinite(config->accel_update_max_rate_rad_s) ||
@@ -229,12 +373,14 @@ void dual_imu_estimator_default_config(dual_imu_estimator_config_t *config)
     config->alignment_std_rad = 0.25f * degree;
     config->rate_floor_std_rad_s = 0.03f * degree;
     config->output_alignment_slew_rad_s = 1.0f;
+    config->unobserved_rotation_rate_std_rad_s = 4000.0f * degree;
     config->zaru_rate_std_rad_s[DUAL_IMU_ESTIMATOR_LANE_BMI088] = 0.30f * degree;
     config->zaru_rate_std_rad_s[DUAL_IMU_ESTIMATOR_LANE_ICM45686] = 0.10f * degree;
     config->stationary_gyro_limit_rad_s = 3.0f * degree;
     config->zaru_target_residual_limit_rad_s = 0.50f * degree;
     config->zaru_bias_slew_limit_rad_s2 = 0.10f * degree;
     config->zaru_calibration_tolerance_rad_s = 0.05f * degree;
+    config->zaru_calibration_revoke_tolerance_rad_s = 0.20f * degree;
     const float stationary_gyro_rms_limit = 1.0f * degree;
     config->stationary_gyro_variance_limit_rad2_s2 =
         stationary_gyro_rms_limit * stationary_gyro_rms_limit;
@@ -255,7 +401,17 @@ void dual_imu_estimator_default_config(dual_imu_estimator_config_t *config)
     config->stationary_accel_direction_limit = 0.02f;
     config->stationary_dwell_windows = 800U;
     config->stationary_hint_dwell_windows = 80U;
+    config->stationary_single_lane_dwell_windows = 1600U;
+    config->stationary_single_lane_hint_dwell_windows = 160U;
+    config->stationary_soft_exit_windows = 4U;
+    config->stationary_rate_exit_windows = 3U;
+    config->attitude_convergence_windows = 40U;
+    config->attitude_aiding_timeout_windows = 800U;
+    config->post_impact_reacquire_dwell_windows = 200U;
+    config->post_impact_reacquire_single_lane_dwell_windows = 400U;
+    config->impact_gyro_disagreement_confirm_windows = 3U;
     config->calibration_accept_windows = 40U;
+    config->calibration_revoke_windows = 40U;
     config->accel_fault_enter_windows = 200U;
     config->accel_fault_recovery_windows = 400U;
     config->accel_update_max_rate_rad_s = 15.0f;
@@ -325,18 +481,30 @@ void dual_imu_estimator_set_hard_faults(dual_imu_estimator_t *estimator,
                                         uint32_t hard_fault_flags)
 {
     uint32_t lane;
-    if ((estimator != NULL) && estimator->initialized &&
-        estimator_source_to_lane(source, &lane))
-        estimator->hard_fault_flags[lane] =
-            (estimator->hard_fault_flags[lane] &
-             DUAL_IMU_ESTIMATOR_FILTER_FAULT) |
-            hard_fault_flags;
+    if ((estimator == NULL) || !estimator->initialized ||
+        !estimator_source_to_lane(source, &lane)) {
+        return;
+    }
+
+    const uint32_t previous_sensor_faults =
+        estimator_sensor_fault_flags(estimator, lane);
+    const uint32_t sensor_faults =
+        hard_fault_flags & ~DUAL_IMU_ESTIMATOR_FILTER_FAULT;
+    estimator->hard_fault_flags[lane] =
+        (estimator->hard_fault_flags[lane] &
+         DUAL_IMU_ESTIMATOR_FILTER_FAULT) |
+        sensor_faults;
+    if (sensor_faults != previous_sensor_faults) {
+        estimator_reset_stationary_tracking(estimator);
+        estimator_clear_stationary_confirmation(estimator);
+    }
 }
 
 static void estimator_update_accel_health(
     dual_imu_estimator_t *estimator,
     const dual_imu_estimator_output_t *output,
-    bool accel_updates_enabled)
+    bool accel_updates_enabled,
+    const bool evidence_valid[DUAL_IMU_ESTIMATOR_LANE_COUNT])
 {
     if (!accel_updates_enabled) {
         for (size_t lane = 0U; lane < DUAL_IMU_ESTIMATOR_LANE_COUNT; ++lane) {
@@ -348,12 +516,17 @@ static void estimator_update_accel_health(
 
     for (size_t lane = 0U; lane < DUAL_IMU_ESTIMATOR_LANE_COUNT; ++lane) {
         const size_t other = 1U - lane;
+        const bool lane_evidence_valid = evidence_valid[lane];
+        const bool other_evidence_valid = evidence_valid[other];
         const bool lane_accepted =
             output->accel_result[lane] == ATTITUDE_MEKF_ACCEL_ACCEPTED;
         const bool other_accepted =
             output->accel_result[other] == ATTITUDE_MEKF_ACCEL_ACCEPTED;
 
-        if (!lane_accepted && other_accepted) {
+        if (!lane_evidence_valid) {
+            estimator->accel_bad_streak[lane] = 0U;
+            estimator->accel_good_streak[lane] = 0U;
+        } else if (!lane_accepted && other_evidence_valid && other_accepted) {
             estimator->accel_good_streak[lane] = 0U;
             if (estimator->accel_bad_streak[lane] < UINT16_MAX)
                 estimator->accel_bad_streak[lane]++;
@@ -393,12 +566,156 @@ void dual_imu_estimator_set_isolation_hint(dual_imu_estimator_t *estimator,
         estimator->isolation_hint = hint;
 }
 
-void dual_imu_estimator_inhibit_accel_until(dual_imu_estimator_t *estimator,
-                                            uint64_t timestamp_us)
+static void estimator_sort_accel_inhibit_intervals(
+    dual_imu_estimator_accel_inhibit_interval_t *intervals,
+    size_t count)
 {
-    if ((estimator != NULL) && estimator->initialized &&
-        (timestamp_us > estimator->accel_inhibit_until_us))
-        estimator->accel_inhibit_until_us = timestamp_us;
+    for (size_t index = 1U; index < count; ++index) {
+        const dual_imu_estimator_accel_inhibit_interval_t current =
+            intervals[index];
+        size_t insertion = index;
+        while ((insertion > 0U) &&
+               ((intervals[insertion - 1U].start_us > current.start_us) ||
+                ((intervals[insertion - 1U].start_us == current.start_us) &&
+                 (intervals[insertion - 1U].end_us > current.end_us)))) {
+            intervals[insertion] = intervals[insertion - 1U];
+            insertion--;
+        }
+        intervals[insertion] = current;
+    }
+}
+
+static bool estimator_add_interval(
+    dual_imu_estimator_accel_inhibit_interval_t
+        intervals[DUAL_IMU_ESTIMATOR_ACCEL_INHIBIT_INTERVAL_COUNT],
+    uint8_t *interval_count,
+    uint64_t start_us,
+    uint64_t end_us)
+{
+    if ((intervals == NULL) || (interval_count == NULL) ||
+        (*interval_count > DUAL_IMU_ESTIMATOR_ACCEL_INHIBIT_INTERVAL_COUNT) ||
+        (start_us >= end_us)) {
+        return false;
+    }
+
+    dual_imu_estimator_accel_inhibit_interval_t pending
+        [DUAL_IMU_ESTIMATOR_ACCEL_INHIBIT_INTERVAL_COUNT + 1U];
+    size_t pending_count = *interval_count;
+    memcpy(pending, intervals,
+           pending_count * sizeof(pending[0]));
+    pending[pending_count++] =
+        (dual_imu_estimator_accel_inhibit_interval_t){start_us, end_us};
+    estimator_sort_accel_inhibit_intervals(pending, pending_count);
+
+    size_t normalized_count = 0U;
+    for (size_t index = 0U; index < pending_count; ++index) {
+        if ((normalized_count > 0U) &&
+            (pending[index].start_us <=
+             pending[normalized_count - 1U].end_us)) {
+            if (pending[index].end_us >
+                pending[normalized_count - 1U].end_us) {
+                pending[normalized_count - 1U].end_us = pending[index].end_us;
+            }
+        } else {
+            pending[normalized_count++] = pending[index];
+        }
+    }
+
+    /* If a pathological backlog contains more disjoint impacts than the fixed
+     * history can hold, bridge the smallest time gap. This remains causal and
+     * fails conservatively by disabling gravity aiding only between events. */
+    while (normalized_count >
+           DUAL_IMU_ESTIMATOR_ACCEL_INHIBIT_INTERVAL_COUNT) {
+        size_t merge_index = 0U;
+        uint64_t smallest_gap = UINT64_MAX;
+        for (size_t index = 0U; index + 1U < normalized_count; ++index) {
+            const uint64_t gap = pending[index + 1U].start_us -
+                                 pending[index].end_us;
+            if (gap < smallest_gap) {
+                smallest_gap = gap;
+                merge_index = index;
+            }
+        }
+        pending[merge_index].end_us = pending[merge_index + 1U].end_us;
+        for (size_t index = merge_index + 1U;
+             index + 1U < normalized_count; ++index) {
+            pending[index] = pending[index + 1U];
+        }
+        normalized_count--;
+    }
+
+    memset(intervals, 0,
+           sizeof(*intervals) *
+               DUAL_IMU_ESTIMATOR_ACCEL_INHIBIT_INTERVAL_COUNT);
+    memcpy(intervals, pending,
+           normalized_count * sizeof(pending[0]));
+    *interval_count = (uint8_t)normalized_count;
+    return true;
+}
+
+bool dual_imu_estimator_inhibit_accel_interval(
+    dual_imu_estimator_t *estimator,
+    uint64_t start_us,
+    uint64_t end_us)
+{
+    return (estimator != NULL) && estimator->initialized &&
+           estimator_add_interval(estimator->accel_inhibit_intervals,
+                                  &estimator->accel_inhibit_interval_count,
+                                  start_us, end_us);
+}
+
+bool dual_imu_estimator_notify_impact_interval(
+    dual_imu_estimator_t *estimator,
+    uint64_t start_us,
+    uint64_t end_us)
+{
+    if ((estimator == NULL) || !estimator->initialized ||
+        (start_us >= end_us)) {
+        return false;
+    }
+
+    const bool accel_added = estimator_add_interval(
+        estimator->accel_inhibit_intervals,
+        &estimator->accel_inhibit_interval_count,
+        start_us, end_us);
+    const bool impact_added = estimator_add_interval(
+        estimator->impact_intervals,
+        &estimator->impact_interval_count,
+        start_us, end_us);
+    return accel_added && impact_added;
+}
+
+static bool estimator_interval_active_for_window(
+    dual_imu_estimator_accel_inhibit_interval_t
+        intervals[DUAL_IMU_ESTIMATOR_ACCEL_INHIBIT_INTERVAL_COUNT],
+    uint8_t *interval_count,
+    uint64_t start_us,
+    uint64_t end_us,
+    uint64_t *first_interval_start_us)
+{
+    bool active = false;
+    size_t retained_count = 0U;
+    const size_t count = *interval_count;
+    for (size_t index = 0U; index < count; ++index) {
+        const dual_imu_estimator_accel_inhibit_interval_t interval =
+            intervals[index];
+        if (interval.end_us <= start_us)
+            continue;
+
+        if ((interval.start_us < end_us) && (start_us < interval.end_us)) {
+            if (!active && (first_interval_start_us != NULL))
+                *first_interval_start_us = interval.start_us;
+            active = true;
+        }
+        if (interval.end_us > end_us)
+            intervals[retained_count++] = interval;
+    }
+    for (size_t index = retained_count; index < count; ++index) {
+        intervals[index] =
+            (dual_imu_estimator_accel_inhibit_interval_t){0U, 0U};
+    }
+    *interval_count = (uint8_t)retained_count;
+    return active;
 }
 
 static void estimator_window_rate(const imu_preintegrated_window_t *window,
@@ -414,7 +731,8 @@ static bool estimator_propagate_half_window(
     const imu_preintegrated_window_t windows[DUAL_IMU_ESTIMATOR_LANE_COUNT],
     uint32_t half_index,
     float half_dt_s,
-    bool *aided)
+    bool *aided,
+    bool *rotation_unobserved)
 {
     if (!estimator->lane_seeded[lane] ||
         !attitude_mekf_is_valid(&estimator->mekf[lane]) ||
@@ -436,8 +754,15 @@ static bool estimator_propagate_half_window(
         const uint32_t other = 1U - lane;
         const bool other_gyro_usable = windows[other].gyro_propagation_valid &&
                                        (estimator->hard_fault_flags[other] == 0U);
-        if (!other_gyro_usable)
-            return false;
+        if (!other_gyro_usable) {
+            *aided = false;
+            if (rotation_unobserved != NULL)
+                *rotation_unobserved = true;
+            return attitude_mekf_mark_rotation_unobserved(
+                &estimator->mekf[lane],
+                estimator->config.unobserved_rotation_rate_std_rad_s *
+                    half_dt_s);
+        }
 
         float lane_bias[3];
         float other_bias[3];
@@ -566,6 +891,247 @@ static void estimator_reset_stationary_tracking(
            sizeof(estimator->stationary_accel_mean_mps2));
     memset(estimator->stationary_accel_m2_m2_s4, 0,
            sizeof(estimator->stationary_accel_m2_m2_s4));
+    memset(estimator->stationary_temporal_gyro_variance_rad2_s2, 0,
+           sizeof(estimator->stationary_temporal_gyro_variance_rad2_s2));
+    memset(estimator->stationary_temporal_accel_variance_m2_s4, 0,
+           sizeof(estimator->stationary_temporal_accel_variance_m2_s4));
+    estimator->stationary_lane_mask = 0U;
+    estimator->stationary_streak = 0U;
+}
+
+static void estimator_clear_stationary_confirmation(
+    dual_imu_estimator_t *estimator)
+{
+    estimator->stationary_confirmed_latched = false;
+    estimator->stationary_confirmed_lane_mask = 0U;
+    estimator->stationary_soft_exit_streak = 0U;
+    estimator->stationary_rate_exit_streak = 0U;
+}
+
+static void estimator_latch_filter_fault(dual_imu_estimator_t *estimator,
+                                         size_t lane,
+                                         uint64_t window_end_us)
+{
+    const bool newly_latched =
+        (estimator->hard_fault_flags[lane] &
+         DUAL_IMU_ESTIMATOR_FILTER_FAULT) == 0U;
+    estimator->hard_fault_flags[lane] |= DUAL_IMU_ESTIMATOR_FILTER_FAULT;
+    estimator->lane_seeded[lane] = false;
+    if (newly_latched ||
+        (window_end_us > estimator->filter_fault_window_end_us[lane])) {
+        estimator->filter_fault_window_end_us[lane] = window_end_us;
+        estimator_reset_stationary_tracking(estimator);
+        estimator_clear_stationary_confirmation(estimator);
+    }
+}
+
+static bool estimator_filter_recovery_window_is_new(
+    const dual_imu_estimator_t *estimator,
+    const dual_imu_estimator_output_t *output,
+    size_t lane)
+{
+    return output->start_us >= estimator->filter_fault_window_end_us[lane];
+}
+
+static void estimator_enter_post_impact_reacquire(
+    dual_imu_estimator_t *estimator)
+{
+    if (!estimator->post_impact_reacquire_active &&
+        (estimator->post_impact_episode_count < UINT32_MAX)) {
+        estimator->post_impact_episode_count++;
+    }
+    estimator->post_impact_reacquire_active = true;
+    estimator->attitude_converged = false;
+    estimator->attitude_convergence_streak = 0U;
+    estimator->attitude_aiding_miss_streak = 0U;
+    estimator->stationary_streak = 0U;
+    estimator_reset_stationary_tracking(estimator);
+    estimator_clear_stationary_confirmation(estimator);
+}
+
+static void estimator_complete_post_impact_reacquire(
+    dual_imu_estimator_t *estimator,
+    dual_imu_estimator_output_t *output)
+{
+    if (!estimator->post_impact_reacquire_active)
+        return;
+
+    estimator->post_impact_reacquire_active = false;
+    estimator->attitude_converged = true;
+    estimator->attitude_convergence_streak =
+        estimator->config.attitude_convergence_windows;
+    estimator->attitude_aiding_miss_streak = 0U;
+    if (estimator->post_impact_reacquire_count < UINT32_MAX)
+        estimator->post_impact_reacquire_count++;
+    output->attitude_reacquired = true;
+}
+
+static void estimator_mark_heading_continuity_lost(
+    dual_imu_estimator_t *estimator,
+    uint64_t event_timestamp_us)
+{
+    if (!estimator->heading_continuity_lost)
+        estimator->heading_continuity_lost_timestamp_us = event_timestamp_us;
+    estimator->heading_continuity_lost = true;
+}
+
+static void estimator_record_unobserved_rotation(
+    dual_imu_estimator_t *estimator,
+    dual_imu_estimator_output_t *output)
+{
+    if (!output->rotation_unobserved)
+        return;
+
+    estimator_mark_heading_continuity_lost(estimator, output->start_us);
+    estimator_enter_post_impact_reacquire(estimator);
+}
+
+static void estimator_reset_impact_gyro_disagreement(
+    dual_imu_estimator_t *estimator)
+{
+    estimator->impact_gyro_suspect_start_us = 0U;
+    estimator->impact_gyro_suspect_last_end_us = 0U;
+    estimator->impact_gyro_disagreement_streak = 0U;
+    estimator->impact_gyro_checkpoint_lane_seeded_mask = 0U;
+    estimator->impact_gyro_checkpoint_filter_fault_mask = 0U;
+    estimator->impact_gyro_checkpoint_valid = false;
+    estimator->impact_gyro_disagreement_confirmed = false;
+    estimator->impact_gyro_output_initialized_checkpoint = false;
+}
+
+static void estimator_capture_impact_gyro_checkpoint(
+    dual_imu_estimator_t *estimator,
+    const dual_imu_estimator_output_t *output,
+    const attitude_mekf_t mekf_before[DUAL_IMU_ESTIMATOR_LANE_COUNT],
+    const imu_angular_accel_estimator_t *angular_accel_before,
+    uint8_t lane_seeded_mask,
+    uint8_t filter_fault_mask)
+{
+    memcpy(estimator->impact_gyro_mekf_checkpoint, mekf_before,
+           sizeof(estimator->impact_gyro_mekf_checkpoint));
+    estimator->impact_gyro_angular_accel_checkpoint = *angular_accel_before;
+    estimator->impact_gyro_suspect_start_us = output->start_us;
+    estimator->impact_gyro_suspect_last_end_us = output->end_us;
+    estimator->impact_gyro_disagreement_streak = 1U;
+    estimator->impact_gyro_checkpoint_lane_seeded_mask = lane_seeded_mask;
+    estimator->impact_gyro_checkpoint_filter_fault_mask = filter_fault_mask;
+    memcpy(estimator->impact_gyro_output_quaternion_checkpoint,
+           estimator->output_quaternion,
+           sizeof(estimator->impact_gyro_output_quaternion_checkpoint));
+    memcpy(estimator->impact_gyro_output_alignment_checkpoint,
+           estimator->output_alignment,
+           sizeof(estimator->impact_gyro_output_alignment_checkpoint));
+    estimator->impact_gyro_previous_selected_lane_checkpoint =
+        estimator->previous_selected_lane;
+    estimator->impact_gyro_output_initialized_checkpoint =
+        estimator->output_initialized;
+    estimator->impact_gyro_checkpoint_valid = true;
+    estimator->impact_gyro_disagreement_confirmed = false;
+}
+
+static void estimator_restore_impact_gyro_checkpoint(
+    dual_imu_estimator_t *estimator,
+    dual_imu_estimator_output_t *output)
+{
+    for (size_t lane = 0U; lane < DUAL_IMU_ESTIMATOR_LANE_COUNT; ++lane) {
+        const attitude_mekf_diagnostics_t live_diagnostics =
+            estimator->mekf[lane].diagnostics;
+        const attitude_mekf_config_t live_config =
+            estimator->mekf[lane].config;
+        estimator->mekf[lane] =
+            estimator->impact_gyro_mekf_checkpoint[lane];
+        estimator->mekf[lane].diagnostics = live_diagnostics;
+        estimator->mekf[lane].config = live_config;
+    }
+    estimator->angular_accel_estimator =
+        estimator->impact_gyro_angular_accel_checkpoint;
+    memcpy(estimator->output_quaternion,
+           estimator->impact_gyro_output_quaternion_checkpoint,
+           sizeof(estimator->output_quaternion));
+    memcpy(estimator->output_alignment,
+           estimator->impact_gyro_output_alignment_checkpoint,
+           sizeof(estimator->output_alignment));
+    estimator->previous_selected_lane =
+        estimator->impact_gyro_previous_selected_lane_checkpoint;
+    estimator->output_initialized =
+        estimator->impact_gyro_output_initialized_checkpoint;
+
+    for (size_t lane = 0U; lane < DUAL_IMU_ESTIMATOR_LANE_COUNT; ++lane) {
+        const uint8_t lane_mask = (uint8_t)(1U << lane);
+        const bool live_filter_fault =
+            (estimator->hard_fault_flags[lane] &
+             DUAL_IMU_ESTIMATOR_FILTER_FAULT) != 0U;
+        estimator->lane_seeded[lane] =
+            (estimator->impact_gyro_checkpoint_lane_seeded_mask & lane_mask) !=
+                0U &&
+            !live_filter_fault;
+        estimator->hard_fault_flags[lane] =
+            estimator_sensor_fault_flags(estimator, lane) |
+            ((live_filter_fault ||
+              ((estimator->impact_gyro_checkpoint_filter_fault_mask &
+                lane_mask) != 0U))
+                 ? DUAL_IMU_ESTIMATOR_FILTER_FAULT
+                 : 0U);
+        output->lane_aided_propagation[lane] = false;
+    }
+}
+
+static bool estimator_handle_impact_gyro_disagreement(
+    dual_imu_estimator_t *estimator,
+    dual_imu_estimator_output_t *output,
+    bool disagreement_evidence,
+    const attitude_mekf_t mekf_before[DUAL_IMU_ESTIMATOR_LANE_COUNT],
+    const imu_angular_accel_estimator_t *angular_accel_before,
+    uint8_t lane_seeded_mask,
+    uint8_t filter_fault_mask)
+{
+    if (!output->accel_inhibited || !disagreement_evidence) {
+        estimator_reset_impact_gyro_disagreement(estimator);
+        return false;
+    }
+
+    if (!estimator->impact_gyro_checkpoint_valid ||
+        (output->start_us != estimator->impact_gyro_suspect_last_end_us)) {
+        estimator_capture_impact_gyro_checkpoint(
+            estimator, output, mekf_before, angular_accel_before,
+            lane_seeded_mask, filter_fault_mask);
+    } else {
+        estimator->impact_gyro_suspect_last_end_us = output->end_us;
+        if (estimator->impact_gyro_disagreement_streak < UINT16_MAX)
+            estimator->impact_gyro_disagreement_streak++;
+    }
+
+    /* Do not commit a gyro interval that the two lanes cannot attribute. The
+     * selector remains live so consecutive evidence can still confirm the
+     * event, while every other estimator state stays at the first suspect
+     * boundary. A later clear window therefore resumes from the last trusted
+     * attitude without publishing a transient lane spike. */
+    estimator_restore_impact_gyro_checkpoint(estimator, output);
+
+    if (estimator->impact_gyro_disagreement_streak <
+        estimator->config.impact_gyro_disagreement_confirm_windows) {
+        return false;
+    }
+    estimator->impact_gyro_disagreement_confirmed = true;
+
+    const float suspect_duration_s =
+        (float)(output->end_us - estimator->impact_gyro_suspect_start_us) *
+        DUAL_IMU_ESTIMATOR_US_TO_S;
+    const float rotation_std_rad =
+        estimator->config.unobserved_rotation_rate_std_rad_s *
+        suspect_duration_s;
+    for (size_t lane = 0U; lane < DUAL_IMU_ESTIMATOR_LANE_COUNT; ++lane) {
+        if (estimator->lane_seeded[lane] &&
+            !attitude_mekf_mark_rotation_unobserved(
+                &estimator->mekf[lane], rotation_std_rad)) {
+            estimator_latch_filter_fault(estimator, lane, output->end_us);
+        }
+    }
+    output->rotation_unobserved = true;
+    estimator_mark_heading_continuity_lost(
+        estimator, estimator->impact_gyro_suspect_start_us);
+    estimator_enter_post_impact_reacquire(estimator);
+    return true;
 }
 
 static bool estimator_reject_stationary(
@@ -582,27 +1148,67 @@ static bool estimator_reject_stationary(
     return false;
 }
 
-static uint32_t estimator_stationary_warmup_windows(
-    const dual_imu_estimator_t *estimator)
+static uint16_t estimator_stationary_required_windows(
+    const dual_imu_estimator_t *estimator,
+    uint8_t lane_mask)
 {
-    const uint32_t required_windows = estimator->stationary_hint
+    const bool single_lane = lane_mask != 0x03U;
+    if (single_lane) {
+        return estimator->stationary_hint
+            ? estimator->config.stationary_single_lane_hint_dwell_windows
+            : estimator->config.stationary_single_lane_dwell_windows;
+    }
+    return estimator->stationary_hint
         ? estimator->config.stationary_hint_dwell_windows
         : estimator->config.stationary_dwell_windows;
+}
+
+static uint32_t estimator_stationary_warmup_windows(
+    const dual_imu_estimator_t *estimator,
+    uint8_t lane_mask)
+{
+    const uint32_t required_windows =
+        estimator_stationary_required_windows(estimator, lane_mask);
     return (required_windows < DUAL_IMU_ESTIMATOR_STATIONARY_WARMUP_WINDOWS)
         ? required_windows
         : DUAL_IMU_ESTIMATOR_STATIONARY_WARMUP_WINDOWS;
 }
 
-static bool estimator_update_stationary_statistics(
-    dual_imu_estimator_t *estimator,
+static uint8_t estimator_stationary_available_lane_mask(
+    const dual_imu_estimator_t *estimator,
     const dual_imu_estimator_output_t *output)
 {
+    uint8_t lane_mask = 0U;
+    for (size_t lane = 0U; lane < DUAL_IMU_ESTIMATOR_LANE_COUNT; ++lane) {
+        const bool filter_fault =
+            (estimator->hard_fault_flags[lane] &
+             DUAL_IMU_ESTIMATOR_FILTER_FAULT) != 0U;
+        if (estimator_raw_lane_usable_for_geometry(estimator, lane) &&
+            (!filter_fault || estimator_filter_recovery_window_is_new(
+                                  estimator, output, lane)) &&
+            !estimator->lane_accel_fault[lane] &&
+            output->lane_window[lane].gyro_valid &&
+            output->lane_window[lane].accel_valid) {
+            lane_mask |= (uint8_t)(1U << lane);
+        }
+    }
+    return lane_mask;
+}
+
+static bool estimator_update_stationary_statistics(
+    dual_imu_estimator_t *estimator,
+    const dual_imu_estimator_output_t *output,
+    uint8_t lane_mask)
+{
     const uint32_t previous_count = estimator->stationary_statistics_count;
-    const uint32_t memory_windows = estimator->config.stationary_dwell_windows;
+    const uint32_t memory_windows =
+        estimator_stationary_required_windows(estimator, lane_mask);
     const uint32_t count = (previous_count < memory_windows)
                                ? previous_count + 1U
                                : memory_windows;
     for (size_t lane = 0U; lane < DUAL_IMU_ESTIMATOR_LANE_COUNT; ++lane) {
+        if ((lane_mask & (uint8_t)(1U << lane)) == 0U)
+            continue;
         for (size_t axis = 0U; axis < 3U; ++axis) {
             const float gyro = output->lane_rate_rad_s[lane][axis];
             const float gyro_delta =
@@ -650,13 +1256,15 @@ static bool estimator_update_stationary_statistics(
     }
     estimator->stationary_statistics_count = count;
     const uint32_t warmup_windows =
-        estimator_stationary_warmup_windows(estimator);
+        estimator_stationary_warmup_windows(estimator, lane_mask);
     if (count < warmup_windows)
         return true;
 
     const float inverse_degrees_of_freedom = 1.0f / (float)(count - 1U);
     bool within_limits = true;
     for (size_t lane = 0U; lane < DUAL_IMU_ESTIMATOR_LANE_COUNT; ++lane) {
+        if ((lane_mask & (uint8_t)(1U << lane)) == 0U)
+            continue;
         float gyro_variance = 0.0f;
         float accel_variance = 0.0f;
         for (size_t axis = 0U; axis < 3U; ++axis) {
@@ -691,16 +1299,21 @@ static bool estimator_update_stationary_statistics(
 
 static bool estimator_stationary_candidate(
     dual_imu_estimator_t *estimator,
-    const dual_imu_estimator_output_t *output)
+    const dual_imu_estimator_output_t *output,
+    uint8_t lane_mask)
 {
-    for (size_t lane = 0U; lane < DUAL_IMU_ESTIMATOR_LANE_COUNT; ++lane) {
-        if ((estimator->hard_fault_flags[lane] != 0U) ||
-            !output->lane_window[lane].gyro_valid ||
-            !output->lane_window[lane].accel_valid) {
-            return estimator_reject_stationary(
-                estimator, DUAL_IMU_STATIONARY_REJECT_INVALID_OR_FAULT);
-        }
+    if (lane_mask == 0U) {
+        return estimator_reject_stationary(
+            estimator, DUAL_IMU_STATIONARY_REJECT_INVALID_OR_FAULT);
+    }
+    if (lane_mask != estimator->stationary_lane_mask) {
+        estimator_reset_stationary_tracking(estimator);
+        estimator->stationary_lane_mask = lane_mask;
+    }
 
+    for (size_t lane = 0U; lane < DUAL_IMU_ESTIMATOR_LANE_COUNT; ++lane) {
+        if ((lane_mask & (uint8_t)(1U << lane)) == 0U)
+            continue;
         if (estimator_vector_norm(output->lane_rate_rad_s[lane]) >
             estimator->config.stationary_gyro_limit_rad_s) {
             return estimator_reject_stationary(
@@ -730,31 +1343,70 @@ static bool estimator_stationary_candidate(
         }
     }
 
-    if (output->accel_pair_residual_mps2 >
-        estimator->config.stationary_accel_pair_limit_mps2) {
+    if ((lane_mask == 0x03U) &&
+        (output->accel_pair_residual_mps2 >
+         estimator->config.stationary_accel_pair_limit_mps2)) {
         return estimator_reject_stationary(
             estimator, DUAL_IMU_STATIONARY_REJECT_ACCEL_PAIR);
     }
 
-    if (!estimator_update_stationary_statistics(estimator, output)) {
+    if (!estimator_update_stationary_statistics(estimator, output, lane_mask)) {
         return estimator_reject_stationary(
             estimator, DUAL_IMU_STATIONARY_REJECT_TEMPORAL_VARIANCE);
     }
 
     const uint32_t warmup_windows =
-        estimator_stationary_warmup_windows(estimator);
+        estimator_stationary_warmup_windows(estimator, lane_mask);
     if (estimator->stationary_statistics_count < warmup_windows)
         return true;
 
     for (size_t lane = 0U; lane < DUAL_IMU_ESTIMATOR_LANE_COUNT; ++lane) {
-        for (size_t axis = 0U; axis < 3U; ++axis) {
-            if (fabsf(estimator->stationary_gyro_mean_rad_s[lane][axis]) >
-                estimator->config.zaru_target_residual_limit_rad_s) {
-                return estimator_reject_stationary(
-                    estimator, DUAL_IMU_STATIONARY_REJECT_MEAN_RATE);
-            }
+        if ((lane_mask & (uint8_t)(1U << lane)) == 0U)
+            continue;
+        const bool filter_only_recovery =
+            estimator->post_impact_reacquire_active &&
+            ((estimator->hard_fault_flags[lane] &
+              DUAL_IMU_ESTIMATOR_FILTER_FAULT) != 0U) &&
+            (estimator_sensor_fault_flags(estimator, lane) == 0U);
+        const bool filter_valid = estimator->lane_seeded[lane] &&
+                                  attitude_mekf_is_valid(
+                                      &estimator->mekf[lane]);
+        if (!filter_valid && !filter_only_recovery) {
+            return estimator_reject_stationary(
+                estimator, DUAL_IMU_STATIONARY_REJECT_INVALID_OR_FAULT);
         }
 
+        float learned_bias_rad_s[3];
+        if (filter_valid) {
+            if (!attitude_mekf_get_bias(&estimator->mekf[lane],
+                                        learned_bias_rad_s)) {
+                return estimator_reject_stationary(
+                    estimator, DUAL_IMU_STATIONARY_REJECT_INVALID_OR_FAULT);
+            }
+        } else {
+            (void)estimator_get_recoverable_bias(&estimator->mekf[lane],
+                                                 learned_bias_rad_s);
+        }
+        if (!estimator_vector_is_finite(learned_bias_rad_s)) {
+            return estimator_reject_stationary(
+                estimator, DUAL_IMU_STATIONARY_REJECT_INVALID_OR_FAULT);
+        }
+        float residual_rad_s[3];
+        for (size_t axis = 0U; axis < 3U; ++axis) {
+            residual_rad_s[axis] =
+                estimator->stationary_gyro_mean_rad_s[lane][axis] -
+                learned_bias_rad_s[axis];
+        }
+        if (estimator_vector_norm(residual_rad_s) >
+            estimator->config.zaru_target_residual_limit_rad_s) {
+            return estimator_reject_stationary(
+                estimator, DUAL_IMU_STATIONARY_REJECT_MEAN_RATE);
+        }
+    }
+
+    for (size_t lane = 0U; lane < DUAL_IMU_ESTIMATOR_LANE_COUNT; ++lane) {
+        if ((lane_mask & (uint8_t)(1U << lane)) == 0U)
+            continue;
         const float norm = estimator_vector_norm(
             estimator->stationary_accel_mean_mps2[lane]);
         if (!isfinite(norm) || (norm <= 0.0f)) {
@@ -780,6 +1432,259 @@ static bool estimator_stationary_candidate(
                 estimator, DUAL_IMU_STATIONARY_REJECT_GRAVITY_DIRECTION);
         }
     }
+    return true;
+}
+
+static bool estimator_stationary_reject_requires_immediate_exit(
+    dual_imu_stationary_reject_reason_t reason)
+{
+    return (reason == DUAL_IMU_STATIONARY_REJECT_INVALID_OR_FAULT) ||
+           (reason == DUAL_IMU_STATIONARY_REJECT_INSTANT_RATE) ||
+           (reason == DUAL_IMU_STATIONARY_REJECT_INHIBITED);
+}
+
+static bool estimator_confirmed_stationary_integrity_valid(
+    const dual_imu_estimator_t *estimator,
+    const dual_imu_estimator_output_t *output,
+    uint8_t available_lane_mask)
+{
+    const uint8_t confirmed_mask = estimator->stationary_confirmed_lane_mask;
+    if (output->accel_inhibited || (confirmed_mask == 0U) ||
+        (available_lane_mask != confirmed_mask)) {
+        return false;
+    }
+
+    for (size_t lane = 0U; lane < DUAL_IMU_ESTIMATOR_LANE_COUNT; ++lane) {
+        if ((confirmed_mask & (uint8_t)(1U << lane)) == 0U)
+            continue;
+        if ((estimator->hard_fault_flags[lane] != 0U) ||
+            estimator->lane_accel_fault[lane] ||
+            !output->lane_window[lane].gyro_valid ||
+            !output->lane_window[lane].accel_valid ||
+            !estimator->lane_seeded[lane] ||
+            !attitude_mekf_is_valid(&estimator->mekf[lane])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool estimator_stationary_rate_exit_evidence(
+    const dual_imu_estimator_t *estimator,
+    const dual_imu_estimator_output_t *output,
+    uint8_t lane_mask,
+    bool *any_lane_exceeds,
+    bool *all_lanes_exceed)
+{
+    float minimum_residual_norm = INFINITY;
+    float maximum_residual_norm = 0.0f;
+    *any_lane_exceeds = false;
+    *all_lanes_exceed = false;
+    if (lane_mask == 0U)
+        return false;
+
+    for (size_t lane = 0U; lane < DUAL_IMU_ESTIMATOR_LANE_COUNT; ++lane) {
+        if ((lane_mask & (uint8_t)(1U << lane)) == 0U)
+            continue;
+
+        float learned_bias_rad_s[3];
+        if (!attitude_mekf_get_bias(&estimator->mekf[lane],
+                                    learned_bias_rad_s) ||
+            !estimator_vector_is_finite(output->lane_rate_rad_s[lane])) {
+            return false;
+        }
+        float residual_rad_s[3];
+        for (size_t axis = 0U; axis < 3U; ++axis) {
+            residual_rad_s[axis] = output->lane_rate_rad_s[lane][axis] -
+                                   learned_bias_rad_s[axis];
+        }
+        const float residual_norm = estimator_vector_norm(residual_rad_s);
+        if (!isfinite(residual_norm))
+            return false;
+        minimum_residual_norm = fminf(minimum_residual_norm, residual_norm);
+        maximum_residual_norm = fmaxf(maximum_residual_norm, residual_norm);
+    }
+
+    *any_lane_exceeds = maximum_residual_norm >
+        estimator->config.zaru_target_residual_limit_rad_s;
+    *all_lanes_exceed = minimum_residual_norm >
+        estimator->config.zaru_target_residual_limit_rad_s;
+    return true;
+}
+
+static bool estimator_update_stationary_confirmation(
+    dual_imu_estimator_t *estimator,
+    const dual_imu_estimator_output_t *output,
+    uint8_t available_lane_mask)
+{
+    if (!estimator->stationary_confirmed_latched) {
+        estimator->stationary_soft_exit_streak = 0U;
+        estimator->stationary_rate_exit_streak = 0U;
+        const uint16_t required_windows =
+            estimator_stationary_required_windows(estimator,
+                                                  available_lane_mask);
+        if (output->stationary_candidate && (available_lane_mask != 0U) &&
+            (estimator->stationary_streak >= required_windows)) {
+            estimator->stationary_confirmed_latched = true;
+            estimator->stationary_confirmed_lane_mask = available_lane_mask;
+        }
+    }
+
+    if (!estimator->stationary_confirmed_latched)
+        return false;
+
+    const bool immediate_reject =
+        !output->stationary_candidate &&
+        estimator_stationary_reject_requires_immediate_exit(
+            estimator->stationary_last_reject_reason);
+    if (immediate_reject ||
+        !estimator_confirmed_stationary_integrity_valid(
+            estimator, output, available_lane_mask)) {
+        estimator_reset_stationary_tracking(estimator);
+        estimator_clear_stationary_confirmation(estimator);
+        return false;
+    }
+
+    bool any_lane_rate_exit_evidence = false;
+    bool all_lanes_rate_exit_evidence = false;
+    const bool rate_evidence_valid = estimator_stationary_rate_exit_evidence(
+        estimator, output, estimator->stationary_confirmed_lane_mask,
+        &any_lane_rate_exit_evidence, &all_lanes_rate_exit_evidence);
+    if (!rate_evidence_valid) {
+        estimator_reset_stationary_tracking(estimator);
+        estimator_clear_stationary_confirmation(estimator);
+        return false;
+    }
+
+    if (all_lanes_rate_exit_evidence) {
+        estimator->stationary_soft_exit_streak = 0U;
+        if (estimator->stationary_rate_exit_streak < UINT16_MAX)
+            estimator->stationary_rate_exit_streak++;
+        if (estimator->stationary_rate_exit_streak >=
+            estimator->config.stationary_rate_exit_windows) {
+            estimator_reset_stationary_tracking(estimator);
+            estimator_clear_stationary_confirmation(estimator);
+        }
+        return false;
+    }
+    estimator->stationary_rate_exit_streak = 0U;
+
+    if (any_lane_rate_exit_evidence || !output->stationary_candidate) {
+        if (estimator->stationary_soft_exit_streak < UINT16_MAX)
+            estimator->stationary_soft_exit_streak++;
+        if (estimator->stationary_soft_exit_streak >=
+            estimator->config.stationary_soft_exit_windows) {
+            estimator_reset_stationary_tracking(estimator);
+            estimator_clear_stationary_confirmation(estimator);
+        }
+        return false;
+    }
+    estimator->stationary_soft_exit_streak = 0U;
+
+    const uint32_t warmup_windows = estimator_stationary_warmup_windows(
+        estimator, estimator->stationary_confirmed_lane_mask);
+    return estimator->stationary_statistics_count >= warmup_windows;
+}
+
+static bool estimator_reacquire_attitude(
+    dual_imu_estimator_t *estimator,
+    dual_imu_estimator_output_t *output)
+{
+    const uint8_t lane_mask = estimator->stationary_lane_mask;
+    if (!estimator->post_impact_reacquire_active ||
+        output->accel_inhibited || (lane_mask == 0U))
+        return false;
+
+    const bool single_lane = lane_mask != 0x03U;
+    uint16_t required_windows = single_lane
+        ? estimator->config.post_impact_reacquire_single_lane_dwell_windows
+        : estimator->config.post_impact_reacquire_dwell_windows;
+    const uint32_t warmup_windows =
+        estimator_stationary_warmup_windows(estimator, lane_mask);
+    if (required_windows < warmup_windows)
+        required_windows = (uint16_t)warmup_windows;
+    if (estimator->stationary_streak < required_windows)
+        return false;
+
+    uint32_t accel_lane = 0U;
+    while ((accel_lane < DUAL_IMU_ESTIMATOR_LANE_COUNT) &&
+           ((lane_mask & (uint8_t)(1U << accel_lane)) == 0U)) {
+        accel_lane++;
+    }
+    if (accel_lane >= DUAL_IMU_ESTIMATOR_LANE_COUNT)
+        return false;
+
+    float reference_quaternion[4];
+    if (estimator->output_initialized)
+        memcpy(reference_quaternion, estimator->output_quaternion,
+               sizeof(reference_quaternion));
+    else
+        estimator_quaternion_identity(reference_quaternion);
+
+    attitude_mekf_t staged[DUAL_IMU_ESTIMATOR_LANE_COUNT];
+    bool staged_seeded[DUAL_IMU_ESTIMATOR_LANE_COUNT] = {false, false};
+    bool staged_bias_preserved[DUAL_IMU_ESTIMATOR_LANE_COUNT] = {false, false};
+    memcpy(staged, estimator->mekf, sizeof(staged));
+    bool any_seeded = false;
+    for (size_t lane = 0U; lane < DUAL_IMU_ESTIMATOR_LANE_COUNT; ++lane) {
+        const uint32_t sensor_faults =
+            estimator_sensor_fault_flags(estimator, lane);
+        if ((sensor_faults != 0U) || !output->lane_window[lane].gyro_valid)
+            continue;
+
+        const bool filter_fault =
+            (estimator->hard_fault_flags[lane] &
+             DUAL_IMU_ESTIMATOR_FILTER_FAULT) != 0U;
+        const bool lane_has_complete_recovery_window =
+            (lane_mask & (uint8_t)(1U << lane)) != 0U;
+        if (filter_fault &&
+            (!lane_has_complete_recovery_window ||
+             !output->lane_window[lane].accel_valid ||
+             estimator->lane_accel_fault[lane] ||
+             !estimator_filter_recovery_window_is_new(
+                 estimator, output, lane))) {
+            continue;
+        }
+
+        const uint32_t source_accel_lane =
+            lane_has_complete_recovery_window
+                ? (uint32_t)lane
+                : accel_lane;
+        float bias_rad_s[3];
+        staged_bias_preserved[lane] =
+            estimator_get_recoverable_bias(&staged[lane], bias_rad_s);
+        if (!estimator_reseed_tilt_preserving_heading(
+                &staged[lane],
+                estimator->stationary_accel_mean_mps2[source_accel_lane],
+                reference_quaternion,
+                bias_rad_s)) {
+            continue;
+        }
+        staged_seeded[lane] = true;
+        any_seeded = true;
+    }
+    if (!any_seeded)
+        return false;
+
+    memcpy(estimator->mekf, staged, sizeof(staged));
+    memcpy(estimator->lane_seeded, staged_seeded, sizeof(staged_seeded));
+    for (size_t lane = 0U; lane < DUAL_IMU_ESTIMATOR_LANE_COUNT; ++lane) {
+        if (staged_seeded[lane]) {
+            estimator->hard_fault_flags[lane] &=
+                ~DUAL_IMU_ESTIMATOR_FILTER_FAULT;
+            if (!staged_bias_preserved[lane]) {
+                estimator->lane_calibrated[lane] = false;
+                estimator->zaru_accept_count[lane] = 0U;
+                estimator->zaru_divergence_count[lane] = 0U;
+            }
+        }
+    }
+    estimator_quaternion_identity(estimator->output_alignment);
+    estimator->output_initialized = false;
+    estimator->previous_selected_lane = IMU_SELECTOR_LANE_NONE;
+    /* Gravity can reconverge roll/pitch even when the separate heading
+     * continuity warning remains sticky. */
+    estimator_complete_post_impact_reacquire(estimator, output);
     return true;
 }
 
@@ -1007,7 +1912,7 @@ imu_preintegrator_result_t dual_imu_estimator_process_next(
     const uint32_t preferred_lane = estimator->selector.selected_lane;
     if ((preferred_lane < DUAL_IMU_ESTIMATOR_LANE_COUNT) &&
         windows[preferred_lane].gyro_valid &&
-        (estimator->hard_fault_flags[preferred_lane] == 0U))
+        estimator_raw_lane_usable_for_geometry(estimator, preferred_lane))
         geometry_lane = preferred_lane;
     const uint32_t lane_priority[DUAL_IMU_ESTIMATOR_LANE_COUNT] = {
         DUAL_IMU_ESTIMATOR_LANE_ICM45686,
@@ -1019,7 +1924,7 @@ imu_preintegrator_result_t dual_imu_estimator_process_next(
          ++index) {
         const uint32_t lane = lane_priority[index];
         if (windows[lane].gyro_valid &&
-            (estimator->hard_fault_flags[lane] == 0U))
+            estimator_raw_lane_usable_for_geometry(estimator, lane))
             geometry_lane = lane;
     }
     for (size_t index = 0U;
@@ -1028,7 +1933,7 @@ imu_preintegrator_result_t dual_imu_estimator_process_next(
          ++index) {
         const uint32_t lane = lane_priority[index];
         if (windows[lane].gyro_propagation_valid &&
-            (estimator->hard_fault_flags[lane] == 0U))
+            estimator_raw_lane_usable_for_geometry(estimator, lane))
             geometry_lane = lane;
     }
 
@@ -1039,13 +1944,42 @@ imu_preintegrator_result_t dual_imu_estimator_process_next(
                output->lane_rate_rad_s[geometry_lane],
                sizeof(output->angular_rate_rad_s));
     }
+
+    output->accel_inhibited = estimator_interval_active_for_window(
+        estimator->accel_inhibit_intervals,
+        &estimator->accel_inhibit_interval_count,
+        output->start_us, output->end_us, NULL);
+    uint64_t impact_start_us = output->start_us;
+    const bool impact_interval_active = estimator_interval_active_for_window(
+        estimator->impact_intervals,
+        &estimator->impact_interval_count,
+        output->start_us, output->end_us, &impact_start_us);
+    const bool impact_episode_started =
+        impact_interval_active && !estimator->impact_interval_was_active;
+    estimator->impact_interval_was_active = impact_interval_active;
+    if (impact_episode_started) {
+        /* A saturated/high-g episode makes common-mode gyro g-sensitivity
+         * indistinguishable from real rotation with only two six-axis IMUs.
+         * Keep propagating matching gyros for responsiveness, but force a
+         * later gravity-based tilt reacquisition and report heading integrity
+         * as unknown from the causal event timestamp. */
+        estimator_mark_heading_continuity_lost(estimator, impact_start_us);
+        estimator_enter_post_impact_reacquire(estimator);
+    }
+
+    const imu_angular_accel_estimator_t angular_accel_estimator_before =
+        estimator->angular_accel_estimator;
+    imu_angular_accel_estimator_t angular_accel_estimator_staged =
+        angular_accel_estimator_before;
     if (!geometry_valid ||
-        !imu_angular_accel_estimator_update(&estimator->angular_accel_estimator,
+        !imu_angular_accel_estimator_update(&angular_accel_estimator_staged,
                                             output->angular_rate_rad_s,
                                             dt_s,
                                             output->angular_accel_rad_s2))
         memset(output->angular_accel_rad_s2, 0,
                sizeof(output->angular_accel_rad_s2));
+    if (!output->accel_inhibited)
+        estimator->angular_accel_estimator = angular_accel_estimator_staged;
 
     float mean_angular_accel_rad_s2[3] = {0.0f};
     float corrected_second_moment[3][3] = {{0.0f}};
@@ -1085,7 +2019,6 @@ imu_preintegrator_result_t dual_imu_estimator_process_next(
             estimator_vector_distance(output->lane_specific_force_mps2[0],
                                       output->lane_specific_force_mps2[1]);
 
-    output->accel_inhibited = output->start_us < estimator->accel_inhibit_until_us;
     const float rate_norm = estimator_vector_norm(output->angular_rate_rad_s);
     const float angular_accel_norm =
         estimator_vector_norm(output->angular_accel_rad_s2);
@@ -1094,22 +2027,45 @@ imu_preintegrator_result_t dual_imu_estimator_process_next(
         (angular_accel_norm >
          estimator->config.accel_update_max_angular_accel_rad_s2);
 
+    attitude_mekf_t mekf_before_gyro_propagation
+        [DUAL_IMU_ESTIMATOR_LANE_COUNT];
+    uint8_t lane_seeded_before_gyro_propagation_mask = 0U;
+    uint8_t filter_fault_before_gyro_propagation_mask = 0U;
+    if (output->accel_inhibited) {
+        memcpy(mekf_before_gyro_propagation, estimator->mekf,
+               sizeof(mekf_before_gyro_propagation));
+        for (size_t lane = 0U; lane < DUAL_IMU_ESTIMATOR_LANE_COUNT; ++lane) {
+            const uint8_t lane_mask = (uint8_t)(1U << lane);
+            if (estimator->lane_seeded[lane])
+                lane_seeded_before_gyro_propagation_mask |= lane_mask;
+            if ((estimator->hard_fault_flags[lane] &
+                 DUAL_IMU_ESTIMATOR_FILTER_FAULT) != 0U) {
+                filter_fault_before_gyro_propagation_mask |= lane_mask;
+            }
+        }
+    }
     for (size_t lane = 0U; lane < DUAL_IMU_ESTIMATOR_LANE_COUNT; ++lane) {
         if (estimator->lane_seeded[lane]) {
             bool aided = false;
+            bool rotation_unobserved = false;
             if (!estimator_propagate_half_window(estimator,
                                                  (uint32_t)lane,
                                                  windows,
                                                  0U,
                                                  half_dt_s,
-                                                 &aided) &&
+                                                 &aided,
+                                                 &rotation_unobserved) &&
                 windows[lane].gyro_propagation_valid &&
-                (estimator->hard_fault_flags[lane] == 0U))
-                estimator->hard_fault_flags[lane] |=
-                    DUAL_IMU_ESTIMATOR_FILTER_FAULT;
+                (estimator->hard_fault_flags[lane] == 0U)) {
+                estimator_latch_filter_fault(estimator, lane,
+                                             output->end_us);
+            }
             output->lane_aided_propagation[lane] = aided;
+            output->rotation_unobserved =
+                output->rotation_unobserved || rotation_unobserved;
         }
     }
+    estimator_record_unobserved_rotation(estimator, output);
 
     for (size_t lane = 0U; lane < DUAL_IMU_ESTIMATOR_LANE_COUNT; ++lane) {
         const size_t other = 1U - lane;
@@ -1120,24 +2076,41 @@ imu_preintegrator_result_t dual_imu_estimator_process_next(
         if (!estimator->lane_seeded[lane] &&
             windows[seed_accel_lane].accel_valid &&
             !estimator->lane_accel_fault[seed_accel_lane] &&
-            !output->accel_inhibited && !dynamic_accel_gate) {
-            const float zero_bias[3] = {0.0f, 0.0f, 0.0f};
-            float seed_yaw_rad = 0.0f;
+            (estimator_sensor_fault_flags(estimator, lane) == 0U) &&
+            (((estimator->hard_fault_flags[lane] &
+               DUAL_IMU_ESTIMATOR_FILTER_FAULT) == 0U) ||
+             (windows[lane].gyro_valid && windows[lane].accel_valid &&
+              !estimator->lane_accel_fault[lane] &&
+              estimator_filter_recovery_window_is_new(
+                  estimator, output, lane))) &&
+            !output->accel_inhibited && !dynamic_accel_gate &&
+            !estimator->post_impact_reacquire_active) {
+            float recoverable_bias[3];
+            const bool bias_preserved = estimator_get_recoverable_bias(
+                &estimator->mekf[lane], recoverable_bias);
+            if (!bias_preserved) {
+                estimator->lane_calibrated[lane] = false;
+                estimator->zaru_accept_count[lane] = 0U;
+                estimator->zaru_divergence_count[lane] = 0U;
+            }
+            float reference_quaternion[4];
+            estimator_quaternion_identity(reference_quaternion);
             if (estimator->lane_seeded[other] &&
                 attitude_mekf_is_valid(&estimator->mekf[other])) {
-                float other_quaternion[4];
-                float other_euler[3];
                 if (attitude_mekf_get_quaternion(&estimator->mekf[other],
-                                                 other_quaternion)) {
-                    estimator_quaternion_to_euler(other_quaternion, other_euler);
-                    seed_yaw_rad = other_euler[2];
+                                                 reference_quaternion)) {
+                    (void)estimator_quaternion_normalize(reference_quaternion);
                 }
             }
-            estimator->lane_seeded[lane] = attitude_mekf_seed_from_accel(
+            estimator->lane_seeded[lane] =
+                estimator_reseed_tilt_preserving_heading(
                 &estimator->mekf[lane],
                 output->lane_specific_force_mps2[seed_accel_lane],
-                seed_yaw_rad,
-                zero_bias);
+                reference_quaternion,
+                recoverable_bias);
+            if (estimator->lane_seeded[lane])
+                estimator->hard_fault_flags[lane] &=
+                    ~DUAL_IMU_ESTIMATOR_FILTER_FAULT;
             output->lane_accel_aided[lane] =
                 estimator->lane_seeded[lane] && (seed_accel_lane != lane);
         }
@@ -1146,8 +2119,7 @@ imu_preintegrator_result_t dual_imu_estimator_process_next(
     /* Select before any ZARU update so bias learning cannot hide this residual. */
     imu_selector_input_t selector_input;
     memset(&selector_input, 0, sizeof(selector_input));
-    selector_input.residual_enabled = !output->accel_inhibited &&
-                                      windows[0].gyro_valid &&
+    selector_input.residual_enabled = windows[0].gyro_valid &&
                                       windows[1].gyro_valid;
     selector_input.isolation_hint = estimator->isolation_hint;
     for (size_t lane = 0U; lane < DUAL_IMU_ESTIMATOR_LANE_COUNT; ++lane) {
@@ -1155,7 +2127,7 @@ imu_preintegrator_result_t dual_imu_estimator_process_next(
             windows[lane].gyro_valid && estimator->lane_seeded[lane] &&
             attitude_mekf_is_valid(&estimator->mekf[lane]);
         selector_input.lane[lane].hard_fault_flags =
-            estimator->hard_fault_flags[lane];
+            estimator_sensor_fault_flags(estimator, lane);
         for (size_t axis = 0U; axis < 3U; ++axis) {
             selector_input.lane[lane].delta_angle_rad[axis] =
                 windows[lane].delta_angle_rad[axis] -
@@ -1174,22 +2146,51 @@ imu_preintegrator_result_t dual_imu_estimator_process_next(
                              &output->selector))
         return IMU_PREINTEGRATOR_ERROR;
 
+    /* Accel inhibition removes the independent arbiter. Require consecutive
+     * cross-lane NIS evidence before failing closed, then roll the full suspect
+     * segment back to the state before its first window. */
+    const bool impact_gyro_disagreement_evidence =
+        output->accel_inhibited && output->selector.residual_valid &&
+        (output->selector.hard_fault_mask == 0U) &&
+        (output->selector.isolated_mask == 0U) &&
+        (output->selector.usable_mask == 0x03U) &&
+        isfinite(output->selector.residual_nis) &&
+        (output->selector.residual_nis >
+         estimator->selector.config.nis_enter_threshold);
+    (void)estimator_handle_impact_gyro_disagreement(
+        estimator, output, impact_gyro_disagreement_evidence,
+        mekf_before_gyro_propagation,
+        &angular_accel_estimator_before,
+        lane_seeded_before_gyro_propagation_mask,
+        filter_fault_before_gyro_propagation_mask);
+    const bool impact_gyro_disagreement_pending =
+        estimator->impact_gyro_checkpoint_valid;
+
     const float accel_variance_scale = estimator_accel_variance_scale(estimator,
                                                                       output);
-    if (!output->accel_inhibited && !dynamic_accel_gate) {
+    bool accel_health_evidence[DUAL_IMU_ESTIMATOR_LANE_COUNT] = {false, false};
+    const bool post_impact_quality_pending =
+        estimator->post_impact_reacquire_active;
+    const bool accel_updates_enabled =
+        !output->accel_inhibited && !dynamic_accel_gate;
+    if (accel_updates_enabled) {
         for (size_t lane = 0U; lane < DUAL_IMU_ESTIMATOR_LANE_COUNT; ++lane) {
-            if (estimator->lane_seeded[lane] && windows[lane].accel_valid)
+            if (estimator->lane_seeded[lane] && windows[lane].accel_valid) {
+                accel_health_evidence[lane] =
+                    estimator->hard_fault_flags[lane] == 0U;
                 output->accel_result[lane] = attitude_mekf_update_accel(
                     &estimator->mekf[lane],
                     output->lane_specific_force_mps2[lane],
                     accel_variance_scale);
+            }
         }
     }
     estimator_update_accel_health(estimator,
                                   output,
-                                  !output->accel_inhibited &&
-                                      !dynamic_accel_gate);
-    if (!output->accel_inhibited && !dynamic_accel_gate) {
+                                  accel_updates_enabled &&
+                                      !post_impact_quality_pending,
+                                  accel_health_evidence);
+    if (accel_updates_enabled) {
         for (size_t lane = 0U; lane < DUAL_IMU_ESTIMATOR_LANE_COUNT; ++lane) {
             const size_t other = 1U - lane;
             if (!estimator->lane_seeded[lane] ||
@@ -1209,12 +2210,75 @@ imu_preintegrator_result_t dual_imu_estimator_process_next(
         }
     }
 
+    bool selected_lane_aiding_evidence = false;
+    if (accel_updates_enabled) {
+        const imu_selector_lane_t selected_lane =
+            output->selector.selected_lane;
+        if (selected_lane < IMU_SELECTOR_LANE_COUNT) {
+            selected_lane_aiding_evidence =
+                estimator->lane_seeded[selected_lane] &&
+                ((output->accel_result[selected_lane] ==
+                  ATTITUDE_MEKF_ACCEL_ACCEPTED) ||
+                 output->lane_accel_aided[selected_lane]);
+        }
+    }
+    const bool post_impact_quality_evidence =
+        post_impact_quality_pending && accel_updates_enabled &&
+        estimator->lane_seeded[0] && estimator->lane_seeded[1] &&
+        (estimator->hard_fault_flags[0] == 0U) &&
+        (estimator->hard_fault_flags[1] == 0U) &&
+        !estimator->lane_accel_fault[0] &&
+        !estimator->lane_accel_fault[1] && windows[0].accel_valid &&
+        windows[1].accel_valid &&
+        (output->accel_result[0] == ATTITUDE_MEKF_ACCEL_ACCEPTED) &&
+        (output->accel_result[1] == ATTITUDE_MEKF_ACCEL_ACCEPTED) &&
+        isfinite(output->accel_pair_residual_mps2) &&
+        (output->accel_pair_residual_mps2 <=
+         estimator->config.stationary_accel_pair_limit_mps2) &&
+        output->selector.residual_valid &&
+        isfinite(output->selector.residual_nis) &&
+        (output->selector.residual_nis <
+         estimator->selector.config.nis_clear_threshold);
+    const bool attitude_convergence_evidence =
+        post_impact_quality_pending ? post_impact_quality_evidence
+                                    : selected_lane_aiding_evidence;
+    if (attitude_convergence_evidence) {
+        estimator->attitude_aiding_miss_streak = 0U;
+        if (!estimator->attitude_converged ||
+            estimator->post_impact_reacquire_active) {
+            if (estimator->attitude_convergence_streak < UINT16_MAX)
+                estimator->attitude_convergence_streak++;
+            if (estimator->attitude_convergence_streak >=
+                estimator->config.attitude_convergence_windows) {
+                if (estimator->post_impact_reacquire_active) {
+                    estimator_complete_post_impact_reacquire(estimator,
+                                                              output);
+                } else {
+                    estimator->attitude_converged = true;
+                }
+            }
+        }
+    } else if (estimator->post_impact_reacquire_active) {
+        estimator->attitude_convergence_streak = 0U;
+    } else {
+        estimator->attitude_convergence_streak = 0U;
+        if (estimator->attitude_aiding_miss_streak < UINT16_MAX)
+            estimator->attitude_aiding_miss_streak++;
+        if (estimator->attitude_aiding_miss_streak >=
+            estimator->config.attitude_aiding_timeout_windows) {
+            estimator->attitude_converged = false;
+        }
+    }
+
+    const uint8_t available_stationary_lane_mask =
+        estimator_stationary_available_lane_mask(estimator, output);
     if (output->accel_inhibited) {
         output->stationary_candidate = estimator_reject_stationary(
             estimator, DUAL_IMU_STATIONARY_REJECT_INHIBITED);
     } else {
         output->stationary_candidate =
-            estimator_stationary_candidate(estimator, output);
+            estimator_stationary_candidate(
+                estimator, output, available_stationary_lane_mask);
     }
     if (output->stationary_candidate) {
         if (estimator->stationary_streak < UINT16_MAX)
@@ -1226,8 +2290,12 @@ imu_preintegrator_result_t dual_imu_estimator_process_next(
         for (size_t lane = 0U; lane < DUAL_IMU_ESTIMATOR_LANE_COUNT; ++lane) {
             if (!estimator->lane_calibrated[lane])
                 estimator->zaru_accept_count[lane] = 0U;
+            estimator->zaru_divergence_count[lane] = 0U;
         }
     }
+    (void)estimator_reacquire_attitude(estimator, output);
+    const bool zaru_allowed = estimator_update_stationary_confirmation(
+        estimator, output, available_stationary_lane_mask);
     output->stationary_last_reject_reason =
         estimator->stationary_last_reject_reason;
     memcpy(output->stationary_temporal_gyro_variance_rad2_s2,
@@ -1238,14 +2306,19 @@ imu_preintegrator_result_t dual_imu_estimator_process_next(
            sizeof(output->stationary_temporal_accel_variance_m2_s4));
     output->stationary_streak = estimator->stationary_streak;
     output->stationary_max_streak = estimator->stationary_max_streak;
-    const uint16_t required_stationary_windows = estimator->stationary_hint
-        ? estimator->config.stationary_hint_dwell_windows
-        : estimator->config.stationary_dwell_windows;
+    output->stationary_lane_mask = estimator->stationary_confirmed_latched
+        ? estimator->stationary_confirmed_lane_mask
+        : estimator->stationary_lane_mask;
+    output->stationary_single_lane =
+        (output->stationary_lane_mask != 0U) &&
+        (output->stationary_lane_mask != 0x03U);
     output->stationary_confirmed =
-        estimator->stationary_streak >= required_stationary_windows;
-    if (output->stationary_confirmed) {
+        estimator->stationary_confirmed_latched;
+    if (zaru_allowed) {
         for (size_t lane = 0U; lane < DUAL_IMU_ESTIMATOR_LANE_COUNT; ++lane) {
-            if (!estimator->lane_seeded[lane] ||
+            if ((estimator->stationary_confirmed_lane_mask &
+                 (uint8_t)(1U << lane)) == 0U ||
+                !estimator->lane_seeded[lane] ||
                 !windows[lane].gyro_valid ||
                 (estimator->hard_fault_flags[lane] != 0U)) {
                 if (!estimator->lane_calibrated[lane])
@@ -1261,7 +2334,7 @@ imu_preintegrator_result_t dual_imu_estimator_process_next(
                 {0.0f, variance, 0.0f},
                 {0.0f, 0.0f, variance},
             };
-            float bounded_target_rad_s[3];
+            float bounded_target_rad_s[3] = {0.0f};
             const float maximum_bias_correction_rad_s =
                 estimator->config.zaru_bias_slew_limit_rad_s2 * dt_s;
             /* The dwell mean is the stationary pseudo-measurement; using the
@@ -1275,22 +2348,42 @@ imu_preintegrator_result_t dual_imu_estimator_process_next(
                     estimator->config.zaru_target_residual_limit_rad_s,
                     maximum_bias_correction_rad_s,
                     bounded_target_rad_s);
-            if (!estimator->lane_calibrated[lane] &&
-                (output->zaru_result[lane] == ATTITUDE_MEKF_ZARU_ACCEPTED)) {
-                float learned_bias_rad_s[3];
-                if (attitude_mekf_get_bias(&estimator->mekf[lane],
-                                           learned_bias_rad_s) &&
-                    (estimator_vector_distance(bounded_target_rad_s,
-                                               learned_bias_rad_s) <
-                     estimator->config.zaru_calibration_tolerance_rad_s)) {
+            float learned_bias_rad_s[3] = {0.0f};
+            const bool learned_bias_valid = attitude_mekf_get_bias(
+                &estimator->mekf[lane], learned_bias_rad_s);
+            const float target_distance = learned_bias_valid
+                ? estimator_vector_distance(bounded_target_rad_s,
+                                            learned_bias_rad_s)
+                : INFINITY;
+            if (estimator->lane_calibrated[lane]) {
+                const bool diverged =
+                    (output->zaru_result[lane] !=
+                     ATTITUDE_MEKF_ZARU_ACCEPTED) ||
+                    !isfinite(target_distance) ||
+                    (target_distance > estimator->config
+                         .zaru_calibration_revoke_tolerance_rad_s);
+                if (diverged) {
+                    if (estimator->zaru_divergence_count[lane] < UINT16_MAX)
+                        estimator->zaru_divergence_count[lane]++;
+                    if (estimator->zaru_divergence_count[lane] >=
+                        estimator->config.calibration_revoke_windows) {
+                        estimator->lane_calibrated[lane] = false;
+                        estimator->zaru_accept_count[lane] = 0U;
+                        estimator->zaru_divergence_count[lane] = 0U;
+                    }
+                } else {
+                    estimator->zaru_divergence_count[lane] = 0U;
+                }
+            } else if ((output->zaru_result[lane] ==
+                        ATTITUDE_MEKF_ZARU_ACCEPTED) &&
+                       isfinite(target_distance) &&
+                       (target_distance < estimator->config
+                            .zaru_calibration_tolerance_rad_s)) {
                     if (estimator->zaru_accept_count[lane] < UINT16_MAX)
                         estimator->zaru_accept_count[lane]++;
                     if (estimator->zaru_accept_count[lane] >=
                         estimator->config.calibration_accept_windows)
                         estimator->lane_calibrated[lane] = true;
-                } else {
-                    estimator->zaru_accept_count[lane] = 0U;
-                }
             } else if (!estimator->lane_calibrated[lane]) {
                 estimator->zaru_accept_count[lane] = 0U;
             }
@@ -1299,21 +2392,35 @@ imu_preintegrator_result_t dual_imu_estimator_process_next(
 
     /* The window-mean accel/ZARU measurements are centered in time. */
     for (size_t lane = 0U; lane < DUAL_IMU_ESTIMATOR_LANE_COUNT; ++lane) {
-        if (!estimator->lane_seeded[lane])
+        if (!estimator->lane_seeded[lane] ||
+            impact_gyro_disagreement_pending)
             continue;
         bool aided = false;
+        bool rotation_unobserved = false;
         if (!estimator_propagate_half_window(estimator,
                                              (uint32_t)lane,
                                              windows,
                                              1U,
                                              half_dt_s,
-                                             &aided) &&
+                                             &aided,
+                                             &rotation_unobserved) &&
             windows[lane].gyro_propagation_valid &&
-            (estimator->hard_fault_flags[lane] == 0U))
-            estimator->hard_fault_flags[lane] |=
-                DUAL_IMU_ESTIMATOR_FILTER_FAULT;
+            (estimator->hard_fault_flags[lane] == 0U)) {
+            estimator_latch_filter_fault(estimator, lane,
+                                         output->end_us);
+        }
         output->lane_aided_propagation[lane] =
             output->lane_aided_propagation[lane] || aided;
+        output->rotation_unobserved =
+            output->rotation_unobserved || rotation_unobserved;
+    }
+    estimator_record_unobserved_rotation(estimator, output);
+    if (!estimator->stationary_confirmed_latched) {
+        output->stationary_confirmed = false;
+        output->stationary_lane_mask = estimator->stationary_lane_mask;
+        output->stationary_single_lane =
+            (output->stationary_lane_mask != 0U) &&
+            (output->stationary_lane_mask != 0x03U);
     }
 
     for (size_t lane = 0U; lane < DUAL_IMU_ESTIMATOR_LANE_COUNT; ++lane) {
@@ -1324,9 +2431,19 @@ imu_preintegrator_result_t dual_imu_estimator_process_next(
         (void)attitude_mekf_get_quaternion(&estimator->mekf[lane],
                                            output->lane_quaternion[lane]);
     }
+    output->attitude_converged = estimator->attitude_converged;
+    output->heading_continuity_lost =
+        estimator->heading_continuity_lost;
+    output->attitude_aiding_stale =
+        estimator->attitude_aiding_miss_streak >=
+        estimator->config.attitude_aiding_timeout_windows;
+    output->post_impact_reacquire_active =
+        estimator->post_impact_reacquire_active;
 
     const imu_selector_lane_t selected = output->selector.selected_lane;
-    if ((selected < IMU_SELECTOR_LANE_COUNT) &&
+    if (!output->rotation_unobserved &&
+        !impact_gyro_disagreement_pending &&
+        (selected < IMU_SELECTOR_LANE_COUNT) &&
         estimator->lane_seeded[selected] &&
         attitude_mekf_is_valid(&estimator->mekf[selected])) {
         estimator_update_output_alignment(estimator,

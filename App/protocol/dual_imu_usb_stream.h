@@ -13,25 +13,33 @@ extern "C" {
 /* The manager may finish more than one 2.5 ms estimator window per call, so
  * the USB observer can legitimately skip an intermediate fused snapshot. */
 #define DUAL_IMU_USB_ACCEL_MAX_AGE_US (7500U)
+/* Invalid frames may carry the latest trustworthy payload for display
+ * continuity. The validity bits remain clear and are always authoritative. */
+#define DUAL_IMU_USB_INVALID_HOLD_US (20000U)
+/* Hold transport-only output until three complete 2.5 ms estimator windows
+ * have had a chance to classify a causal gyro disagreement. */
+#define DUAL_IMU_USB_INTEGRITY_HOLDBACK_US (7500U)
+#define DUAL_IMU_USB_SATURATION_HOLD_US \
+    IMU_MOTION_GUARD_STATUS_SATURATION_HOLD_US
 
 typedef enum
 {
-    DUAL_IMU_USB_STATUS_ATTITUDE_VALID = (1U << 0),
-    DUAL_IMU_USB_STATUS_ACCEL_VALID = (1U << 1),
-    DUAL_IMU_USB_STATUS_GYRO_VALID = (1U << 2),
-    DUAL_IMU_USB_STATUS_DEGRADED = (1U << 3),
-    DUAL_IMU_USB_STATUS_DEADLINE_MISS = (1U << 4),
-    DUAL_IMU_USB_STATUS_EULER_SINGULAR = (1U << 5),
-    DUAL_IMU_USB_STATUS_BOTH_INITIALIZED = (1U << 6),
-    DUAL_IMU_USB_STATUS_SELECTOR_HEALTHY = (1U << 7),
-    DUAL_IMU_USB_STATUS_BMI_BIAS_CONVERGED = (1U << 8),
-    DUAL_IMU_USB_STATUS_ICM_BIAS_CONVERGED = (1U << 9),
-    DUAL_IMU_USB_STATUS_SELECTED_ICM = (1U << 10),
-    DUAL_IMU_USB_STATUS_STATIONARY = (1U << 11),
-    DUAL_IMU_USB_STATUS_BMI_FAULT = (1U << 12),
-    DUAL_IMU_USB_STATUS_ICM_FAULT = (1U << 13),
-    DUAL_IMU_USB_STATUS_STREAM_DROP = (1U << 14),
-    DUAL_IMU_USB_STATUS_YAW_RELATIVE = (1U << 15)
+    DUAL_IMU_USB_STATUS_PRIVATE_ATTITUDE_VALID = (1U << 0),
+    DUAL_IMU_USB_STATUS_PRIVATE_ACCEL_VALID = (1U << 1),
+    DUAL_IMU_USB_STATUS_PRIVATE_GYRO_VALID = (1U << 2),
+    DUAL_IMU_USB_STATUS_BIAS_NOT_CONVERGED = (1U << 3),
+    DUAL_IMU_USB_STATUS_MAG_DISTURBED = (1U << 4),
+    DUAL_IMU_USB_STATUS_ACCEL_SATURATION_RECENT = (1U << 5),
+    DUAL_IMU_USB_STATUS_GYRO_SATURATION_RECENT = (1U << 6),
+    DUAL_IMU_USB_STATUS_ATTITUDE_NOT_CONVERGED = (1U << 7),
+    DUAL_IMU_USB_STATUS_PRIVATE_HEADING_LOST = (1U << 8),
+    DUAL_IMU_USB_STATUS_STATIONARY = (1U << 9),
+    DUAL_IMU_USB_STATUS_MAG_AIDING = (1U << 10),
+    DUAL_IMU_USB_STATUS_UTC_UNSYNC = (1U << 11),
+    DUAL_IMU_USB_STATUS_SOUT_PULSE = (1U << 12),
+    DUAL_IMU_USB_STATUS_PRIVATE_BMI_FAULT = (1U << 13),
+    DUAL_IMU_USB_STATUS_PRIVATE_ICM_FAULT = (1U << 14),
+    DUAL_IMU_USB_STATUS_PRIVATE_STREAM_DROP = (1U << 15)
 } dual_imu_usb_status_t;
 
 typedef struct
@@ -43,9 +51,13 @@ typedef struct
     uint32_t usb_busy_count;
     uint32_t usb_fail_count;
     uint32_t encoder_error_count;
+    uint32_t heading_event_queue_patch_count;
+    uint32_t maturity_wait_count;
     uint32_t accel_no_causal_frame_count;
     uint32_t accel_invalid_frame_count;
     uint32_t accel_stale_frame_count;
+    uint32_t attitude_held_frame_count;
+    uint32_t accel_held_frame_count;
     uint32_t last_attitude_sequence;
     uint16_t queued_frame_count;
     bool drop_sticky;

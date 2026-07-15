@@ -24,7 +24,8 @@ static bool config_is_valid(const imu_selector_config_t *config)
            (config->ambiguous_enter_windows >= config->suspect_enter_windows) &&
            (config->soft_fault_confirm_windows >= config->suspect_enter_windows) &&
            (config->clear_windows > 0U) &&
-           (config->isolated_recovery_windows > 0U);
+           (config->isolated_recovery_windows > 0U) &&
+           (config->preferred_recovery_windows > 0U);
 }
 
 static bool covariance_is_valid(const float covariance[3][3], float floor_rad2)
@@ -302,6 +303,7 @@ void imu_selector_default_config(imu_selector_config_t *config)
     config->soft_fault_confirm_windows = 8U;
     config->clear_windows = 20U;
     config->isolated_recovery_windows = 40U;
+    config->preferred_recovery_windows = 40U;
 }
 
 bool imu_selector_init(imu_selector_t *selector,
@@ -370,7 +372,24 @@ bool imu_selector_update(imu_selector_t *selector,
     const uint8_t isolated_mask = selector->hard_latched_mask |
                                   selector->soft_latched_mask;
     const uint8_t usable_mask = numeric_mask & (uint8_t)~isolated_mask;
-    selector->selected_lane = choose_output_lane(selector, usable_mask);
+    imu_selector_lane_t selected = choose_output_lane(selector, usable_mask);
+    const uint8_t preferred_mask =
+        IMU_SELECTOR_LANE_MASK(selector->preferred_lane);
+    if ((selected != IMU_SELECTOR_LANE_NONE) &&
+        (selected != selector->preferred_lane) &&
+        ((usable_mask & preferred_mask) != 0U) &&
+        residual_valid && residual_clear) {
+        selector->preferred_recovery_streak =
+            increment_saturated(selector->preferred_recovery_streak);
+        if (selector->preferred_recovery_streak >=
+            selector->config.preferred_recovery_windows) {
+            selected = selector->preferred_lane;
+            selector->preferred_recovery_streak = 0U;
+        }
+    } else {
+        selector->preferred_recovery_streak = 0U;
+    }
+    selector->selected_lane = selected;
 
     const uint8_t invalid_mask = (uint8_t)(0x03U & (uint8_t)~numeric_mask);
     if ((isolated_mask != 0U) ||
@@ -437,5 +456,7 @@ bool imu_selector_update(imu_selector_t *selector,
     result->reason_flags = reasons;
     result->mismatch_streak = selector->mismatch_streak;
     result->clear_streak = selector->clear_streak;
+    result->preferred_recovery_streak =
+        selector->preferred_recovery_streak;
     return true;
 }

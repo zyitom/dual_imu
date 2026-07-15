@@ -202,6 +202,8 @@ static void send_diagnostics(const dual_imu_state_t *imu, uint32_t now_ms)
         "fault=%lx/%lx wf=%lx/%lx fast_err=%lu/%lu/%lu if=%lx "
         "lat_us=%lu/%lu horizon=%lu sched=%u "
         "fifo_err=%lu/%lu atl_reset=%lu gyro=%lu/%lu:%02lx/%u warm=%lu "
+        "rec=%lu/%lu/%lu:%03lx/%u/%u/%u "
+        "impact=%lu/%u/%02x sat=%lu/%lu:%lu/%lu "
         "drop=%lu/%lu/%lu cap=%lu/%lu clock=%u/%u ppm=%ld/%ld "
         "arej=%lu/%lu reset=%lu/%lu:%lu/%lu disc=%lu depth=%u/%u "
         "stage_us=%lu/%lu:%lu/%lu loop=%lu/%lu\r\n",
@@ -284,6 +286,24 @@ static void send_diagnostics(const dual_imu_state_t *imu, uint32_t now_ms)
         (unsigned long)imu->bmi088_gyro_capture_mismatch_reason,
         imu->bmi088_gyro_capture_sync_fault,
         (unsigned long)imu->bmi088_gyro_warmup_discard_count,
+        (unsigned long)imu->bmi088_gyro_recovery_attempt_count,
+        (unsigned long)imu->bmi088_gyro_recovery_success_count,
+        (unsigned long)imu->bmi088_gyro_recovery_failure_count,
+        (unsigned long)imu->bmi088_gyro_last_recovery_reason,
+        (unsigned int)imu->bmi088_gyro_last_recovery_result,
+        imu->bmi088_gyro_recovery_warmup,
+        imu->bmi088_gyro_recovery_pending,
+        (unsigned long)imu->motion_guard_common_impact_count,
+        imu->motion_guard_gyro_latch_suppressed,
+        (unsigned int)imu->motion_guard_gyro_hard_fault_mask,
+        (unsigned long)imu->motion_guard_accel_saturation_count[
+            IMU_SOURCE_BMI088],
+        (unsigned long)imu->motion_guard_accel_saturation_count[
+            IMU_SOURCE_ICM45686],
+        (unsigned long)imu->motion_guard_gyro_saturation_count[
+            IMU_SOURCE_BMI088],
+        (unsigned long)imu->motion_guard_gyro_saturation_count[
+            IMU_SOURCE_ICM45686],
         (unsigned long)imu->bmi088_accel_event_drop_count,
         (unsigned long)imu->bmi088_gyro_event_drop_count,
         (unsigned long)imu->icm45686_event_drop_count,
@@ -348,18 +368,19 @@ void app_process(void)
     const uint64_t process_start_us = imu_time_now_us();
 
     dual_imu_process();
-    const uint64_t process_duration_us = imu_time_now_us() - process_start_us;
-    if (process_duration_us > app_process_max_us)
-        app_process_max_us = (process_duration_us > UINT32_MAX)
-                                 ? UINT32_MAX
-                                 : (uint32_t)process_duration_us;
-    app_process_count++;
     const dual_imu_state_t *imu = dual_imu_get_state();
     update_leds(imu, now_ms);
     if (APP_USB_BINARY_OUTPUT != 0U)
         dual_imu_usb_stream_process(imu);
     else
         send_diagnostics(imu, now_ms);
+
+    const uint64_t process_duration_us = imu_time_now_us() - process_start_us;
+    if (process_duration_us > app_process_max_us)
+        app_process_max_us = (process_duration_us > UINT32_MAX)
+                                 ? UINT32_MAX
+                                 : (uint32_t)process_duration_us;
+    app_process_count++;
 }
 
 void HAL_GPIO_EXTI_Callback(uint16_t gpio_pin)

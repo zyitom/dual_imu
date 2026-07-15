@@ -557,6 +557,43 @@ static void test_bounded_zaru_clips_target_and_limits_global_slew(void)
     TEST_EXPECT(attitude_mekf_is_valid(&filter));
 }
 
+static void test_bounded_zaru_clips_about_existing_bias(void)
+{
+    attitude_mekf_t filter;
+    const float quaternion[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+    const float initial_bias[3] = {
+        degrees_to_radians(0.8f),
+        degrees_to_radians(-0.7f),
+        0.0f,
+    };
+    const float measured_rate[3] = {
+        degrees_to_radians(2.0f),
+        degrees_to_radians(-0.9f),
+        0.0f,
+    };
+    const float covariance[3][3] = {
+        {1.0e-7f, 0.0f, 0.0f},
+        {0.0f, 1.0e-7f, 0.0f},
+        {0.0f, 0.0f, 1.0e-7f},
+    };
+    const float target_limit = degrees_to_radians(0.5f);
+    float bounded_target[3];
+
+    TEST_EXPECT(attitude_mekf_init(&filter, NULL));
+    TEST_EXPECT(attitude_mekf_reset(&filter, quaternion, initial_bias));
+    TEST_EXPECT(attitude_mekf_update_zero_rate_bounded(
+                    &filter,
+                    measured_rate,
+                    covariance,
+                    target_limit,
+                    degrees_to_radians(0.1f) * TEST_DT_S,
+                    bounded_target) == ATTITUDE_MEKF_ZARU_ACCEPTED);
+    TEST_EXPECT(fabsf(bounded_target[0] - degrees_to_radians(1.3f)) <
+                1.0e-7f);
+    TEST_EXPECT(fabsf(bounded_target[1] - measured_rate[1]) < 1.0e-7f);
+    TEST_EXPECT(fabsf(bounded_target[2]) < 1.0e-7f);
+}
+
 static void test_zaru_rejection_is_transactional(void)
 {
     attitude_mekf_t filter;
@@ -660,6 +697,35 @@ static void test_long_run_numerical_health(void)
     TEST_EXPECT(filter.diagnostics.numeric_fault_count == 0U);
 }
 
+static void test_unobserved_rotation_only_inflates_attitude_covariance(void)
+{
+    attitude_mekf_t filter;
+    TEST_EXPECT(attitude_mekf_init(&filter, NULL));
+
+    float quaternion_before[4];
+    float bias_before[3];
+    float covariance_before[ATTITUDE_MEKF_STATE_DIM][ATTITUDE_MEKF_STATE_DIM];
+    memcpy(quaternion_before, filter.q, sizeof(quaternion_before));
+    memcpy(bias_before, filter.gyro_bias_rad_s, sizeof(bias_before));
+    memcpy(covariance_before, filter.covariance, sizeof(covariance_before));
+
+    TEST_EXPECT(attitude_mekf_mark_rotation_unobserved(&filter, 0.5f));
+    TEST_EXPECT(memcmp(quaternion_before, filter.q, sizeof(quaternion_before)) == 0);
+    TEST_EXPECT(memcmp(bias_before, filter.gyro_bias_rad_s, sizeof(bias_before)) == 0);
+    for (size_t axis = 0U; axis < 3U; ++axis) {
+        TEST_EXPECT(filter.covariance[axis][axis] >
+                    covariance_before[axis][axis]);
+        TEST_EXPECT(filter.covariance[axis + 3U][axis + 3U] ==
+                    covariance_before[axis + 3U][axis + 3U]);
+    }
+    TEST_EXPECT(filter.diagnostics.unobserved_rotation_count == 1U);
+    TEST_EXPECT(attitude_mekf_is_valid(&filter));
+
+    TEST_EXPECT(!attitude_mekf_mark_rotation_unobserved(&filter, 0.0f));
+    TEST_EXPECT(!attitude_mekf_mark_rotation_unobserved(&filter, NAN));
+    TEST_EXPECT(filter.diagnostics.unobserved_rotation_count == 1U);
+}
+
 int main(void)
 {
     test_initialization_and_validation();
@@ -673,8 +739,10 @@ int main(void)
     test_noisy_tilt_preserves_gravity_gauge_and_observable_bias();
     test_zaru_three_axis_bias_update();
     test_bounded_zaru_clips_target_and_limits_global_slew();
+    test_bounded_zaru_clips_about_existing_bias();
     test_zaru_rejection_is_transactional();
     test_zaru_bias_limit();
+    test_unobserved_rotation_only_inflates_attitude_covariance();
     test_long_run_numerical_health();
 
     if (failure_count != 0U)

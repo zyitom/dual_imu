@@ -1,4 +1,5 @@
 #include "imu_preintegrator.h"
+#include "icm45686.h"
 
 #include <math.h>
 #include <stdbool.h>
@@ -328,6 +329,120 @@ static void test_invalid_coverage_and_stopped_stream(void)
     TEST_EXPECT(window.accel_coverage_us == 0U);
 }
 
+static void test_icm_invalid_gyro_slot_blocks_interpolation(void)
+{
+    const uint64_t epoch_us = UINT64_C(1000000);
+    imu_preintegrator_t preintegrator = make_preintegrator(epoch_us, 5000U);
+    const icm45686_fifo_frame_t frames[3] = {
+        {
+            .gyro_rad_s = {0.0f, 0.0f, 1.0f},
+            .mcu_timestamp_us = epoch_us,
+            .gyro_valid = true,
+            .timestamp_valid = true,
+            .mcu_timestamp_valid = true,
+        },
+        {
+            .gyro_rad_s = {NAN, NAN, NAN},
+            .mcu_timestamp_us = epoch_us + 1250U,
+            .gyro_valid = false,
+            .timestamp_valid = true,
+            .mcu_timestamp_valid = true,
+        },
+        {
+            .gyro_rad_s = {0.0f, 0.0f, 1.0f},
+            .mcu_timestamp_us = epoch_us + 2500U,
+            .gyro_valid = true,
+            .timestamp_valid = true,
+            .mcu_timestamp_valid = true,
+        },
+    };
+
+    for (uint32_t index = 0U; index < 3U; ++index) {
+        imu_gyro_sample_t sample;
+        memset(&sample, 0xA5, sizeof(sample));
+        TEST_EXPECT(icm45686_fifo_frame_to_gyro_sample(
+            &frames[index], 25.0f, &sample));
+        TEST_EXPECT(sample.timestamp_us == frames[index].mcu_timestamp_us);
+        TEST_EXPECT(sample.source == IMU_SOURCE_ICM45686);
+        TEST_EXPECT(sample.valid == frames[index].gyro_valid);
+        TEST_EXPECT(!sample.temperature_valid);
+        TEST_EXPECT(sample.temperature_timestamp_us == 0U);
+        if (!sample.valid) {
+            TEST_EXPECT(sample.gyro_rad_s[0] == 0.0f);
+            TEST_EXPECT(sample.gyro_rad_s[1] == 0.0f);
+            TEST_EXPECT(sample.gyro_rad_s[2] == 0.0f);
+        }
+        sample.sequence = index;
+        TEST_EXPECT(imu_preintegrator_push_gyro(&preintegrator, &sample));
+    }
+    push_accel(&preintegrator, epoch_us, 0U,
+               0.0f, 0.0f, -9.80665f, true);
+    push_accel(&preintegrator, epoch_us + 2500U, 1U,
+               0.0f, 0.0f, -9.80665f, true);
+
+    const imu_preintegrated_window_t window =
+        get_window(&preintegrator, epoch_us + 2500U);
+    TEST_EXPECT(!window.gyro_valid);
+    TEST_EXPECT(!window.gyro_propagation_valid);
+    TEST_EXPECT((window.flags & IMU_PREINTEGRATOR_FLAG_GYRO_INVALID) != 0U);
+    TEST_EXPECT(window.gyro_coverage_us == 0U);
+    expect_near(window.delta_angle_rad[2], 0.0f, 1.0e-9f);
+    const imu_preintegrator_diagnostics_t *diagnostics =
+        imu_preintegrator_get_diagnostics(&preintegrator);
+    TEST_EXPECT(diagnostics != NULL);
+    TEST_EXPECT(diagnostics->gyro_samples_accepted == 3U);
+    TEST_EXPECT(diagnostics->gyro_invalid_samples == 1U);
+    TEST_EXPECT(diagnostics->gyro_sequence_discontinuities == 0U);
+
+    icm45686_fifo_frame_t temperature_frame = frames[0];
+    temperature_frame.temperature_valid = true;
+    imu_gyro_sample_t temperature_sample;
+    memset(&temperature_sample, 0xA5, sizeof(temperature_sample));
+    TEST_EXPECT(icm45686_fifo_frame_to_gyro_sample(
+        &temperature_frame, 25.0f, &temperature_sample));
+    TEST_EXPECT(temperature_sample.temperature_valid);
+    TEST_EXPECT(temperature_sample.temperature_timestamp_us == epoch_us);
+}
+
+static void test_icm_accel_placeholder_and_missing_sample_cadence(void)
+{
+    const uint64_t epoch_us = UINT64_C(2000000);
+    imu_preintegrator_t complete = make_preintegrator(
+        epoch_us, ICM45686_CONFIG_ACCEL_MAX_GAP_US);
+    imu_preintegrator_t missing = make_preintegrator(
+        epoch_us, ICM45686_CONFIG_ACCEL_MAX_GAP_US);
+
+    for (uint32_t index = 0U; index <= 4U; ++index) {
+        const uint64_t timestamp_us = epoch_us + ((uint64_t)index * 625U);
+        push_accel(&complete, timestamp_us, index,
+                   0.0f, 0.0f, -9.80665f, true);
+        if (index != 2U) {
+            push_accel(&missing, timestamp_us, index,
+                       0.0f, 0.0f, -9.80665f, true);
+        }
+    }
+    for (uint32_t index = 0U; index <= 2U; ++index) {
+        const uint64_t timestamp_us = epoch_us + ((uint64_t)index * 1250U);
+        push_gyro(&complete, timestamp_us, index,
+                  0.0f, 0.0f, 0.0f, true);
+        push_gyro(&missing, timestamp_us, index,
+                  0.0f, 0.0f, 0.0f, true);
+    }
+
+    const imu_preintegrated_window_t complete_window =
+        get_window(&complete, epoch_us + 2500U);
+    TEST_EXPECT(complete_window.accel_valid);
+    TEST_EXPECT((complete_window.flags &
+                 (IMU_PREINTEGRATOR_FLAG_ACCEL_GAP |
+                  IMU_PREINTEGRATOR_FLAG_ACCEL_MISSING)) == 0U);
+
+    const imu_preintegrated_window_t missing_window =
+        get_window(&missing, epoch_us + 2500U);
+    TEST_EXPECT(!missing_window.accel_valid);
+    TEST_EXPECT((missing_window.flags &
+                 IMU_PREINTEGRATOR_FLAG_ACCEL_GAP) != 0U);
+}
+
 static void test_gap_drop_and_timestamp_diagnostics(void)
 {
     imu_preintegrator_t preintegrator = make_preintegrator(1000U, 800U);
@@ -466,6 +581,8 @@ int main(void)
     test_all_segments_coning_composition();
     test_true_half_windows_follow_linear_ramp();
     test_invalid_coverage_and_stopped_stream();
+    test_icm_invalid_gyro_slot_blocks_interpolation();
+    test_icm_accel_placeholder_and_missing_sample_cadence();
     test_gap_drop_and_timestamp_diagnostics();
     test_sequence_counter_wrap_is_continuous();
     test_sequence_drop_can_still_propagate_covered_angle();

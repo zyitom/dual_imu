@@ -5,6 +5,7 @@ project_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 output="${TMPDIR:-/tmp}/dual_imu_estimator_tests"
 
 cc -std=c11 -O2 -Wall -Wextra -Werror -Wpedantic -Wshadow \
+    -DDUAL_IMU_ESTIMATOR_TESTING=1 \
     -I"$project_root/App/fusion" \
     -I"$project_root/App/imu" \
     "$project_root/App/fusion/attitude_mekf.c" \

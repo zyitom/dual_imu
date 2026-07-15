@@ -23,6 +23,8 @@
 /* The 20-byte high-resolution frame carries the 16-bit temperature value. */
 #define ICM45686_FIFO_TEMPERATURE_SCALE (1.0f / 128.0f)
 #define ICM45686_TEMPERATURE_OFFSET     25.0f
+#define ICM45686_TEMPERATURE_MIN_VALID_C (-50.0f)
+#define ICM45686_TEMPERATURE_MAX_VALID_C (125.0f)
 #define ICM45686_SPI_MAX_TRANSFER   256U
 #define ICM45686_FIFO_COUNT_TRANSFER_BYTES 3U
 #define ICM45686_FIFO_DMA_TIMEOUT_MS       2U
@@ -282,6 +284,9 @@ static bool icm45686_fifo_parse_frame(const uint8_t *data,
         frame->temperature_c =
             ((float)frame->temperature_raw * ICM45686_FIFO_TEMPERATURE_SCALE) +
             ICM45686_TEMPERATURE_OFFSET;
+        frame->temperature_valid =
+            (frame->temperature_c >= ICM45686_TEMPERATURE_MIN_VALID_C) &&
+            (frame->temperature_c <= ICM45686_TEMPERATURE_MAX_VALID_C);
     }
 
     if (frame->timestamp_valid)
@@ -788,6 +793,13 @@ bool icm45686_read(uint64_t timestamp_us, imu_sample_t *sample)
     }
     sample->temperature_c = ((float)raw_data.temp_data * ICM45686_TEMPERATURE_SCALE) +
                             ICM45686_TEMPERATURE_OFFSET;
+    sample->temperature_valid =
+        (raw_data.temp_data != INT16_MIN) &&
+        (sample->temperature_c >= ICM45686_TEMPERATURE_MIN_VALID_C) &&
+        (sample->temperature_c <= ICM45686_TEMPERATURE_MAX_VALID_C);
+    sample->temperature_timestamp_us = sample->temperature_valid
+                                           ? timestamp_us
+                                           : 0U;
     sample->sequence = ++s_sequence;
     sample->accel_sequence = sample->sequence;
     sample->gyro_sequence = sample->sequence;
@@ -894,6 +906,8 @@ bool icm45686_fifo_parse_dma_response(
             local_report.accel_frame_count++;
         if (frames[index].gyro_valid)
             local_report.gyro_frame_count++;
+        if (!frames[index].temperature_valid)
+            local_report.temperature_invalid_frame_count++;
         if (!header_valid)
             local_report.malformed_frame_count++;
         if (timestamp_discontinuity)
@@ -967,6 +981,8 @@ bool icm45686_fifo_parse_dma_response(
 
     s_fifo_diagnostics.malformed_frame_count +=
         local_report.malformed_frame_count;
+    s_fifo_diagnostics.temperature_invalid_frame_count +=
+        local_report.temperature_invalid_frame_count;
     s_fifo_diagnostics.timestamp_discontinuity_count +=
         local_report.timestamp_discontinuity_count;
     if (report != NULL)

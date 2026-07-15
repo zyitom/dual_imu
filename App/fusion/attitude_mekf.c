@@ -899,6 +899,38 @@ bool attitude_mekf_propagate_delta(attitude_mekf_t *filter,
     return true;
 }
 
+bool attitude_mekf_mark_rotation_unobserved(attitude_mekf_t *filter,
+                                            float rotation_std_rad)
+{
+    if ((filter == NULL) || !filter->initialized ||
+        !attitude_mekf_is_valid(filter) || !isfinite(rotation_std_rad) ||
+        (rotation_std_rad <= 0.0f)) {
+        return false;
+    }
+
+    const float added_variance = rotation_std_rad * rotation_std_rad;
+    if (!isfinite(added_variance))
+        return false;
+
+    float inflated[ATTITUDE_MEKF_STATE_DIM][ATTITUDE_MEKF_STATE_DIM];
+    memcpy(inflated, filter->covariance, sizeof(inflated));
+    const float maximum_attitude_variance =
+        0.5f * filter->config.covariance_ceiling;
+    for (size_t axis = 0U; axis < ATTITUDE_MEKF_VECTOR_DIM; ++axis) {
+        inflated[axis][axis] = fminf(maximum_attitude_variance,
+                                     inflated[axis][axis] + added_variance);
+    }
+    if (!mekf_condition_covariance(&filter->config, inflated)) {
+        filter->diagnostics.numeric_fault_count++;
+        return false;
+    }
+
+    memcpy(filter->covariance, inflated, sizeof(filter->covariance));
+    if (filter->diagnostics.unobserved_rotation_count < UINT32_MAX)
+        filter->diagnostics.unobserved_rotation_count++;
+    return true;
+}
+
 attitude_mekf_accel_result_t attitude_mekf_update_accel(
     attitude_mekf_t *filter,
     const float specific_force_mps2[ATTITUDE_MEKF_VECTOR_DIM],
@@ -1291,11 +1323,19 @@ static attitude_mekf_zaru_result_t mekf_update_zero_rate(
     float target_rad_s[ATTITUDE_MEKF_VECTOR_DIM];
     for (size_t axis = 0U; axis < ATTITUDE_MEKF_VECTOR_DIM; ++axis)
     {
-        target_rad_s[axis] = bounded
-                                 ? fmaxf(-target_residual_limit_rad_s,
-                                         fminf(target_residual_limit_rad_s,
-                                               gyro_rad_s[axis]))
-                                 : gyro_rad_s[axis];
+        if (bounded)
+        {
+            const float residual = gyro_rad_s[axis] -
+                                   filter->gyro_bias_rad_s[axis];
+            target_rad_s[axis] = filter->gyro_bias_rad_s[axis] +
+                                 fmaxf(-target_residual_limit_rad_s,
+                                       fminf(target_residual_limit_rad_s,
+                                             residual));
+        }
+        else
+        {
+            target_rad_s[axis] = gyro_rad_s[axis];
+        }
     }
     if (bounded_target_rad_s != NULL)
     {

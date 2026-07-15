@@ -360,6 +360,19 @@ uint8_t CDC_IsPortOpen_FS(void)
   return ((cdc_control_line_state & 0x0001U) != 0U) ? 1U : 0U;
 }
 
+uint8_t CDC_TxReady_FS(void)
+{
+  if ((hUsbDeviceFS.dev_state != USBD_STATE_CONFIGURED) ||
+      (hUsbDeviceFS.pClassData == NULL))
+  {
+    return 0U;
+  }
+
+  const USBD_CDC_HandleTypeDef *hcdc =
+      (const USBD_CDC_HandleTypeDef *)hUsbDeviceFS.pClassData;
+  return (hcdc->TxState == 0U) ? 1U : 0U;
+}
+
 /* USER CODE END PRIVATE_FUNCTIONS_IMPLEMENTATION */
 
 /**

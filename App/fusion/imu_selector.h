@@ -88,6 +88,7 @@ typedef struct
     uint16_t soft_fault_confirm_windows;
     uint16_t clear_windows;
     uint16_t isolated_recovery_windows;
+    uint16_t preferred_recovery_windows;
 } imu_selector_config_t;
 
 typedef struct
@@ -105,6 +106,7 @@ typedef struct
     uint32_t reason_flags;
     uint16_t mismatch_streak;
     uint16_t clear_streak;
+    uint16_t preferred_recovery_streak;
 } imu_selector_result_t;
 
 typedef struct
@@ -119,6 +121,7 @@ typedef struct
     uint16_t clear_streak;
     uint16_t hint_streak[IMU_SELECTOR_LANE_COUNT];
     uint16_t recovery_streak[IMU_SELECTOR_LANE_COUNT];
+    uint16_t preferred_recovery_streak;
     bool initialized;
 } imu_selector_t;
 

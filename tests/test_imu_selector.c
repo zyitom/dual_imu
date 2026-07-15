@@ -24,6 +24,7 @@ static imu_selector_config_t test_config(void)
     config.soft_fault_confirm_windows = 3U;
     config.clear_windows = 3U;
     config.isolated_recovery_windows = 3U;
+    config.preferred_recovery_windows = 3U;
     return config;
 }
 
@@ -64,6 +65,9 @@ static void test_configuration_validation(void)
 
     TEST_ASSERT(imu_selector_init(&selector, &config, IMU_SELECTOR_LANE_0));
     config.nis_clear_threshold = config.nis_enter_threshold;
+    TEST_ASSERT(!imu_selector_init(&selector, &config, IMU_SELECTOR_LANE_0));
+    config = test_config();
+    config.preferred_recovery_windows = 0U;
     TEST_ASSERT(!imu_selector_init(&selector, &config, IMU_SELECTOR_LANE_0));
     config = test_config();
     TEST_ASSERT(!imu_selector_init(&selector, &config, IMU_SELECTOR_LANE_NONE));
@@ -215,6 +219,78 @@ static void test_transient_invalid_input_uses_other_lane(void)
     TEST_ASSERT(result.selected_lane == IMU_SELECTOR_LANE_1);
     TEST_ASSERT(result.isolated_mask == 0U);
     TEST_ASSERT((result.reason_flags & IMU_SELECTOR_REASON_LANE_0_INPUT) != 0U);
+
+    input.lane[0].window_valid = true;
+    run_clear_windows(&selector,
+                      &input,
+                      &result,
+                      (uint16_t)(config.preferred_recovery_windows - 1U));
+    TEST_ASSERT(result.selected_lane == IMU_SELECTOR_LANE_1);
+    TEST_ASSERT(!result.selection_changed);
+    TEST_ASSERT(result.preferred_recovery_streak ==
+                (uint16_t)(config.preferred_recovery_windows - 1U));
+
+    update_or_fail(&selector, &input, &result);
+    TEST_ASSERT(result.selected_lane == IMU_SELECTOR_LANE_0);
+    TEST_ASSERT(result.selection_changed);
+    TEST_ASSERT(result.preferred_recovery_streak == 0U);
+}
+
+static void test_preferred_recovery_interruptions_reset_dwell(void)
+{
+    imu_selector_t selector;
+    imu_selector_result_t result;
+    imu_selector_config_t config = test_config();
+    imu_selector_input_t input = healthy_input();
+
+    TEST_ASSERT(imu_selector_init(&selector, &config, IMU_SELECTOR_LANE_0));
+    run_clear_windows(&selector, &input, &result, config.clear_windows);
+
+    input.lane[0].window_valid = false;
+    update_or_fail(&selector, &input, &result);
+    TEST_ASSERT(result.selected_lane == IMU_SELECTOR_LANE_1);
+    TEST_ASSERT(result.preferred_recovery_streak == 0U);
+
+    input.lane[0].window_valid = true;
+    update_or_fail(&selector, &input, &result);
+    TEST_ASSERT(result.preferred_recovery_streak == 1U);
+
+    /* NIS=9 lies between the clear and enter thresholds. It is valid
+     * residual evidence, but not clear recovery evidence. */
+    input.lane[0].delta_angle_rad[0] = 3.0f;
+    update_or_fail(&selector, &input, &result);
+    TEST_ASSERT(result.residual_valid);
+    TEST_ASSERT(result.residual_nis > config.nis_clear_threshold);
+    TEST_ASSERT(result.residual_nis < config.nis_enter_threshold);
+    TEST_ASSERT(result.selected_lane == IMU_SELECTOR_LANE_1);
+    TEST_ASSERT(result.preferred_recovery_streak == 0U);
+
+    input.lane[0].delta_angle_rad[0] = 0.0f;
+    run_clear_windows(&selector,
+                      &input,
+                      &result,
+                      (uint16_t)(config.preferred_recovery_windows - 1U));
+    TEST_ASSERT(result.preferred_recovery_streak ==
+                (uint16_t)(config.preferred_recovery_windows - 1U));
+
+    input.lane[0].window_valid = false;
+    update_or_fail(&selector, &input, &result);
+    TEST_ASSERT(!result.residual_valid);
+    TEST_ASSERT(result.selected_lane == IMU_SELECTOR_LANE_1);
+    TEST_ASSERT(result.preferred_recovery_streak == 0U);
+
+    input.lane[0].window_valid = true;
+    run_clear_windows(&selector,
+                      &input,
+                      &result,
+                      (uint16_t)(config.preferred_recovery_windows - 1U));
+    TEST_ASSERT(result.selected_lane == IMU_SELECTOR_LANE_1);
+    TEST_ASSERT(result.preferred_recovery_streak ==
+                (uint16_t)(config.preferred_recovery_windows - 1U));
+    update_or_fail(&selector, &input, &result);
+    TEST_ASSERT(result.selected_lane == IMU_SELECTOR_LANE_0);
+    TEST_ASSERT(result.selection_changed);
+    TEST_ASSERT(result.preferred_recovery_streak == 0U);
 }
 
 static void test_both_hard_faults_remove_output(void)
@@ -263,6 +339,7 @@ int main(void)
     test_external_hint_can_isolate_one_lane();
     test_changing_hint_does_not_isolate();
     test_transient_invalid_input_uses_other_lane();
+    test_preferred_recovery_interruptions_reset_dwell();
     test_both_hard_faults_remove_output();
     test_residual_inhibit_pauses_soft_scoring();
     puts("imu_selector_test: all tests passed");
