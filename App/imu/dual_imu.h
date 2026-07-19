@@ -134,7 +134,13 @@ typedef struct
     float stationary_temporal_gyro_variance_rad2_s2[IMU_SOURCE_COUNT];
     float stationary_temporal_accel_variance_m2_s4[IMU_SOURCE_COUNT];
     bool stationary_hint_active;
+    /* Raw motion-guard interval versus the effective fusion decision. Gravity
+     * aiding can remain inhibited after the raw interval while post-impact
+     * trust is being re-established. */
     bool accel_update_inhibited;
+    bool gravity_aiding_inhibited;
+    bool post_impact_gravity_trusted;
+    uint16_t post_impact_gravity_trust_streak;
     bool rotation_unobserved;
     bool heading_continuity_lost;
     uint64_t heading_continuity_lost_timestamp_us;
@@ -144,6 +150,14 @@ typedef struct
     bool post_impact_reacquire_active;
     uint32_t post_impact_episode_count;
     uint32_t post_impact_reacquire_count;
+    /* Attitude-rewrite diagnostics (see dual_imu_attitude_rewrite_reason_t):
+     * every estimator-side attitude rewrite plus the residual output-alignment
+     * tilt still being slewed out of the published quaternion. */
+    uint32_t attitude_rewrite_count;
+    uint8_t attitude_rewrite_last_reason;
+    uint8_t attitude_rewrite_last_lane;
+    bool impact_gyro_rollback_pending;
+    float output_alignment_tilt_rad;
     uint32_t motion_guard_common_impact_count;
     uint32_t motion_guard_accel_saturation_count[IMU_SOURCE_COUNT];
     uint32_t motion_guard_gyro_saturation_count[IMU_SOURCE_COUNT];

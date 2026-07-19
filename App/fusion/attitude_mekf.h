@@ -47,6 +47,11 @@ typedef struct
     float accel_variance_scale_max;
     float accel_nis_gate;
     float zaru_nis_gate;
+    /* Reject corrections beyond max_attitude_correction_rad as implausible,
+     * but apply an accepted accel correction by at most this much per update.
+     * The gain is scaled with the state correction so the Joseph covariance
+     * update remains consistent with the under-relaxed measurement update. */
+    float max_accel_correction_step_rad;
     float max_attitude_correction_rad;
     float max_abs_bias_rad_s;
     float min_dt_s;

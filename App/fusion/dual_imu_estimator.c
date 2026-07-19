@@ -17,6 +17,10 @@ static void estimator_clear_stationary_confirmation(
     dual_imu_estimator_t *estimator);
 static void estimator_enter_post_impact_reacquire(
     dual_imu_estimator_t *estimator);
+static void estimator_note_attitude_rewrite(
+    dual_imu_estimator_t *estimator,
+    uint32_t lane,
+    dual_imu_attitude_rewrite_reason_t reason);
 
 static bool estimator_source_to_lane(imu_source_t source, uint32_t *lane)
 {
@@ -328,6 +332,7 @@ static bool estimator_config_is_valid(const dual_imu_estimator_config_t *config)
         (config->post_impact_reacquire_dwell_windows < 2U) ||
         (config->post_impact_reacquire_single_lane_dwell_windows <
          config->post_impact_reacquire_dwell_windows) ||
+        (config->post_impact_gravity_trust_windows < 2U) ||
         (config->impact_gyro_disagreement_confirm_windows < 2U) ||
         (config->calibration_accept_windows == 0U) ||
         (config->calibration_revoke_windows == 0U) ||
@@ -456,6 +461,10 @@ void dual_imu_estimator_default_config(dual_imu_estimator_config_t *config)
     config->attitude_aiding_timeout_windows = 800U;
     config->post_impact_reacquire_dwell_windows = 200U;
     config->post_impact_reacquire_single_lane_dwell_windows = 400U;
+    /* 200 ms at 400 Hz. This is shorter than the stationary reseed dwell but
+     * long enough that a fast-yaw inhibit cannot reopen gravity aiding on the
+     * first still-contaminated window after its 100 ms hold expires. */
+    config->post_impact_gravity_trust_windows = 80U;
     config->impact_gyro_disagreement_confirm_windows = 3U;
     config->calibration_accept_windows = 40U;
     config->calibration_revoke_windows = 40U;
@@ -1012,6 +1021,8 @@ static void estimator_enter_post_impact_reacquire(
         estimator->post_impact_episode_count++;
     }
     estimator->post_impact_reacquire_active = true;
+    estimator->post_impact_gravity_trusted = false;
+    estimator->post_impact_gravity_trust_streak = 0U;
     estimator->attitude_converged = false;
     estimator->attitude_convergence_streak = 0U;
     estimator->attitude_aiding_miss_streak = 0U;
@@ -1028,6 +1039,8 @@ static void estimator_complete_post_impact_reacquire(
         return;
 
     estimator->post_impact_reacquire_active = false;
+    estimator->post_impact_gravity_trusted = false;
+    estimator->post_impact_gravity_trust_streak = 0U;
     estimator->attitude_converged = true;
     estimator->attitude_convergence_streak =
         estimator->config.attitude_convergence_windows;
@@ -1141,6 +1154,9 @@ static void estimator_handle_accel_recovery(
             output->lane_accel_recovery_reseeded[lane] = true;
             if (estimator->accel_recovery_reseed_count < UINT32_MAX)
                 estimator->accel_recovery_reseed_count++;
+            estimator_note_attitude_rewrite(
+                estimator, (uint32_t)lane,
+                DUAL_IMU_ATTITUDE_REWRITE_ACCEL_RECOVERY);
             estimator_enter_post_impact_reacquire(estimator);
             continue;
         }
@@ -1155,6 +1171,23 @@ static void estimator_handle_accel_recovery(
         output->lane_accel_recovery_inflating[lane] = true;
         if (estimator->accel_recovery_inflation_count < UINT32_MAX)
             estimator->accel_recovery_inflation_count++;
+    }
+}
+
+static void estimator_note_attitude_rewrite(
+    dual_imu_estimator_t *estimator,
+    uint32_t lane,
+    dual_imu_attitude_rewrite_reason_t reason)
+{
+    if (estimator->attitude_rewrite_count < UINT32_MAX)
+        estimator->attitude_rewrite_count++;
+    estimator->attitude_rewrite_last_reason = (uint8_t)reason;
+    estimator->attitude_rewrite_last_lane = (uint8_t)lane;
+    if (lane == DUAL_IMU_ATTITUDE_REWRITE_LANE_BOTH) {
+        estimator->lane_attitude_discontinuity[0] = true;
+        estimator->lane_attitude_discontinuity[1] = true;
+    } else if (lane < DUAL_IMU_ESTIMATOR_LANE_COUNT) {
+        estimator->lane_attitude_discontinuity[lane] = true;
     }
 }
 
@@ -1246,6 +1279,9 @@ static void estimator_restore_impact_gyro_checkpoint(
                  : 0U);
         output->lane_aided_propagation[lane] = false;
     }
+    estimator_note_attitude_rewrite(estimator,
+                                    DUAL_IMU_ATTITUDE_REWRITE_LANE_BOTH,
+                                    DUAL_IMU_ATTITUDE_REWRITE_ROLLBACK);
 }
 
 static bool estimator_handle_impact_gyro_disagreement(
@@ -2002,9 +2038,13 @@ static bool estimator_reacquire_attitude(
             }
         }
     }
-    estimator_quaternion_identity(estimator->output_alignment);
-    estimator->output_initialized = false;
-    estimator->previous_selected_lane = IMU_SELECTOR_LANE_NONE;
+    /* Do NOT reset output_initialized here: dropping the output history would
+     * republish the reseeded lane attitude as a step. Marking the rewrite
+     * lets the output path bridge the jump through output_alignment and slew
+     * it out instead. */
+    estimator_note_attitude_rewrite(estimator,
+                                    DUAL_IMU_ATTITUDE_REWRITE_LANE_BOTH,
+                                    DUAL_IMU_ATTITUDE_REWRITE_REACQUIRE);
     /* Gravity can reconverge roll/pitch even when the separate heading
      * continuity warning remains sticky. */
     estimator_complete_post_impact_reacquire(estimator, output);
@@ -2032,6 +2072,59 @@ static float estimator_accel_variance_scale(
         scale += normalized_pair * normalized_pair;
     }
     return fminf(DUAL_IMU_ESTIMATOR_MAX_SCALE, fmaxf(1.0f, scale));
+}
+
+static bool estimator_update_post_impact_gravity_trust(
+    dual_imu_estimator_t *estimator,
+    const dual_imu_estimator_output_t *output,
+    const imu_preintegrated_window_t windows[DUAL_IMU_ESTIMATOR_LANE_COUNT],
+    bool dynamic_accel_gate)
+{
+    if (!estimator->post_impact_reacquire_active) {
+        estimator->post_impact_gravity_trusted = false;
+        estimator->post_impact_gravity_trust_streak = 0U;
+        return true;
+    }
+
+    bool candidate = !output->accel_inhibited && !dynamic_accel_gate;
+    const float rate_norm = estimator_vector_norm(output->angular_rate_rad_s);
+    candidate = candidate && isfinite(rate_norm) &&
+        (rate_norm <= estimator->config.accel_recovery_max_rate_rad_s);
+
+    for (size_t lane = 0U;
+         candidate && (lane < DUAL_IMU_ESTIMATOR_LANE_COUNT);
+         ++lane) {
+        if (!estimator->lane_seeded[lane] ||
+            (estimator->hard_fault_flags[lane] != 0U) ||
+            estimator->lane_accel_fault[lane] || !windows[lane].accel_valid) {
+            candidate = false;
+            break;
+        }
+        const float specific_force_norm = estimator_vector_norm(
+            output->lane_specific_force_mps2[lane]);
+        candidate = isfinite(specific_force_norm) &&
+            (fabsf(specific_force_norm - DUAL_IMU_ESTIMATOR_GRAVITY_MPS2) <=
+             estimator->config.accel_recovery_norm_tolerance_mps2);
+    }
+    candidate = candidate && isfinite(output->accel_pair_residual_mps2) &&
+        (output->accel_pair_residual_mps2 <=
+         estimator->config.stationary_accel_pair_limit_mps2);
+
+    if (!candidate) {
+        estimator->post_impact_gravity_trusted = false;
+        estimator->post_impact_gravity_trust_streak = 0U;
+        return false;
+    }
+
+    if (!estimator->post_impact_gravity_trusted) {
+        if (estimator->post_impact_gravity_trust_streak < UINT16_MAX)
+            estimator->post_impact_gravity_trust_streak++;
+        if (estimator->post_impact_gravity_trust_streak >=
+            estimator->config.post_impact_gravity_trust_windows) {
+            estimator->post_impact_gravity_trusted = true;
+        }
+    }
+    return estimator->post_impact_gravity_trusted;
 }
 
 static bool estimator_split_output_alignment(const float alignment[4],
@@ -2125,11 +2218,30 @@ static bool estimator_decay_output_alignment(dual_imu_estimator_t *estimator,
     return true;
 }
 
+static float estimator_output_alignment_tilt_angle(
+    const dual_imu_estimator_t *estimator)
+{
+    float yaw_alignment[4];
+    float tilt_alignment[4];
+    if (!estimator->output_initialized ||
+        !estimator_split_output_alignment(estimator->output_alignment,
+                                          yaw_alignment,
+                                          tilt_alignment))
+        return 0.0f;
+
+    const float vector_norm = sqrtf((tilt_alignment[1] * tilt_alignment[1]) +
+                                    (tilt_alignment[2] * tilt_alignment[2]));
+    const float angle = 2.0f * atan2f(vector_norm,
+                                      fmaxf(0.0f, tilt_alignment[0]));
+    return isfinite(angle) ? angle : 0.0f;
+}
+
 static void estimator_update_output_alignment(dual_imu_estimator_t *estimator,
                                               imu_selector_lane_t selected_lane,
                                               const float lane_quaternion[4],
                                               const float corrected_delta_angle[3],
                                               float dt_s,
+                                              bool attitude_discontinuity,
                                               bool *alignment_active)
 {
     bool switched = false;
@@ -2139,7 +2251,8 @@ static void estimator_update_output_alignment(dual_imu_estimator_t *estimator,
                sizeof(estimator->output_quaternion));
         estimator_quaternion_identity(estimator->output_alignment);
         estimator->output_initialized = true;
-    } else if (selected_lane != estimator->previous_selected_lane) {
+    } else if ((selected_lane != estimator->previous_selected_lane) ||
+               attitude_discontinuity) {
         switched = true;
         float delta_quaternion[4];
         float propagated_output[4];
@@ -2431,9 +2544,13 @@ imu_preintegrator_result_t dual_imu_estimator_process_next(
                 output->lane_specific_force_mps2[seed_accel_lane],
                 reference_quaternion,
                 recoverable_bias);
-            if (estimator->lane_seeded[lane])
+            if (estimator->lane_seeded[lane]) {
                 estimator->hard_fault_flags[lane] &=
                     ~DUAL_IMU_ESTIMATOR_FILTER_FAULT;
+                estimator_note_attitude_rewrite(
+                    estimator, (uint32_t)lane,
+                    DUAL_IMU_ATTITUDE_REWRITE_SEED);
+            }
             output->lane_accel_aided[lane] =
                 estimator->lane_seeded[lane] && (seed_accel_lane != lane);
         }
@@ -2494,8 +2611,17 @@ imu_preintegrator_result_t dual_imu_estimator_process_next(
     bool accel_health_evidence[DUAL_IMU_ESTIMATOR_LANE_COUNT] = {false, false};
     const bool post_impact_quality_pending =
         estimator->post_impact_reacquire_active;
+    const bool post_impact_gravity_trusted =
+        estimator_update_post_impact_gravity_trust(estimator, output, windows,
+                                                   dynamic_accel_gate);
     const bool accel_updates_enabled =
-        !output->accel_inhibited && !dynamic_accel_gate;
+        !output->accel_inhibited && !dynamic_accel_gate &&
+        post_impact_gravity_trusted;
+    output->post_impact_gravity_trusted =
+        estimator->post_impact_gravity_trusted;
+    output->post_impact_gravity_trust_streak =
+        estimator->post_impact_gravity_trust_streak;
+    output->gravity_aiding_inhibited = !accel_updates_enabled;
     if (accel_updates_enabled) {
         for (size_t lane = 0U; lane < DUAL_IMU_ESTIMATOR_LANE_COUNT; ++lane) {
             if (estimator->lane_seeded[lane] && windows[lane].accel_valid) {
@@ -2777,7 +2903,13 @@ imu_preintegrator_result_t dual_imu_estimator_process_next(
                                           selector_input.lane[selected]
                                               .delta_angle_rad,
                                           dt_s,
+                                          estimator->lane_attitude_discontinuity
+                                              [selected],
                                           &output->output_alignment_active);
+        /* Consumed: the published attitude is bridged; a later lane switch
+         * re-bridges against the other lane's live quaternion anyway. */
+        estimator->lane_attitude_discontinuity[0] = false;
+        estimator->lane_attitude_discontinuity[1] = false;
         memcpy(output->quaternion, estimator->output_quaternion,
                sizeof(output->quaternion));
         estimator_quaternion_to_euler(output->quaternion, output->euler_rad);
@@ -2804,6 +2936,16 @@ imu_preintegrator_result_t dual_imu_estimator_process_next(
     } else {
         estimator_quaternion_identity(output->quaternion);
     }
+
+    output->attitude_rewrite_count = estimator->attitude_rewrite_count;
+    output->attitude_rewrite_last_reason =
+        estimator->attitude_rewrite_last_reason;
+    output->attitude_rewrite_last_lane =
+        estimator->attitude_rewrite_last_lane;
+    output->impact_gyro_rollback_pending =
+        estimator->impact_gyro_checkpoint_valid;
+    output->output_alignment_tilt_rad =
+        estimator_output_alignment_tilt_angle(estimator);
 
     estimator->windows_processed++;
     return IMU_PREINTEGRATOR_WINDOW_READY;

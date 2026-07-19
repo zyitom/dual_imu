@@ -118,6 +118,7 @@ static dual_imu_estimator_t make_estimator(void)
     config.attitude_aiding_timeout_windows = 12U;
     config.post_impact_reacquire_dwell_windows = 20U;
     config.post_impact_reacquire_single_lane_dwell_windows = 40U;
+    config.post_impact_gravity_trust_windows = 4U;
     config.calibration_accept_windows = 10U;
     config.calibration_revoke_windows = 4U;
     TEST_EXPECT(dual_imu_estimator_init(&estimator, &config, TEST_EPOCH_US));
@@ -2405,8 +2406,17 @@ static void run_post_impact_reacquire_case(float roll_degrees)
     TEST_EXPECT(estimator.post_impact_reacquire_active);
     TEST_EXPECT(!estimator.attitude_converged);
 
+    /* The reacquire rewrites the MEKF attitude; the published output must
+     * bridge the jump through output_alignment and slew it out instead of
+     * stepping. Run enough quiet windows for the worst-case 90 deg tilt to
+     * finish slewing at output_alignment_slew_rad_s, and assert per-window
+     * output continuity the whole way. */
     bool saw_reacquire = false;
-    for (uint32_t sample = 24U; sample <= 60U; ++sample) {
+    bool calibration_cleared_at_reacquire = false;
+    bool have_previous_output = false;
+    float previous_output_quaternion[4];
+    float max_output_step_rad = 0.0f;
+    for (uint32_t sample = 24U; sample <= 999U; ++sample) {
         const uint64_t timestamp = TEST_EPOCH_US +
                                    ((uint64_t)sample * TEST_PERIOD_US);
         push_lane_measurements_validity(&estimator, IMU_SOURCE_BMI088,
@@ -2416,18 +2426,38 @@ static void run_post_impact_reacquire_case(float roll_degrees)
                                         timestamp, sample, zero,
                                         tilted_gravity, true, true);
         (void)dual_imu_estimator_process_next(&estimator, timestamp, &output);
-        if (output.attitude_reacquired)
+        if (output.attitude_reacquired && !saw_reacquire) {
             saw_reacquire = true;
+            calibration_cleared_at_reacquire =
+                !output.lane_calibrated[0] && !output.lane_calibrated[1];
+        }
+        if (output.output_valid) {
+            if (have_previous_output) {
+                max_output_step_rad = fmaxf(
+                    max_output_step_rad,
+                    quaternion_distance(output.quaternion,
+                                        previous_output_quaternion));
+            }
+            memcpy(previous_output_quaternion, output.quaternion,
+                   sizeof(previous_output_quaternion));
+            have_previous_output = true;
+        }
     }
 
     float expected[4];
     quaternion_from_roll_yaw(roll_rad, yaw_before_impact, expected);
     TEST_EXPECT(saw_reacquire);
+    /* No teleports: the body is stationary, so the published attitude may
+     * move per window at most by the alignment slew plus small filter
+     * corrections, never by the reseeded tilt in one step. */
+    TEST_EXPECT(max_output_step_rad < 0.02f);
     TEST_EXPECT(!output.post_impact_reacquire_active);
     TEST_EXPECT(output.attitude_converged);
     TEST_EXPECT(output.heading_continuity_lost);
-    TEST_EXPECT(!output.lane_calibrated[0]);
-    TEST_EXPECT(!output.lane_calibrated[1]);
+    /* The reacquire could not preserve the pre-impact bias, so calibration
+     * must be cleared at that moment; the long stationary settle afterwards
+     * may legitimately re-earn it. */
+    TEST_EXPECT(calibration_cleared_at_reacquire);
     TEST_EXPECT(quaternion_distance(output.quaternion, expected) < 0.01f);
     TEST_EXPECT(fabsf(output.euler_rad[2] - yaw_before_impact) < 0.005f);
 }
@@ -2636,8 +2666,10 @@ static void test_common_mode_shock_error_reacquires_level_tilt(void)
     TEST_EXPECT(output.heading_continuity_lost);
     TEST_EXPECT(fabsf(output.euler_rad[0]) > degrees_to_radians(10.0f));
 
+    /* Extended past the reacquire so the discontinuity absorbed into
+     * output_alignment finishes slewing out of the published attitude. */
     bool saw_reacquire = false;
-    for (uint32_t sample = 16U; sample <= 65U; ++sample) {
+    for (uint32_t sample = 16U; sample <= 500U; ++sample) {
         const uint64_t timestamp = TEST_EPOCH_US +
                                    ((uint64_t)sample * TEST_PERIOD_US);
         push_lane_measurements_validity(&estimator, IMU_SOURCE_BMI088,
@@ -2766,9 +2798,11 @@ static void test_undetected_shock_reseeds_after_inflation_timeout(void)
      * rejects the correction and only the reseed escalation can recover. */
     inject_undetected_shock(&estimator, &output, 30.0f);
 
+    /* Extended past the reseed escalation so the absorbed 30 deg output
+     * discontinuity finishes slewing out at output_alignment_slew_rad_s. */
     bool saw_reseed = false;
     bool saw_reacquire = false;
-    for (uint32_t sample = 16U; sample <= 140U; ++sample) {
+    for (uint32_t sample = 16U; sample <= 600U; ++sample) {
         run_level_window(&estimator, &output, sample);
         saw_reseed = saw_reseed ||
                      output.lane_accel_recovery_reseeded[0] ||
@@ -2829,6 +2863,118 @@ static void test_sustained_rotation_contamination_never_forced_into_tilt(void)
     TEST_EXPECT(estimator.accel_recovery_inflation_count == 0U);
     TEST_EXPECT(estimator.accel_recovery_reseed_count == 0U);
     /* Tilt must remain gyro-propagated and clean through the whole burst. */
+    TEST_EXPECT(fabsf(output.euler_rad[0]) < degrees_to_radians(1.0f));
+    TEST_EXPECT(fabsf(output.euler_rad[1]) < degrees_to_radians(1.0f));
+}
+
+static void test_post_rollback_dynamic_accel_waits_for_gravity_trust(void)
+{
+    dual_imu_estimator_t estimator = make_estimator();
+    dual_imu_estimator_output_t output;
+    const float zero[3] = {0.0f, 0.0f, 0.0f};
+    const float disputed_rate[3] = {0.0f, 0.0f, 0.5f};
+    const float yaw_rate[3] = {0.0f, 0.0f, degrees_to_radians(200.0f)};
+    const float level[3] = {0.0f, 0.0f, -9.80665f};
+    const float contaminated[3] = {3.0f, 0.0f, -9.80665f};
+
+    memset(&output, 0, sizeof(output));
+    for (uint32_t sample = 0U; sample <= 12U; ++sample)
+        run_level_window(&estimator, &output, sample);
+    TEST_EXPECT(output.attitude_converged);
+    use_sensitive_disagreement_gate(&estimator);
+
+    const uint64_t inhibit_start_us =
+        TEST_EPOCH_US + (UINT64_C(12) * TEST_PERIOD_US);
+    const uint64_t inhibit_end_us =
+        TEST_EPOCH_US + (UINT64_C(18) * TEST_PERIOD_US);
+    TEST_EXPECT(dual_imu_estimator_inhibit_accel_interval(
+        &estimator, inhibit_start_us, inhibit_end_us));
+
+    for (uint32_t sample = 13U; sample <= 15U; ++sample) {
+        const uint64_t timestamp = TEST_EPOCH_US +
+                                   ((uint64_t)sample * TEST_PERIOD_US);
+        push_lane_measurements_validity(&estimator, IMU_SOURCE_BMI088,
+                                        timestamp, sample, zero, level,
+                                        true, true);
+        push_lane_measurements_validity(&estimator, IMU_SOURCE_ICM45686,
+                                        timestamp, sample, disputed_rate, level,
+                                        true, true);
+        (void)dual_imu_estimator_process_next(&estimator, timestamp, &output);
+    }
+    TEST_EXPECT(output.rotation_unobserved);
+    TEST_EXPECT(output.post_impact_reacquire_active);
+    TEST_EXPECT(!output.output_valid);
+
+    for (uint32_t sample = 16U; sample <= 18U; ++sample) {
+        const uint64_t timestamp = TEST_EPOCH_US +
+                                   ((uint64_t)sample * TEST_PERIOD_US);
+        push_lane_measurements_validity(&estimator, IMU_SOURCE_BMI088,
+                                        timestamp, sample, yaw_rate,
+                                        contaminated, true, true);
+        push_lane_measurements_validity(&estimator, IMU_SOURCE_ICM45686,
+                                        timestamp, sample, yaw_rate,
+                                        contaminated, true, true);
+        (void)dual_imu_estimator_process_next(&estimator, timestamp, &output);
+        TEST_EXPECT(output.accel_inhibited);
+    }
+
+    float previous_output[4];
+    memcpy(previous_output, output.quaternion, sizeof(previous_output));
+    float maximum_output_step = 0.0f;
+    float maximum_tilt = 0.0f;
+    for (uint32_t sample = 19U; sample <= 80U; ++sample) {
+        const uint64_t timestamp = TEST_EPOCH_US +
+                                   ((uint64_t)sample * TEST_PERIOD_US);
+        push_lane_measurements_validity(&estimator, IMU_SOURCE_BMI088,
+                                        timestamp, sample, yaw_rate,
+                                        contaminated, true, true);
+        push_lane_measurements_validity(&estimator, IMU_SOURCE_ICM45686,
+                                        timestamp, sample, yaw_rate,
+                                        contaminated, true, true);
+        (void)dual_imu_estimator_process_next(&estimator, timestamp, &output);
+        TEST_EXPECT(!output.accel_inhibited);
+        TEST_EXPECT(output.gravity_aiding_inhibited);
+        TEST_EXPECT(!output.post_impact_gravity_trusted);
+        TEST_EXPECT(output.post_impact_gravity_trust_streak == 0U);
+        TEST_EXPECT(output.accel_result[0] ==
+                    ATTITUDE_MEKF_ACCEL_REJECTED_INVALID_INPUT);
+        TEST_EXPECT(output.accel_result[1] ==
+                    ATTITUDE_MEKF_ACCEL_REJECTED_INVALID_INPUT);
+        if (output.output_valid) {
+            maximum_output_step = fmaxf(
+                maximum_output_step,
+                quaternion_distance(previous_output, output.quaternion));
+            memcpy(previous_output, output.quaternion,
+                   sizeof(previous_output));
+            maximum_tilt = fmaxf(maximum_tilt,
+                                 fmaxf(fabsf(output.euler_rad[0]),
+                                       fabsf(output.euler_rad[1])));
+        }
+    }
+    TEST_EXPECT(maximum_output_step < degrees_to_radians(1.0f));
+    TEST_EXPECT(maximum_tilt < degrees_to_radians(1.0f));
+    TEST_EXPECT(output.post_impact_reacquire_active);
+
+    bool saw_gravity_trusted = false;
+    bool saw_reacquire = false;
+    for (uint32_t sample = 81U; sample <= 120U; ++sample) {
+        const uint64_t timestamp = TEST_EPOCH_US +
+                                   ((uint64_t)sample * TEST_PERIOD_US);
+        push_lane_measurements_validity(&estimator, IMU_SOURCE_BMI088,
+                                        timestamp, sample, zero, level,
+                                        true, true);
+        push_lane_measurements_validity(&estimator, IMU_SOURCE_ICM45686,
+                                        timestamp, sample, zero, level,
+                                        true, true);
+        (void)dual_imu_estimator_process_next(&estimator, timestamp, &output);
+        saw_gravity_trusted = saw_gravity_trusted ||
+                              output.post_impact_gravity_trusted;
+        saw_reacquire = saw_reacquire || output.attitude_reacquired;
+    }
+    TEST_EXPECT(saw_gravity_trusted);
+    TEST_EXPECT(saw_reacquire);
+    TEST_EXPECT(output.attitude_converged);
+    TEST_EXPECT(!output.post_impact_reacquire_active);
     TEST_EXPECT(fabsf(output.euler_rad[0]) < degrees_to_radians(1.0f));
     TEST_EXPECT(fabsf(output.euler_rad[1]) < degrees_to_radians(1.0f));
 }
@@ -2953,10 +3099,12 @@ static void test_post_impact_dual_filter_fault_reseeds_from_new_windows(void)
                 IMU_PREINTEGRATOR_WINDOW_READY);
     TEST_EXPECT(!output.attitude_reacquired);
 
+    /* Extended so the 30 deg discontinuity absorbed at the reacquire slews
+     * fully out of the published output before the final expectations. */
     bool saw_reacquire = false;
     bool invalid_bias_calibration_cleared = false;
     bool valid_bias_calibration_preserved = false;
-    for (sample++; sample <= 120U; ++sample) {
+    for (sample++; sample <= 600U; ++sample) {
         timestamp = TEST_EPOCH_US +
                     ((uint64_t)sample * TEST_PERIOD_US);
         push_lane_measurements_validity(
@@ -3556,10 +3704,12 @@ static void test_single_lane_recovers_first_after_dual_gyro_loss(void)
     TEST_EXPECT(output.post_impact_reacquire_active);
     TEST_EXPECT(!output.attitude_converged);
 
+    /* Extended so the 45 deg discontinuity absorbed at the reacquire slews
+     * fully out of the published output before the final expectations. */
     bool saw_output_resume_while_reacquiring = false;
     bool saw_reacquire = false;
     bool saw_icm_cross_lane_aiding = false;
-    for (uint32_t sample = 24U; sample <= 90U; ++sample) {
+    for (uint32_t sample = 24U; sample <= 999U; ++sample) {
         const uint64_t timestamp = TEST_EPOCH_US +
                                    ((uint64_t)sample * TEST_PERIOD_US);
         push_lane_measurements_validity(&estimator, IMU_SOURCE_BMI088,
@@ -3659,6 +3809,7 @@ int main(void)
     test_undetected_shock_recovers_through_nis_inflation();
     test_undetected_shock_reseeds_after_inflation_timeout();
     test_sustained_rotation_contamination_never_forced_into_tilt();
+    test_post_rollback_dynamic_accel_waits_for_gravity_trust();
     test_post_impact_dual_filter_fault_reseeds_from_new_windows();
     test_post_impact_recovery_never_clears_sensor_hard_fault();
     test_attitude_aiding_timeout_is_recoverable();

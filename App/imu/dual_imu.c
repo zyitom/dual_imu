@@ -1094,6 +1094,11 @@ static void publish_estimator_output(const dual_imu_estimator_output_t *output)
            output->stationary_temporal_accel_variance_m2_s4,
            sizeof(state.stationary_temporal_accel_variance_m2_s4));
     state.accel_update_inhibited = output->accel_inhibited;
+    state.gravity_aiding_inhibited = output->gravity_aiding_inhibited;
+    state.post_impact_gravity_trusted =
+        output->post_impact_gravity_trusted;
+    state.post_impact_gravity_trust_streak =
+        output->post_impact_gravity_trust_streak;
     state.rotation_unobserved = output->rotation_unobserved;
     if (output->heading_continuity_lost) {
         record_public_heading_continuity_loss(
@@ -1105,6 +1110,11 @@ static void publish_estimator_output(const dual_imu_estimator_output_t *output)
         output->post_impact_reacquire_active;
     state.post_impact_episode_count = estimator.post_impact_episode_count;
     state.post_impact_reacquire_count = estimator.post_impact_reacquire_count;
+    state.attitude_rewrite_count = output->attitude_rewrite_count;
+    state.attitude_rewrite_last_reason = output->attitude_rewrite_last_reason;
+    state.attitude_rewrite_last_lane = output->attitude_rewrite_last_lane;
+    state.impact_gyro_rollback_pending = output->impact_gyro_rollback_pending;
+    state.output_alignment_tilt_rad = output->output_alignment_tilt_rad;
     state.fused_accel_valid = output->specific_force_valid;
     state.accel_residual_mps2 = output->accel_pair_residual_mps2;
 

@@ -49,6 +49,8 @@ static dual_imu_attitude_output_t last_valid_attitude;
 static bool last_valid_attitude_available;
 static uint64_t reconciled_heading_loss_timestamp_us;
 static dual_imu_usb_stream_diagnostics_t stream_diagnostics;
+static uint32_t previous_attitude_rewrite_count;
+static bool previous_attitude_rewrite_count_valid;
 
 _Static_assert((DUAL_IMU_USB_ACCEL_HISTORY_CAPACITY &
                 DUAL_IMU_USB_ACCEL_HISTORY_MASK) == 0U,
@@ -271,6 +273,18 @@ static uint16_t build_status(const dual_imu_state_t *state,
         status |= DUAL_IMU_USB_STATUS_PRIVATE_GYRO_VALID;
     if (accel_valid)
         status |= DUAL_IMU_USB_STATUS_PRIVATE_ACCEL_VALID;
+    /* Fusion debug diagnostics on otherwise-constant-0 HI91 bits. */
+    if (attitude->selected_source == IMU_SOURCE_ICM45686)
+        status |= DUAL_IMU_USB_STATUS_DEBUG_LANE_ICM;
+    if (previous_attitude_rewrite_count_valid &&
+        (state->attitude_rewrite_count != previous_attitude_rewrite_count))
+        status |= DUAL_IMU_USB_STATUS_DEBUG_REWRITE;
+    if (state->gravity_aiding_inhibited)
+        status |= DUAL_IMU_USB_STATUS_DEBUG_ACCEL_INHIBIT;
+    if (attitude->post_impact_reacquire_active)
+        status |= DUAL_IMU_USB_STATUS_DEBUG_REACQUIRE;
+    if (state->impact_gyro_rollback_pending)
+        status |= DUAL_IMU_USB_STATUS_DEBUG_ROLLBACK;
     /* WB_CONV: positive polarity, gyro bias converged. */
     if (selected_bias_is_converged(state, attitude))
         status |= DUAL_IMU_USB_STATUS_WB_CONV;
@@ -377,8 +391,20 @@ static void fill_frame_data(const dual_imu_state_t *state,
                 DUAL_IMU_USB_RAD_TO_DEG;
     }
 
+    /* No magnetometer exists: the mag field carries fusion debug channels
+     * (documented at the status enum). Values stay well inside float's exact
+     * integer range. */
+    data->magnetic_field_ut[0] = (float)state->attitude_rewrite_count;
+    data->magnetic_field_ut[1] =
+        (float)state->attitude_rewrite_last_reason +
+        (10.0f * (float)state->attitude_rewrite_last_lane);
+    data->magnetic_field_ut[2] =
+        state->output_alignment_tilt_rad * DUAL_IMU_USB_RAD_TO_DEG;
+
     data->main_status = build_status(state, attitude, attitude_valid,
                                      accel.valid, gyro_valid);
+    previous_attitude_rewrite_count = state->attitude_rewrite_count;
+    previous_attitude_rewrite_count_valid = true;
 }
 
 static void enqueue_attitude(const dual_imu_state_t *state,
@@ -560,6 +586,8 @@ void dual_imu_usb_stream_init(void)
     memset(&last_valid_attitude, 0, sizeof(last_valid_attitude));
     last_valid_attitude_available = false;
     reconciled_heading_loss_timestamp_us = 0U;
+    previous_attitude_rewrite_count = 0U;
+    previous_attitude_rewrite_count_valid = false;
 }
 
 void dual_imu_usb_stream_process(const dual_imu_state_t *state)

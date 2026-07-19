@@ -446,6 +446,10 @@ static bool mekf_config_is_valid(const attitude_mekf_config_t *config)
            (config->accel_variance_scale_max >= 1.0f) &&
            isfinite(config->accel_nis_gate) && (config->accel_nis_gate > 0.0f) &&
            isfinite(config->zaru_nis_gate) && (config->zaru_nis_gate > 0.0f) &&
+           isfinite(config->max_accel_correction_step_rad) &&
+           (config->max_accel_correction_step_rad > 0.0f) &&
+           (config->max_accel_correction_step_rad <=
+            config->max_attitude_correction_rad) &&
            isfinite(config->max_attitude_correction_rad) &&
            (config->max_attitude_correction_rad > 0.0f) &&
            (config->max_attitude_correction_rad <= ATTITUDE_MEKF_PI_F) &&
@@ -558,6 +562,8 @@ void attitude_mekf_default_config(attitude_mekf_config_t *config)
     config->accel_variance_scale_max = 100.0f;
     config->accel_nis_gate = ATTITUDE_MEKF_DEFAULT_NIS_GATE_99;
     config->zaru_nis_gate = ATTITUDE_MEKF_DEFAULT_NIS_GATE_3D;
+    config->max_accel_correction_step_rad =
+        0.5f * ATTITUDE_MEKF_PI_F / 180.0f;
     config->max_attitude_correction_rad = 20.0f * ATTITUDE_MEKF_PI_F / 180.0f;
     config->max_abs_bias_rad_s = 1.0f;
     config->min_dt_s = 0.0001f;
@@ -1165,6 +1171,22 @@ attitude_mekf_accel_result_t attitude_mekf_update_accel(
     {
         return mekf_record_accel_result(filter,
                                         ATTITUDE_MEKF_ACCEL_REJECTED_CORRECTION);
+    }
+
+    if (attitude_correction_norm >
+        filter->config.max_accel_correction_step_rad)
+    {
+        const float gain_scale =
+            filter->config.max_accel_correction_step_rad /
+            attitude_correction_norm;
+        for (size_t row = 0U; row < ATTITUDE_MEKF_STATE_DIM; ++row)
+        {
+            correction[row] *= gain_scale;
+            for (size_t column = 0U; column < 2U; ++column)
+            {
+                gain[row][column] *= gain_scale;
+            }
+        }
     }
 
     float corrected_bias[ATTITUDE_MEKF_VECTOR_DIM];

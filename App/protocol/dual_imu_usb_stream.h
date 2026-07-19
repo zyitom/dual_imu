@@ -26,9 +26,17 @@ extern "C" {
  * MAIN_STATUS bitfield follows the official HiPNUC HI91 status word so the
  * host decoder can be used unmodified. Bits the host reads as "converged /
  * healthy" are POSITIVE polarity (1 = good). This hardware has no odometer,
- * no UTC source and no magnetometer, so those official bits are wired to a
- * constant 0. HI91 Reserved positions (bit0-1, bit6-7, bit13-15) carry our
- * private diagnostics; a stock HiPNUC host ignores them.
+ * no UTC source and no magnetometer, so those official bits (bit2-5, bit11)
+ * would otherwise be a constant 0; they now carry fusion debug diagnostics
+ * (a stock HiPNUC host displays but does not act on them). HI91 Reserved
+ * positions (bit0-1, bit6-7, bit13-15) carry our private diagnostics.
+ *
+ * The unused HI91 magnetometer field carries debug channels as well:
+ *   mag_x = cumulative attitude-rewrite count (integer)
+ *   mag_y = last rewrite reason + 10 * last rewrite lane
+ *           (reason: 1=seed 2=accel-recovery 3=reacquire 4=rollback;
+ *            lane: 0=BMI088 1=ICM45686 2=both)
+ *   mag_z = residual output-alignment tilt still being slewed out, in deg
  */
 typedef enum
 {
@@ -36,11 +44,12 @@ typedef enum
     DUAL_IMU_USB_STATUS_PRIVATE_GYRO_VALID = (1U << 0),
     DUAL_IMU_USB_STATUS_PRIVATE_ACCEL_VALID = (1U << 1),
 
-    /* --- Official HI91 bits, unsupported on this hardware (always 0) --- */
-    DUAL_IMU_USB_STATUS_OD = (1U << 2),         /* odometer: none */
-    DUAL_IMU_USB_STATUS_SOUT_PULSE = (1U << 3), /* sync-out pulse: none */
-    DUAL_IMU_USB_STATUS_UTC_TIME = (1U << 4),   /* UTC synced: never */
-    DUAL_IMU_USB_STATUS_MAG_AIDING = (1U << 5), /* mag in fusion: never */
+    /* --- Official HI91 bits unsupported on this hardware, reused as
+     * fusion debug diagnostics --- */
+    DUAL_IMU_USB_STATUS_DEBUG_LANE_ICM = (1U << 2),      /* selected lane: 1 = ICM45686 (HI91 OD) */
+    DUAL_IMU_USB_STATUS_DEBUG_REWRITE = (1U << 3),       /* attitude rewrite since previous frame (HI91 SOUT) */
+    DUAL_IMU_USB_STATUS_DEBUG_ACCEL_INHIBIT = (1U << 4), /* gravity aiding inhibited (HI91 UTC) */
+    DUAL_IMU_USB_STATUS_DEBUG_REACQUIRE = (1U << 5),     /* post-impact reacquire active (HI91 MAG_AIDING) */
 
     /* --- Private diagnostics (HI91 Reserved bit6-7) --- */
     DUAL_IMU_USB_STATUS_PRIVATE_STATIONARY = (1U << 6),
@@ -50,7 +59,7 @@ typedef enum
     DUAL_IMU_USB_STATUS_ATT_CONV = (1U << 8), /* attitude converged (positive) */
     DUAL_IMU_USB_STATUS_GYR_SAT = (1U << 9),  /* gyro over-range */
     DUAL_IMU_USB_STATUS_ACC_SAT = (1U << 10), /* accel over-range */
-    DUAL_IMU_USB_STATUS_MAG_DIST = (1U << 11), /* mag disturbance: none, always 0 */
+    DUAL_IMU_USB_STATUS_DEBUG_ROLLBACK = (1U << 11), /* impact rollback pending (HI91 MAG_DIST) */
     DUAL_IMU_USB_STATUS_WB_CONV = (1U << 12), /* gyro bias converged (positive) */
 
     /* --- Private diagnostics (HI91 Reserved bit13-15) --- */

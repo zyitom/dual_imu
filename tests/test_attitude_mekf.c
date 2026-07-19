@@ -47,6 +47,14 @@ static float wrap_pi(float angle)
     return angle;
 }
 
+static float quaternion_distance(const float lhs[4], const float rhs[4])
+{
+    float dot = fabsf((lhs[0] * rhs[0]) + (lhs[1] * rhs[1]) +
+                      (lhs[2] * rhs[2]) + (lhs[3] * rhs[3]));
+    dot = fminf(1.0f, fmaxf(-1.0f, dot));
+    return 2.0f * acosf(dot);
+}
+
 static void quaternion_from_euler(float roll,
                                   float pitch,
                                   float yaw,
@@ -257,6 +265,33 @@ static void test_accel_rejection_is_transactional(void)
                 ATTITUDE_MEKF_ACCEL_REJECTED_INVALID_INPUT);
     TEST_EXPECT(memcmp(saved_quaternion, filter.q, sizeof(saved_quaternion)) == 0);
     TEST_EXPECT(memcmp(saved_covariance, filter.covariance, sizeof(saved_covariance)) == 0);
+}
+
+static void test_inflated_covariance_accel_correction_is_step_limited(void)
+{
+    attitude_mekf_t filter;
+    const float contamination_angle = degrees_to_radians(17.0f);
+    const float contaminated_force[3] = {
+        0.0f,
+        -TEST_GRAVITY * sinf(contamination_angle),
+        -TEST_GRAVITY * cosf(contamination_angle),
+    };
+
+    TEST_EXPECT(attitude_mekf_init(&filter, NULL));
+    TEST_EXPECT(attitude_mekf_mark_rotation_unobserved(
+        &filter, degrees_to_radians(30.0f)));
+    float before[4];
+    memcpy(before, filter.q, sizeof(before));
+
+    TEST_EXPECT(attitude_mekf_update_accel(
+                    &filter, contaminated_force, 1.0f) ==
+                ATTITUDE_MEKF_ACCEL_ACCEPTED);
+    const float applied_step = quaternion_distance(before, filter.q);
+    TEST_EXPECT(applied_step <=
+                filter.config.max_accel_correction_step_rad + 1.0e-5f);
+    TEST_EXPECT(applied_step >=
+                0.9f * filter.config.max_accel_correction_step_rad);
+    TEST_EXPECT(attitude_mekf_is_valid(&filter));
 }
 
 static void test_yaw_unobservability_and_propagation_rejection(void)
@@ -734,6 +769,7 @@ int main(void)
     test_tilt_and_bias_convergence();
     test_gravity_update_at_arbitrary_attitude();
     test_accel_rejection_is_transactional();
+    test_inflated_covariance_accel_correction_is_step_limited();
     test_yaw_unobservability_and_propagation_rejection();
     test_gravity_axis_bias_is_unobservable_at_tilt();
     test_noisy_tilt_preserves_gravity_gauge_and_observable_bias();

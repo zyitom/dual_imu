@@ -23,6 +23,26 @@ typedef enum
     DUAL_IMU_ESTIMATOR_LANE_NONE = 0xFF
 } dual_imu_estimator_lane_t;
 
+/* Why the estimator last rewrote a lane's MEKF attitude outside of normal
+ * propagate/update. Every rewrite is a potential output discontinuity; the
+ * output path absorbs it into output_alignment and these codes let the host
+ * attribute each absorbed jump to its mechanism. */
+typedef enum
+{
+    DUAL_IMU_ATTITUDE_REWRITE_NONE = 0,
+    /* Unseeded/faulted lane reseeded from the current accel window. */
+    DUAL_IMU_ATTITUDE_REWRITE_SEED = 1,
+    /* Stuck gravity-NIS escalation reseeded tilt from accel. */
+    DUAL_IMU_ATTITUDE_REWRITE_ACCEL_RECOVERY = 2,
+    /* Post-impact stationary reacquire reseeded tilt from the dwell mean. */
+    DUAL_IMU_ATTITUDE_REWRITE_REACQUIRE = 3,
+    /* Impact gyro-disagreement rollback restored the checkpoint state. */
+    DUAL_IMU_ATTITUDE_REWRITE_ROLLBACK = 4,
+} dual_imu_attitude_rewrite_reason_t;
+
+/* attitude_rewrite_last_lane value when a rewrite touched both lanes. */
+#define DUAL_IMU_ATTITUDE_REWRITE_LANE_BOTH (2U)
+
 typedef enum
 {
     DUAL_IMU_STATIONARY_REJECT_NONE = 0,
@@ -127,6 +147,10 @@ typedef struct
     uint16_t attitude_aiding_timeout_windows;
     uint16_t post_impact_reacquire_dwell_windows;
     uint16_t post_impact_reacquire_single_lane_dwell_windows;
+    /* After an impact/rollback, ordinary gravity updates stay closed until
+     * this many consecutive low-rate, near-1g, dual-lane-consistent windows
+     * have re-established that accelerometer direction is usable as gravity. */
+    uint16_t post_impact_gravity_trust_windows;
     uint16_t impact_gyro_disagreement_confirm_windows;
     uint16_t calibration_accept_windows;
     uint16_t calibration_revoke_windows;
@@ -182,9 +206,19 @@ typedef struct
     float stationary_temporal_gyro_variance_rad2_s2[DUAL_IMU_ESTIMATOR_LANE_COUNT];
     float stationary_temporal_accel_variance_m2_s4[DUAL_IMU_ESTIMATOR_LANE_COUNT];
     dual_imu_stationary_reject_reason_t stationary_last_reject_reason;
+    /* Cumulative MEKF attitude rewrites (all lanes, all reasons) plus the
+     * attribution of the most recent one. The residual tilt angle of
+     * output_alignment shows how much absorbed discontinuity is still being
+     * slewed out of the published attitude. */
+    uint32_t attitude_rewrite_count;
+    float output_alignment_tilt_rad;
+    uint8_t attitude_rewrite_last_reason;
+    uint8_t attitude_rewrite_last_lane;
     uint16_t stationary_streak;
     uint16_t stationary_max_streak;
+    uint16_t post_impact_gravity_trust_streak;
     uint8_t stationary_lane_mask;
+    bool impact_gyro_rollback_pending;
     bool lane_seeded[DUAL_IMU_ESTIMATOR_LANE_COUNT];
     bool lane_calibrated[DUAL_IMU_ESTIMATOR_LANE_COUNT];
     bool lane_aided_propagation[DUAL_IMU_ESTIMATOR_LANE_COUNT];
@@ -202,6 +236,8 @@ typedef struct
     bool attitude_aiding_stale;
     bool attitude_converged;
     bool post_impact_reacquire_active;
+    bool post_impact_gravity_trusted;
+    bool gravity_aiding_inhibited;
     bool attitude_reacquired;
     bool specific_force_valid;
     bool output_valid;
@@ -231,6 +267,7 @@ typedef struct
     uint16_t stationary_rate_exit_streak;
     uint16_t attitude_convergence_streak;
     uint16_t attitude_aiding_miss_streak;
+    uint16_t post_impact_gravity_trust_streak;
     dual_imu_stationary_reject_reason_t stationary_last_reject_reason;
     uint32_t stationary_reject_count[DUAL_IMU_STATIONARY_REJECT_COUNT];
     float stationary_temporal_gyro_variance_rad2_s2[DUAL_IMU_ESTIMATOR_LANE_COUNT];
@@ -269,6 +306,13 @@ typedef struct
     uint8_t impact_gyro_checkpoint_lane_seeded_mask;
     uint8_t impact_gyro_checkpoint_filter_fault_mask;
     uint16_t impact_gyro_disagreement_streak;
+    uint32_t attitude_rewrite_count;
+    uint8_t attitude_rewrite_last_reason;
+    uint8_t attitude_rewrite_last_lane;
+    /* Set when a lane's MEKF attitude was rewritten; consumed by the output
+     * path, which bridges the jump through output_alignment like a lane
+     * switch so the published quaternion never steps discontinuously. */
+    bool lane_attitude_discontinuity[DUAL_IMU_ESTIMATOR_LANE_COUNT];
     bool lane_seeded[DUAL_IMU_ESTIMATOR_LANE_COUNT];
     bool lane_calibrated[DUAL_IMU_ESTIMATOR_LANE_COUNT];
     bool lane_accel_fault[DUAL_IMU_ESTIMATOR_LANE_COUNT];
@@ -282,6 +326,7 @@ typedef struct
     bool heading_continuity_lost;
     bool attitude_converged;
     bool post_impact_reacquire_active;
+    bool post_impact_gravity_trusted;
     bool output_initialized;
     bool initialized;
 } dual_imu_estimator_t;

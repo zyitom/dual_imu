@@ -191,16 +191,20 @@ static void test_field_mapping_and_status(void)
     const uint16_t expected_status =
         DUAL_IMU_USB_STATUS_PRIVATE_GYRO_VALID |
         DUAL_IMU_USB_STATUS_PRIVATE_ACCEL_VALID |
+        DUAL_IMU_USB_STATUS_DEBUG_LANE_ICM |
         DUAL_IMU_USB_STATUS_PRIVATE_STATIONARY |
         DUAL_IMU_USB_STATUS_ATT_CONV |
         DUAL_IMU_USB_STATUS_WB_CONV;
     TEST_EXPECT(read_u16_le(&cdc_capture[7]) == expected_status);
-    /* Unsupported official HI91 bits must be a constant 0 on this hardware. */
-    const uint16_t unsupported_official =
-        DUAL_IMU_USB_STATUS_OD | DUAL_IMU_USB_STATUS_SOUT_PULSE |
-        DUAL_IMU_USB_STATUS_UTC_TIME | DUAL_IMU_USB_STATUS_MAG_AIDING |
-        DUAL_IMU_USB_STATUS_MAG_DIST;
-    TEST_EXPECT((read_u16_le(&cdc_capture[7]) & unsupported_official) == 0U);
+    /* Debug bits reusing unsupported official HI91 positions must stay 0
+     * while their conditions are inactive (no rewrite yet, gravity aiding
+     * live, no reacquire, no rollback). */
+    const uint16_t inactive_debug =
+        DUAL_IMU_USB_STATUS_DEBUG_REWRITE |
+        DUAL_IMU_USB_STATUS_DEBUG_ACCEL_INHIBIT |
+        DUAL_IMU_USB_STATUS_DEBUG_REACQUIRE |
+        DUAL_IMU_USB_STATUS_DEBUG_ROLLBACK;
+    TEST_EXPECT((read_u16_le(&cdc_capture[7]) & inactive_debug) == 0U);
     /* Regression: a stationary board must NOT set the official GYR_SAT (bit9)
      * or ACC_SAT (bit10). The old layout aliased STATIONARY onto bit9. */
     TEST_EXPECT((read_u16_le(&cdc_capture[7]) &
@@ -235,6 +239,33 @@ static void test_field_mapping_and_status(void)
     TEST_EXPECT(diagnostics.queued_frame_count == 0U);
 }
 
+static void test_gravity_aiding_debug_bit_tracks_effective_gate(void)
+{
+    reset_fakes();
+    dual_imu_usb_stream_init();
+    dual_imu_state_t state;
+    initialize_state(&state);
+
+    /* The raw motion-guard interval is over, but post-impact gravity trust is
+     * still pending, so the effective aiding gate must remain visible. */
+    state.accel_update_inhibited = false;
+    state.gravity_aiding_inhibited = true;
+    push_attitude(make_attitude(1U));
+    dual_imu_usb_stream_process(&state);
+    TEST_EXPECT((captured_status(0U) &
+                 DUAL_IMU_USB_STATUS_DEBUG_ACCEL_INHIBIT) != 0U);
+
+    reset_fakes();
+    dual_imu_usb_stream_init();
+    initialize_state(&state);
+    state.accel_update_inhibited = true;
+    state.gravity_aiding_inhibited = false;
+    push_attitude(make_attitude(2U));
+    dual_imu_usb_stream_process(&state);
+    TEST_EXPECT((captured_status(0U) &
+                 DUAL_IMU_USB_STATUS_DEBUG_ACCEL_INHIBIT) == 0U);
+}
+
 static void test_invalid_data_emits_identity_quaternion_when_never_valid(void)
 {
     reset_fakes();
@@ -256,9 +287,9 @@ static void test_invalid_data_emits_identity_quaternion_when_never_valid(void)
     TEST_EXPECT((status & DUAL_IMU_USB_STATUS_PRIVATE_ACCEL_VALID) == 0U);
     TEST_EXPECT((status & DUAL_IMU_USB_STATUS_PRIVATE_GYRO_VALID) == 0U);
     TEST_EXPECT((status & DUAL_IMU_USB_STATUS_WB_CONV) == 0U);
-    /* bit11 (MAG_DIST) must no longer be a constant 1 as the old
-     * UTC_UNSYNC bit was. */
-    TEST_EXPECT((status & DUAL_IMU_USB_STATUS_MAG_DIST) == 0U);
+    /* bit11 (debug rollback) must no longer be a constant 1 as the old
+     * UTC_UNSYNC bit was, and no rollback is pending here. */
+    TEST_EXPECT((status & DUAL_IMU_USB_STATUS_DEBUG_ROLLBACK) == 0U);
 
     /* No valid attitude has ever been seen: the quaternion field must carry
      * the identity (w=1, x=y=z=0), never an all-zero non-orientation. */
@@ -1101,6 +1132,7 @@ static void test_new_usb_session_does_not_clear_device_saturation_history(void)
 int main(void)
 {
     test_field_mapping_and_status();
+    test_gravity_aiding_debug_bit_tracks_effective_gate();
     test_invalid_data_emits_identity_quaternion_when_never_valid();
     test_brief_invalid_frame_holds_payload_but_clears_validity();
     test_invalid_past_old_window_keeps_holding_attitude();
