@@ -701,6 +701,111 @@ static void test_unobservable_static_yaw_rate_is_not_learned_as_bias(void)
                 DUAL_IMU_STATIONARY_REJECT_MEAN_RATE);
 }
 
+static void test_zaru_bias_recovery_reseeds_diverged_bias(void)
+{
+    dual_imu_estimator_t estimator = make_estimator();
+    dual_imu_estimator_output_t output;
+    const float zero_rate[3] = {0.0f, 0.0f, 0.0f};
+    /* Matches the field capture (FIX_PLAN §12.1): the learned yaw bias driven
+     * ~5.5 dps off during violent motion while the sensor itself stayed
+     * healthy, deadlocking the ZARU residual gate. */
+    const float diverged_bias[3] = {0.0f, 0.0f, degrees_to_radians(5.5f)};
+
+    estimator.config.zaru_recovery_reject_windows = 16U;
+    uint32_t sample = confirm_level_stationary(
+        &estimator, &output,
+        4U * estimator.config.stationary_dwell_windows);
+
+    for (size_t lane = 0U; lane < DUAL_IMU_ESTIMATOR_LANE_COUNT; ++lane) {
+        float quaternion[4];
+        TEST_EXPECT(attitude_mekf_get_quaternion(&estimator.mekf[lane],
+                                                 quaternion));
+        TEST_EXPECT(attitude_mekf_reset(&estimator.mekf[lane], quaternion,
+                                        diverged_bias));
+    }
+
+    bool saw_reseed[DUAL_IMU_ESTIMATOR_LANE_COUNT] = {false, false};
+    bool reconfirmed_after_reseed = false;
+    for (uint32_t window = 0U; window < 1200U; ++window) {
+        sample++;
+        const uint64_t timestamp = TEST_EPOCH_US +
+                                   ((uint64_t)sample * TEST_PERIOD_US);
+        push_lane_sample(&estimator, IMU_SOURCE_BMI088,
+                         timestamp, sample, zero_rate);
+        push_lane_sample(&estimator, IMU_SOURCE_ICM45686,
+                         timestamp, sample, zero_rate);
+        TEST_EXPECT(dual_imu_estimator_process_next(
+                        &estimator, timestamp, &output) ==
+                    IMU_PREINTEGRATOR_WINDOW_READY);
+        for (size_t lane = 0U; lane < DUAL_IMU_ESTIMATOR_LANE_COUNT; ++lane) {
+            saw_reseed[lane] = saw_reseed[lane] ||
+                               output.lane_bias_recovery_reseeded[lane];
+        }
+        reconfirmed_after_reseed = reconfirmed_after_reseed ||
+            ((saw_reseed[0] || saw_reseed[1]) && output.stationary_confirmed);
+    }
+
+    TEST_EXPECT(saw_reseed[0]);
+    TEST_EXPECT(saw_reseed[1]);
+    TEST_EXPECT(estimator.zaru_bias_recovery_count >= 2U);
+    TEST_EXPECT(reconfirmed_after_reseed);
+    TEST_EXPECT(output.stationary_confirmed);
+    for (size_t lane = 0U; lane < DUAL_IMU_ESTIMATOR_LANE_COUNT; ++lane) {
+        TEST_EXPECT(fabsf(output.lane_bias_rad_s[lane][2]) <
+                    degrees_to_radians(0.2f));
+    }
+    TEST_EXPECT(output.output_valid);
+    TEST_EXPECT(fabsf(output.angular_rate_rad_s[2]) <
+                degrees_to_radians(0.2f));
+}
+
+static void test_zaru_bias_recovery_rejects_slow_tilt_rotation(void)
+{
+    dual_imu_estimator_t estimator = make_estimator();
+    dual_imu_estimator_output_t output;
+    /* 1.5 dps about body x sits inside the tilt rest tolerance, so only the
+     * bias-independent evidence (gravity direction moving across the dwell,
+     * accel temporal variance) separates this genuine rotation from a
+     * diverged bias. It must never be reseeded into the bias state. */
+    const float roll_rate_rad_s = degrees_to_radians(1.5f);
+    const float rate[3] = {roll_rate_rad_s, 0.0f, 0.0f};
+
+    /* At 1.5 dps the gravity direction crosses the 0.02-chord stability limit
+     * after ~0.77 s = ~307 windows, so an 800-window recovery dwell keeps the
+     * production invariant (gravity gate fires well before the reseed dwell
+     * elapses) while still running fast as a host test. */
+    estimator.config.zaru_recovery_reject_windows = 800U;
+    memset(&output, 0, sizeof(output));
+    bool saw_confirmed = false;
+    for (uint32_t sample = 0U; sample <= 4000U; ++sample) {
+        const uint64_t timestamp = TEST_EPOCH_US +
+                                   ((uint64_t)sample * TEST_PERIOD_US);
+        const float angle = roll_rate_rad_s * (float)sample *
+                            ((float)TEST_PERIOD_US * 1.0e-6f);
+        const float accel[3] = {
+            0.0f,
+            -9.80665f * sinf(angle),
+            -9.80665f * cosf(angle),
+        };
+        push_lane_measurements_validity(&estimator, IMU_SOURCE_BMI088,
+                                        timestamp, sample, rate, accel,
+                                        true, true);
+        push_lane_measurements_validity(&estimator, IMU_SOURCE_ICM45686,
+                                        timestamp, sample, rate, accel,
+                                        true, true);
+        (void)dual_imu_estimator_process_next(&estimator, timestamp, &output);
+        saw_confirmed = saw_confirmed || output.stationary_confirmed;
+        TEST_EXPECT(!output.lane_bias_recovery_reseeded[0]);
+        TEST_EXPECT(!output.lane_bias_recovery_reseeded[1]);
+    }
+    TEST_EXPECT(estimator.zaru_bias_recovery_count == 0U);
+    TEST_EXPECT(!saw_confirmed);
+    for (size_t lane = 0U; lane < DUAL_IMU_ESTIMATOR_LANE_COUNT; ++lane) {
+        TEST_EXPECT(fabsf(output.lane_bias_rad_s[lane][0]) <
+                    degrees_to_radians(0.1f));
+    }
+}
+
 static void test_calibration_convergence_is_revoked_after_bias_shift(void)
 {
     dual_imu_estimator_t estimator = make_estimator();
@@ -2553,6 +2658,181 @@ static void test_common_mode_shock_error_reacquires_level_tilt(void)
     TEST_EXPECT(fabsf(output.euler_rad[1]) < degrees_to_radians(0.5f));
 }
 
+/* Runs one quiet level window and returns the processed output flags. */
+static void run_level_window(dual_imu_estimator_t *estimator,
+                             dual_imu_estimator_output_t *output,
+                             uint32_t sample)
+{
+    const float zero[3] = {0.0f, 0.0f, 0.0f};
+    const float level[3] = {0.0f, 0.0f, -9.80665f};
+    const uint64_t timestamp = TEST_EPOCH_US +
+                               ((uint64_t)sample * TEST_PERIOD_US);
+    push_lane_measurements_validity(estimator, IMU_SOURCE_BMI088,
+                                    timestamp, sample, zero, level,
+                                    true, true);
+    push_lane_measurements_validity(estimator, IMU_SOURCE_ICM45686,
+                                    timestamp, sample, zero, level,
+                                    true, true);
+    (void)dual_imu_estimator_process_next(estimator, timestamp, output);
+}
+
+/* Injects a common-mode false rotation with NO impact notification and both
+ * accels staying valid: no clipping, no impact interval, no disagreement.
+ * This is the undetected-shock case that used to deadlock the NIS gate. */
+static void inject_undetected_shock(dual_imu_estimator_t *estimator,
+                                    dual_imu_estimator_output_t *output,
+                                    float error_degrees)
+{
+    const float level[3] = {0.0f, 0.0f, -9.80665f};
+    const float false_roll_rate[3] = {
+        degrees_to_radians(error_degrees) /
+            (3.0f * (float)TEST_PERIOD_US * 1.0e-6f),
+        0.0f,
+        0.0f,
+    };
+
+    memset(output, 0, sizeof(*output));
+    for (uint32_t sample = 0U; sample <= 12U; ++sample)
+        run_level_window(estimator, output, sample);
+    TEST_EXPECT(output->attitude_converged);
+
+    for (uint32_t sample = 13U; sample <= 15U; ++sample) {
+        const uint64_t timestamp = TEST_EPOCH_US +
+                                   ((uint64_t)sample * TEST_PERIOD_US);
+        push_lane_measurements_validity(estimator, IMU_SOURCE_BMI088,
+                                        timestamp, sample, false_roll_rate,
+                                        level, true, true);
+        push_lane_measurements_validity(estimator, IMU_SOURCE_ICM45686,
+                                        timestamp, sample, false_roll_rate,
+                                        level, true, true);
+        (void)dual_imu_estimator_process_next(estimator, timestamp, output);
+    }
+    TEST_EXPECT(!output->post_impact_reacquire_active);
+    TEST_EXPECT(fabsf(output->euler_rad[0]) >
+                degrees_to_radians(0.6f * error_degrees));
+}
+
+static void test_undetected_shock_recovers_through_nis_inflation(void)
+{
+    dual_imu_estimator_t estimator = make_estimator();
+    estimator.config.accel_recovery_stuck_windows = 20U;
+    estimator.config.accel_recovery_reseed_windows = 400U;
+    estimator.config.accel_recovery_inflation_std_rad =
+        degrees_to_radians(1.5f);
+    dual_imu_estimator_output_t output;
+    /* 15 deg stays inside max_attitude_correction_rad (20 deg), so covariance
+     * inflation alone must recover without the reseed escalation. */
+    inject_undetected_shock(&estimator, &output, 15.0f);
+
+    /* The gate must still be stuck once the streak threshold is reached:
+     * inflation has to earn reconvergence, not a silent early accept. */
+    uint32_t sample = 16U;
+    for (; sample <= 36U; ++sample)
+        run_level_window(&estimator, &output, sample);
+    TEST_EXPECT(fabsf(output.euler_rad[0]) > degrees_to_radians(8.0f));
+
+    bool saw_inflating = false;
+    bool saw_reseed = false;
+    for (; sample <= 400U; ++sample) {
+        run_level_window(&estimator, &output, sample);
+        saw_inflating = saw_inflating ||
+                        output.lane_accel_recovery_inflating[0] ||
+                        output.lane_accel_recovery_inflating[1];
+        saw_reseed = saw_reseed ||
+                     output.lane_accel_recovery_reseeded[0] ||
+                     output.lane_accel_recovery_reseeded[1];
+    }
+
+    TEST_EXPECT(saw_inflating);
+    TEST_EXPECT(!saw_reseed);
+    TEST_EXPECT(fabsf(output.euler_rad[0]) < degrees_to_radians(1.0f));
+    TEST_EXPECT(fabsf(output.euler_rad[1]) < degrees_to_radians(1.0f));
+    /* Rotation stayed observed throughout: inflation must not scramble or
+     * flag the heading gauge. */
+    TEST_EXPECT(fabsf(output.euler_rad[2]) < degrees_to_radians(5.0f));
+    TEST_EXPECT(!output.heading_continuity_lost);
+}
+
+static void test_undetected_shock_reseeds_after_inflation_timeout(void)
+{
+    dual_imu_estimator_t estimator = make_estimator();
+    estimator.config.accel_recovery_stuck_windows = 8U;
+    estimator.config.accel_recovery_reseed_windows = 24U;
+    /* Deliberately too small to reopen the gate before the reseed count. */
+    estimator.config.accel_recovery_inflation_std_rad =
+        degrees_to_radians(0.02f);
+    dual_imu_estimator_output_t output;
+    /* 30 deg exceeds max_attitude_correction_rad, so even a reopened NIS gate
+     * rejects the correction and only the reseed escalation can recover. */
+    inject_undetected_shock(&estimator, &output, 30.0f);
+
+    bool saw_reseed = false;
+    bool saw_reacquire = false;
+    for (uint32_t sample = 16U; sample <= 140U; ++sample) {
+        run_level_window(&estimator, &output, sample);
+        saw_reseed = saw_reseed ||
+                     output.lane_accel_recovery_reseeded[0] ||
+                     output.lane_accel_recovery_reseeded[1];
+        saw_reacquire = saw_reacquire || output.attitude_reacquired;
+    }
+
+    TEST_EXPECT(saw_reseed);
+    TEST_EXPECT(saw_reacquire);
+    TEST_EXPECT(!output.post_impact_reacquire_active);
+    TEST_EXPECT(fabsf(output.euler_rad[0]) < degrees_to_radians(1.0f));
+    TEST_EXPECT(fabsf(output.euler_rad[1]) < degrees_to_radians(1.0f));
+    TEST_EXPECT(fabsf(output.euler_rad[2]) < degrees_to_radians(5.0f));
+}
+
+static void test_sustained_rotation_contamination_never_forced_into_tilt(void)
+{
+    dual_imu_estimator_t estimator = make_estimator();
+    estimator.config.accel_recovery_stuck_windows = 8U;
+    estimator.config.accel_recovery_reseed_windows = 24U;
+    dual_imu_estimator_output_t output;
+    /* Fast yaw with 3 m/s2 of centripetal contamination: the magnitude stays
+     * within the norm tolerance (sqrt(g^2+3^2)-g ~= 0.45 m/s2) but the
+     * direction is ~17 deg off gravity, so the NIS gate rejects every window.
+     * Those rejections are correct dynamics handling, not a stuck gate; the
+     * recovery machinery must hold instead of inflating the covariance open
+     * or reseeding tilt toward the contaminated direction. */
+    const float yaw_rate[3] = {0.0f, 0.0f, degrees_to_radians(200.0f)};
+    const float contaminated[3] = {3.0f, 0.0f, -9.80665f};
+
+    memset(&output, 0, sizeof(output));
+    for (uint32_t sample = 0U; sample <= 12U; ++sample)
+        run_level_window(&estimator, &output, sample);
+    TEST_EXPECT(output.attitude_converged);
+
+    bool saw_inflating = false;
+    bool saw_reseed = false;
+    for (uint32_t sample = 13U; sample <= 400U; ++sample) {
+        const uint64_t timestamp = TEST_EPOCH_US +
+                                   ((uint64_t)sample * TEST_PERIOD_US);
+        push_lane_measurements_validity(&estimator, IMU_SOURCE_BMI088,
+                                        timestamp, sample, yaw_rate,
+                                        contaminated, true, true);
+        push_lane_measurements_validity(&estimator, IMU_SOURCE_ICM45686,
+                                        timestamp, sample, yaw_rate,
+                                        contaminated, true, true);
+        (void)dual_imu_estimator_process_next(&estimator, timestamp, &output);
+        saw_inflating = saw_inflating ||
+                        output.lane_accel_recovery_inflating[0] ||
+                        output.lane_accel_recovery_inflating[1];
+        saw_reseed = saw_reseed ||
+                     output.lane_accel_recovery_reseeded[0] ||
+                     output.lane_accel_recovery_reseeded[1];
+    }
+
+    TEST_EXPECT(!saw_inflating);
+    TEST_EXPECT(!saw_reseed);
+    TEST_EXPECT(estimator.accel_recovery_inflation_count == 0U);
+    TEST_EXPECT(estimator.accel_recovery_reseed_count == 0U);
+    /* Tilt must remain gyro-propagated and clean through the whole burst. */
+    TEST_EXPECT(fabsf(output.euler_rad[0]) < degrees_to_radians(1.0f));
+    TEST_EXPECT(fabsf(output.euler_rad[1]) < degrees_to_radians(1.0f));
+}
+
 static uint32_t induce_dual_filter_fault_during_impact(
     dual_imu_estimator_t *estimator,
     dual_imu_estimator_output_t *output)
@@ -3341,6 +3621,8 @@ int main(void)
     test_physical_roll_is_not_learned_as_gyro_bias();
     test_gravity_aiding_learns_static_observable_bias_before_zaru();
     test_unobservable_static_yaw_rate_is_not_learned_as_bias();
+    test_zaru_bias_recovery_reseeds_diverged_bias();
+    test_zaru_bias_recovery_rejects_slow_tilt_rotation();
     test_calibration_convergence_is_revoked_after_bias_shift();
     test_external_hint_does_not_bypass_stationary_rate_mean_gate();
     test_temporal_gyro_variance_breaks_stationary_dwell();
@@ -3374,6 +3656,9 @@ int main(void)
     test_rotation_unobserved_preserves_learned_bias_state();
     test_common_impact_reacquires_tilt_and_marks_heading_uncertain();
     test_common_mode_shock_error_reacquires_level_tilt();
+    test_undetected_shock_recovers_through_nis_inflation();
+    test_undetected_shock_reseeds_after_inflation_timeout();
+    test_sustained_rotation_contamination_never_forced_into_tilt();
     test_post_impact_dual_filter_fault_reseeds_from_new_windows();
     test_post_impact_recovery_never_clears_sensor_hard_fault();
     test_attitude_aiding_timeout_is_recoverable();

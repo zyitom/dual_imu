@@ -91,9 +91,12 @@ static void mark_frame_heading_lost(uint8_t frame[HI91_FRAME_SIZE])
     uint8_t *const encoded_status =
         &frame[DUAL_IMU_USB_FRAME_STATUS_OFFSET];
     const uint16_t status = read_u16_le(encoded_status);
+    /* Heading loss only raises the private bit7 diagnostic. It does NOT touch
+     * the official ATT_CONV bit: heading continuity is sticky and independent
+     * of tilt convergence, and the host reads bit7 to decide whether to
+     * re-zero yaw. */
     const uint16_t updated =
-        status | DUAL_IMU_USB_STATUS_ATTITUDE_NOT_CONVERGED |
-        DUAL_IMU_USB_STATUS_PRIVATE_HEADING_LOST;
+        (uint16_t)(status | DUAL_IMU_USB_STATUS_PRIVATE_HEADING_LOST);
     if (updated == status)
         return;
 
@@ -258,47 +261,53 @@ static uint16_t build_status(const dual_imu_state_t *state,
                              bool accel_valid,
                              bool gyro_valid)
 {
-    uint16_t status = DUAL_IMU_USB_STATUS_UTC_UNSYNC;
+    uint16_t status = 0U;
     const bool heading_continuity_lost =
         state->heading_continuity_lost &&
         (state->heading_continuity_lost_timestamp_us != 0U) &&
         (attitude->output_timestamp_us >=
          state->heading_continuity_lost_timestamp_us);
-    if (attitude_valid)
-        status |= DUAL_IMU_USB_STATUS_PRIVATE_ATTITUDE_VALID;
-    if (accel_valid)
-        status |= DUAL_IMU_USB_STATUS_PRIVATE_ACCEL_VALID;
     if (gyro_valid)
         status |= DUAL_IMU_USB_STATUS_PRIVATE_GYRO_VALID;
-    if (!selected_bias_is_converged(state, attitude))
-        status |= DUAL_IMU_USB_STATUS_BIAS_NOT_CONVERGED;
+    if (accel_valid)
+        status |= DUAL_IMU_USB_STATUS_PRIVATE_ACCEL_VALID;
+    /* WB_CONV: positive polarity, gyro bias converged. */
+    if (selected_bias_is_converged(state, attitude))
+        status |= DUAL_IMU_USB_STATUS_WB_CONV;
+    /* ACC_SAT: real accel over-range detection (1 = saturated). */
     if (attitude->accel_saturation_recent ||
         saturation_history_is_recent(
             state->motion_guard_accel_saturation_history,
             state->motion_guard_accel_saturation_seen,
             state->motion_guard_last_accel_saturation_us,
             attitude->output_timestamp_us)) {
-        status |= DUAL_IMU_USB_STATUS_ACCEL_SATURATION_RECENT;
+        status |= DUAL_IMU_USB_STATUS_ACC_SAT;
     }
+    /* GYR_SAT: real gyro over-range detection (1 = saturated). */
     if (attitude->gyro_saturation_recent ||
         saturation_history_is_recent(
             state->motion_guard_gyro_saturation_history,
             state->motion_guard_gyro_saturation_seen,
             state->motion_guard_last_gyro_saturation_us,
             attitude->output_timestamp_us)) {
-        status |= DUAL_IMU_USB_STATUS_GYRO_SATURATION_RECENT;
+        status |= DUAL_IMU_USB_STATUS_GYR_SAT;
     }
-    if (!attitude_valid || !attitude->attitude_converged ||
-        attitude->post_impact_reacquire_active ||
-        attitude->attitude_aiding_stale || attitude->rotation_unobserved ||
-        attitude->euler_singular || heading_continuity_lost) {
-        status |= DUAL_IMU_USB_STATUS_ATTITUDE_NOT_CONVERGED;
+    /* ATT_CONV: positive polarity, tilt/attitude convergence only. It does
+     * NOT include heading_continuity_lost: that flag is sticky (the estimator
+     * only ever sets it, never clears it outside init), so folding it in would
+     * pin ATT_CONV to 0 forever. Heading loss lives solely on the private
+     * bit7; the host inspects bit7 to decide whether to re-zero yaw. */
+    if (attitude_valid && attitude->attitude_converged &&
+        !attitude->post_impact_reacquire_active &&
+        !attitude->attitude_aiding_stale && !attitude->rotation_unobserved &&
+        !attitude->euler_singular) {
+        status |= DUAL_IMU_USB_STATUS_ATT_CONV;
     }
     if (heading_continuity_lost) {
         status |= DUAL_IMU_USB_STATUS_PRIVATE_HEADING_LOST;
     }
     if (state->stationary_confirmed)
-        status |= DUAL_IMU_USB_STATUS_STATIONARY;
+        status |= DUAL_IMU_USB_STATUS_PRIVATE_STATIONARY;
     if (state->bmi088_fault_flags != 0U)
         status |= DUAL_IMU_USB_STATUS_PRIVATE_BMI_FAULT;
     if (state->icm45686_fault_flags != 0U)
@@ -330,10 +339,10 @@ static void fill_frame_data(const dual_imu_state_t *state,
         attitude_payload = attitude;
     } else if (last_valid_attitude_available &&
                (attitude->output_timestamp_us >=
-                last_valid_attitude.output_timestamp_us) &&
-               ((attitude->output_timestamp_us -
-                 last_valid_attitude.output_timestamp_us) <=
-                DUAL_IMU_USB_INVALID_HOLD_US)) {
+                last_valid_attitude.output_timestamp_us)) {
+        /* Hold the last valid attitude indefinitely: an all-zero quaternion is
+         * not a legal orientation and would draw a false jump to zero on the
+         * host. Validity bits (ATT_CONV) stay clear, so this is display-only. */
         attitude_payload = &last_valid_attitude;
         stream_diagnostics.attitude_held_frame_count++;
     }
@@ -343,6 +352,11 @@ static void fill_frame_data(const dual_imu_state_t *state,
                 attitude_payload->euler_rad[axis] * DUAL_IMU_USB_RAD_TO_DEG;
         memcpy(data->quaternion, attitude_payload->quaternion,
                sizeof(data->quaternion));
+    } else {
+        /* Never had a valid attitude yet: emit the identity quaternion
+         * (w=1, x=y=z=0) rather than the all-zero memset default. Euler stays
+         * zero. HI91 quaternion is scalar-first (quaternion[0] = w). */
+        data->quaternion[0] = 1.0f;
     }
 
     const fused_accel_lookup_t accel = find_fused_accel(attitude);

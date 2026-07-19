@@ -189,12 +189,23 @@ static void test_field_mapping_and_status(void)
     TEST_EXPECT(read_u16_le(&cdc_capture[2]) == HI91_FRAME_PAYLOAD_SIZE);
     TEST_EXPECT(cdc_capture[6] == HI91_FRAME_TAG);
     const uint16_t expected_status =
-        DUAL_IMU_USB_STATUS_PRIVATE_ATTITUDE_VALID |
-        DUAL_IMU_USB_STATUS_PRIVATE_ACCEL_VALID |
         DUAL_IMU_USB_STATUS_PRIVATE_GYRO_VALID |
-        DUAL_IMU_USB_STATUS_STATIONARY |
-        DUAL_IMU_USB_STATUS_UTC_UNSYNC;
+        DUAL_IMU_USB_STATUS_PRIVATE_ACCEL_VALID |
+        DUAL_IMU_USB_STATUS_PRIVATE_STATIONARY |
+        DUAL_IMU_USB_STATUS_ATT_CONV |
+        DUAL_IMU_USB_STATUS_WB_CONV;
     TEST_EXPECT(read_u16_le(&cdc_capture[7]) == expected_status);
+    /* Unsupported official HI91 bits must be a constant 0 on this hardware. */
+    const uint16_t unsupported_official =
+        DUAL_IMU_USB_STATUS_OD | DUAL_IMU_USB_STATUS_SOUT_PULSE |
+        DUAL_IMU_USB_STATUS_UTC_TIME | DUAL_IMU_USB_STATUS_MAG_AIDING |
+        DUAL_IMU_USB_STATUS_MAG_DIST;
+    TEST_EXPECT((read_u16_le(&cdc_capture[7]) & unsupported_official) == 0U);
+    /* Regression: a stationary board must NOT set the official GYR_SAT (bit9)
+     * or ACC_SAT (bit10). The old layout aliased STATIONARY onto bit9. */
+    TEST_EXPECT((read_u16_le(&cdc_capture[7]) &
+                 (DUAL_IMU_USB_STATUS_GYR_SAT |
+                  DUAL_IMU_USB_STATUS_ACC_SAT)) == 0U);
     TEST_EXPECT((int8_t)cdc_capture[9] == INT8_C(35));
     TEST_EXPECT(read_u32_le(&cdc_capture[14]) == UINT32_C(1234));
     TEST_EXPECT(nearly_equal(read_float_le(&cdc_capture[18]), 1.0f, 1.0e-6f));
@@ -224,7 +235,7 @@ static void test_field_mapping_and_status(void)
     TEST_EXPECT(diagnostics.queued_frame_count == 0U);
 }
 
-static void test_invalid_data_is_zeroed(void)
+static void test_invalid_data_emits_identity_quaternion_when_never_valid(void)
 {
     reset_fakes();
     dual_imu_usb_stream_init();
@@ -241,13 +252,21 @@ static void test_invalid_data_is_zeroed(void)
     dual_imu_usb_stream_process(&state);
 
     const uint16_t status = read_u16_le(&cdc_capture[7]);
-    TEST_EXPECT((status & DUAL_IMU_USB_STATUS_PRIVATE_ATTITUDE_VALID) == 0U);
+    TEST_EXPECT((status & DUAL_IMU_USB_STATUS_ATT_CONV) == 0U);
     TEST_EXPECT((status & DUAL_IMU_USB_STATUS_PRIVATE_ACCEL_VALID) == 0U);
     TEST_EXPECT((status & DUAL_IMU_USB_STATUS_PRIVATE_GYRO_VALID) == 0U);
-    TEST_EXPECT((status & DUAL_IMU_USB_STATUS_BIAS_NOT_CONVERGED) != 0U);
-    TEST_EXPECT((status & DUAL_IMU_USB_STATUS_ATTITUDE_NOT_CONVERGED) != 0U);
-    TEST_EXPECT((status & DUAL_IMU_USB_STATUS_UTC_UNSYNC) != 0U);
-    for (size_t byte = 18U; byte < HI91_FRAME_SIZE; ++byte)
+    TEST_EXPECT((status & DUAL_IMU_USB_STATUS_WB_CONV) == 0U);
+    /* bit11 (MAG_DIST) must no longer be a constant 1 as the old
+     * UTC_UNSYNC bit was. */
+    TEST_EXPECT((status & DUAL_IMU_USB_STATUS_MAG_DIST) == 0U);
+
+    /* No valid attitude has ever been seen: the quaternion field must carry
+     * the identity (w=1, x=y=z=0), never an all-zero non-orientation. */
+    TEST_EXPECT(nearly_equal(read_float_le(&cdc_capture[66]), 1.0f, 1.0e-6f));
+    /* Accel, gyro and euler stay zero; only quaternion[0] is non-zero. */
+    for (size_t byte = 18U; byte < 66U; ++byte)
+        TEST_EXPECT(cdc_capture[byte] == 0U);
+    for (size_t byte = 70U; byte < HI91_FRAME_SIZE; ++byte)
         TEST_EXPECT(cdc_capture[byte] == 0U);
 }
 
@@ -280,11 +299,9 @@ static void test_brief_invalid_frame_holds_payload_but_clears_validity(void)
     dual_imu_usb_stream_process(&state);
 
     const uint16_t status = read_u16_le(&cdc_capture[7]);
-    TEST_EXPECT((status & DUAL_IMU_USB_STATUS_PRIVATE_ATTITUDE_VALID) == 0U);
+    TEST_EXPECT((status & DUAL_IMU_USB_STATUS_ATT_CONV) == 0U);
     TEST_EXPECT((status & DUAL_IMU_USB_STATUS_PRIVATE_ACCEL_VALID) == 0U);
     TEST_EXPECT((status & DUAL_IMU_USB_STATUS_PRIVATE_GYRO_VALID) == 0U);
-    TEST_EXPECT((status &
-                 DUAL_IMU_USB_STATUS_ATTITUDE_NOT_CONVERGED) != 0U);
     TEST_EXPECT(nearly_equal(read_float_le(&cdc_capture[18]), 1.0f, 1.0e-6f));
     TEST_EXPECT(nearly_equal(read_float_le(&cdc_capture[30]), 180.0f, 1.0e-4f));
     TEST_EXPECT(nearly_equal(read_float_le(&cdc_capture[54]), 90.0f, 1.0e-4f));
@@ -296,7 +313,7 @@ static void test_brief_invalid_frame_holds_payload_but_clears_validity(void)
     TEST_EXPECT(diagnostics.accel_held_frame_count == 1U);
 }
 
-static void test_invalid_hold_expires(void)
+static void test_invalid_past_old_window_keeps_holding_attitude(void)
 {
     reset_fakes();
     dual_imu_usb_stream_init();
@@ -310,18 +327,24 @@ static void test_invalid_hold_expires(void)
 
     dual_imu_attitude_output_t invalid = make_attitude(2U);
     invalid.valid = false;
+    /* Well beyond the former 20 ms invalid-hold cap: the attitude must still
+     * be held (never an all-zero quaternion) so the host does not draw a jump
+     * to zero. ATT_CONV must stay clear because the frame is invalid. */
     invalid.output_timestamp_us = valid.output_timestamp_us +
-                                  DUAL_IMU_USB_INVALID_HOLD_US + 1U;
+                                  (10U * DUAL_IMU_USB_INVALID_HOLD_US);
     push_attitude(invalid);
     dual_imu_usb_stream_process(&state);
 
     const uint16_t status = read_u16_le(&cdc_capture[7]);
-    TEST_EXPECT((status & DUAL_IMU_USB_STATUS_PRIVATE_ATTITUDE_VALID) == 0U);
+    TEST_EXPECT((status & DUAL_IMU_USB_STATUS_ATT_CONV) == 0U);
     TEST_EXPECT((status & DUAL_IMU_USB_STATUS_PRIVATE_GYRO_VALID) == 0U);
-    TEST_EXPECT((status &
-                 DUAL_IMU_USB_STATUS_ATTITUDE_NOT_CONVERGED) != 0U);
-    for (size_t byte = 30U; byte < HI91_FRAME_SIZE; ++byte)
-        TEST_EXPECT(cdc_capture[byte] == 0U);
+    /* Held orientation is still present: quaternion[0]=1, euler[0]=90 deg. */
+    TEST_EXPECT(nearly_equal(read_float_le(&cdc_capture[66]), 1.0f, 1.0e-6f));
+    TEST_EXPECT(nearly_equal(read_float_le(&cdc_capture[54]), 90.0f, 1.0e-4f));
+
+    dual_imu_usb_stream_diagnostics_t diagnostics;
+    dual_imu_usb_stream_get_diagnostics(&diagnostics);
+    TEST_EXPECT(diagnostics.attitude_held_frame_count == 1U);
 }
 
 static void test_busy_queue_drop_and_disconnect_flush(void)
@@ -558,30 +581,30 @@ static void test_convergence_status_uses_active_low_quality_semantics(void)
     push_attitude(attitude);
     dual_imu_usb_stream_process(&state);
     uint16_t status = captured_status(0U);
-    TEST_EXPECT((status & DUAL_IMU_USB_STATUS_BIAS_NOT_CONVERGED) != 0U);
-    TEST_EXPECT((status & DUAL_IMU_USB_STATUS_ATTITUDE_NOT_CONVERGED) != 0U);
+    TEST_EXPECT((status & DUAL_IMU_USB_STATUS_WB_CONV) == 0U);
+    TEST_EXPECT((status & DUAL_IMU_USB_STATUS_ATT_CONV) == 0U);
 
     state.icm45686_calibrated = true;
     attitude = make_attitude(2U);
     push_attitude(attitude);
     dual_imu_usb_stream_process(&state);
     status = captured_status(0U);
-    TEST_EXPECT((status & DUAL_IMU_USB_STATUS_BIAS_NOT_CONVERGED) == 0U);
-    TEST_EXPECT((status & DUAL_IMU_USB_STATUS_ATTITUDE_NOT_CONVERGED) == 0U);
+    TEST_EXPECT((status & DUAL_IMU_USB_STATUS_WB_CONV) != 0U);
+    TEST_EXPECT((status & DUAL_IMU_USB_STATUS_ATT_CONV) != 0U);
 
     attitude = make_attitude(3U);
     attitude.post_impact_reacquire_active = true;
     push_attitude(attitude);
     dual_imu_usb_stream_process(&state);
     status = captured_status(0U);
-    TEST_EXPECT((status & DUAL_IMU_USB_STATUS_ATTITUDE_NOT_CONVERGED) != 0U);
+    TEST_EXPECT((status & DUAL_IMU_USB_STATUS_ATT_CONV) == 0U);
 
     attitude = make_attitude(4U);
     attitude.euler_singular = true;
     push_attitude(attitude);
     dual_imu_usb_stream_process(&state);
     status = captured_status(0U);
-    TEST_EXPECT((status & DUAL_IMU_USB_STATUS_ATTITUDE_NOT_CONVERGED) != 0U);
+    TEST_EXPECT((status & DUAL_IMU_USB_STATUS_ATT_CONV) == 0U);
 }
 
 static void test_convergence_status_is_frame_causal_across_backlog(void)
@@ -605,9 +628,9 @@ static void test_convergence_status_is_frame_causal_across_backlog(void)
     dual_imu_usb_stream_process(&state);
 
     TEST_EXPECT((captured_status(0U) &
-                 DUAL_IMU_USB_STATUS_ATTITUDE_NOT_CONVERGED) == 0U);
+                 DUAL_IMU_USB_STATUS_ATT_CONV) != 0U);
     TEST_EXPECT((captured_status(1U) &
-                 DUAL_IMU_USB_STATUS_ATTITUDE_NOT_CONVERGED) != 0U);
+                 DUAL_IMU_USB_STATUS_ATT_CONV) == 0U);
 
     reset_fakes();
     dual_imu_usb_stream_init();
@@ -622,12 +645,12 @@ static void test_convergence_status_is_frame_causal_across_backlog(void)
     dual_imu_usb_stream_process(&state);
 
     TEST_EXPECT((captured_status(0U) &
-                 DUAL_IMU_USB_STATUS_ATTITUDE_NOT_CONVERGED) != 0U);
+                 DUAL_IMU_USB_STATUS_ATT_CONV) == 0U);
     TEST_EXPECT((captured_status(1U) &
-                 DUAL_IMU_USB_STATUS_ATTITUDE_NOT_CONVERGED) == 0U);
+                 DUAL_IMU_USB_STATUS_ATT_CONV) != 0U);
 }
 
-static void test_heading_loss_forces_public_convergence_status_causally(void)
+static void test_heading_loss_sets_private_bit_without_touching_att_conv(void)
 {
     reset_fakes();
     dual_imu_usb_stream_init();
@@ -645,14 +668,17 @@ static void test_heading_loss_forces_public_convergence_status_causally(void)
     push_attitude(at_event);
     dual_imu_usb_stream_process(&state);
 
+    /* Before the event: no heading-lost bit. At/after the event: private bit7
+     * is raised, but the sticky heading loss must NOT clear ATT_CONV. Both
+     * frames carry a converged tilt attitude, so ATT_CONV stays set. */
     TEST_EXPECT((captured_status(0U) &
                  DUAL_IMU_USB_STATUS_PRIVATE_HEADING_LOST) == 0U);
     TEST_EXPECT((captured_status(0U) &
-                 DUAL_IMU_USB_STATUS_ATTITUDE_NOT_CONVERGED) == 0U);
+                 DUAL_IMU_USB_STATUS_ATT_CONV) != 0U);
     TEST_EXPECT((captured_status(1U) &
                  DUAL_IMU_USB_STATUS_PRIVATE_HEADING_LOST) != 0U);
     TEST_EXPECT((captured_status(1U) &
-                 DUAL_IMU_USB_STATUS_ATTITUDE_NOT_CONVERGED) != 0U);
+                 DUAL_IMU_USB_STATUS_ATT_CONV) != 0U);
 }
 
 static void test_late_heading_event_patches_only_post_event_encoded_frames(void)
@@ -693,11 +719,12 @@ static void test_late_heading_event_patches_only_post_event_encoded_frames(void)
     TEST_EXPECT((captured_status(0U) &
                  DUAL_IMU_USB_STATUS_PRIVATE_HEADING_LOST) == 0U);
     TEST_EXPECT((captured_status(0U) &
-                 DUAL_IMU_USB_STATUS_ATTITUDE_NOT_CONVERGED) == 0U);
+                 DUAL_IMU_USB_STATUS_ATT_CONV) != 0U);
     TEST_EXPECT((captured_status(1U) &
                  DUAL_IMU_USB_STATUS_PRIVATE_HEADING_LOST) != 0U);
+    /* Patch only raises bit7; the converged ATT_CONV bit is left untouched. */
     TEST_EXPECT((captured_status(1U) &
-                 DUAL_IMU_USB_STATUS_ATTITUDE_NOT_CONVERGED) != 0U);
+                 DUAL_IMU_USB_STATUS_ATT_CONV) != 0U);
     TEST_EXPECT(captured_crc_is_valid(0U));
     TEST_EXPECT(captured_crc_is_valid(1U));
     dual_imu_usb_stream_get_diagnostics(&diagnostics);
@@ -714,7 +741,7 @@ static void test_late_heading_event_patches_only_post_event_encoded_frames(void)
     TEST_EXPECT((captured_status(0U) &
                  DUAL_IMU_USB_STATUS_PRIVATE_HEADING_LOST) != 0U);
     TEST_EXPECT((captured_status(0U) &
-                 DUAL_IMU_USB_STATUS_ATTITUDE_NOT_CONVERGED) != 0U);
+                 DUAL_IMU_USB_STATUS_ATT_CONV) != 0U);
     TEST_EXPECT(captured_crc_is_valid(0U));
 }
 
@@ -755,8 +782,9 @@ static void test_three_window_confirmation_backfills_first_suspect(void)
     TEST_EXPECT(diagnostics.heading_event_queue_patch_count == 2U);
     TEST_EXPECT((captured_status(0U) &
                  DUAL_IMU_USB_STATUS_PRIVATE_HEADING_LOST) != 0U);
+    /* Patch raises bit7 only; ATT_CONV stays set on this converged frame. */
     TEST_EXPECT((captured_status(0U) &
-                 DUAL_IMU_USB_STATUS_ATTITUDE_NOT_CONVERGED) != 0U);
+                 DUAL_IMU_USB_STATUS_ATT_CONV) != 0U);
     TEST_EXPECT(captured_crc_is_valid(0U));
 
     state.estimator_assessed_through_us =
@@ -908,8 +936,8 @@ static void test_saturation_status_is_frame_causal_and_holds_two_seconds(void)
     dual_imu_usb_stream_process(&state);
 
     const uint16_t saturation_mask =
-        DUAL_IMU_USB_STATUS_ACCEL_SATURATION_RECENT |
-        DUAL_IMU_USB_STATUS_GYRO_SATURATION_RECENT;
+        DUAL_IMU_USB_STATUS_ACC_SAT |
+        DUAL_IMU_USB_STATUS_GYR_SAT;
     TEST_EXPECT((captured_status(0U) & saturation_mask) == 0U);
     TEST_EXPECT((captured_status(1U) & saturation_mask) == saturation_mask);
     TEST_EXPECT((captured_status(2U) & saturation_mask) == saturation_mask);
@@ -928,7 +956,7 @@ static void test_saturation_status_is_frame_causal_and_holds_two_seconds(void)
 
     const uint16_t status = captured_status(0U);
     TEST_EXPECT((status & saturation_mask) == saturation_mask);
-    TEST_EXPECT((status & DUAL_IMU_USB_STATUS_PRIVATE_ATTITUDE_VALID) == 0U);
+    TEST_EXPECT((status & DUAL_IMU_USB_STATUS_ATT_CONV) == 0U);
     TEST_EXPECT((status & DUAL_IMU_USB_STATUS_PRIVATE_GYRO_VALID) == 0U);
     TEST_EXPECT(nearly_equal(read_float_le(&cdc_capture[30]),
                              180.0f, 1.0e-4f));
@@ -974,11 +1002,11 @@ static void test_saturation_status_retains_prior_causal_window(void)
     dual_imu_usb_stream_process(&state);
 
     TEST_EXPECT((captured_status(0U) &
-                 DUAL_IMU_USB_STATUS_ACCEL_SATURATION_RECENT) != 0U);
+                 DUAL_IMU_USB_STATUS_ACC_SAT) != 0U);
     TEST_EXPECT((captured_status(1U) &
-                 DUAL_IMU_USB_STATUS_ACCEL_SATURATION_RECENT) == 0U);
+                 DUAL_IMU_USB_STATUS_ACC_SAT) == 0U);
     TEST_EXPECT((captured_status(2U) &
-                 DUAL_IMU_USB_STATUS_ACCEL_SATURATION_RECENT) != 0U);
+                 DUAL_IMU_USB_STATUS_ACC_SAT) != 0U);
 }
 
 static void test_frame_snapshot_survives_long_history_backlog(void)
@@ -1026,8 +1054,8 @@ static void test_frame_snapshot_survives_long_history_backlog(void)
     dual_imu_usb_stream_process(&state);
 
     const uint16_t saturation_mask =
-        DUAL_IMU_USB_STATUS_ACCEL_SATURATION_RECENT |
-        DUAL_IMU_USB_STATUS_GYRO_SATURATION_RECENT;
+        DUAL_IMU_USB_STATUS_ACC_SAT |
+        DUAL_IMU_USB_STATUS_GYR_SAT;
     for (uint16_t index = 0U; index < 4U; ++index)
         TEST_EXPECT((captured_status(index) & saturation_mask) ==
                     saturation_mask);
@@ -1053,9 +1081,9 @@ static void test_new_usb_session_does_not_clear_device_saturation_history(void)
     dual_imu_usb_stream_process(&state);
 
     TEST_EXPECT((captured_status(0U) &
-                 DUAL_IMU_USB_STATUS_ACCEL_SATURATION_RECENT) != 0U);
+                 DUAL_IMU_USB_STATUS_ACC_SAT) != 0U);
     TEST_EXPECT((captured_status(0U) &
-                 DUAL_IMU_USB_STATUS_GYRO_SATURATION_RECENT) == 0U);
+                 DUAL_IMU_USB_STATUS_GYR_SAT) == 0U);
 
     state.motion_guard_accel_saturation_seen = false;
     state.motion_guard_gyro_saturation_seen = true;
@@ -1065,17 +1093,17 @@ static void test_new_usb_session_does_not_clear_device_saturation_history(void)
     push_attitude(attitude);
     dual_imu_usb_stream_process(&state);
     TEST_EXPECT((captured_status(0U) &
-                 DUAL_IMU_USB_STATUS_ACCEL_SATURATION_RECENT) == 0U);
+                 DUAL_IMU_USB_STATUS_ACC_SAT) == 0U);
     TEST_EXPECT((captured_status(0U) &
-                 DUAL_IMU_USB_STATUS_GYRO_SATURATION_RECENT) != 0U);
+                 DUAL_IMU_USB_STATUS_GYR_SAT) != 0U);
 }
 
 int main(void)
 {
     test_field_mapping_and_status();
-    test_invalid_data_is_zeroed();
+    test_invalid_data_emits_identity_quaternion_when_never_valid();
     test_brief_invalid_frame_holds_payload_but_clears_validity();
-    test_invalid_hold_expires();
+    test_invalid_past_old_window_keeps_holding_attitude();
     test_busy_queue_drop_and_disconnect_flush();
     test_closed_port_discards_without_a_drop();
     test_not_ready_skips_transmit_and_retries();
@@ -1086,7 +1114,7 @@ int main(void)
     test_producer_drop_status_is_session_relative();
     test_convergence_status_uses_active_low_quality_semantics();
     test_convergence_status_is_frame_causal_across_backlog();
-    test_heading_loss_forces_public_convergence_status_causally();
+    test_heading_loss_sets_private_bit_without_touching_att_conv();
     test_late_heading_event_patches_only_post_event_encoded_frames();
     test_three_window_confirmation_backfills_first_suspect();
     test_integrity_holdback_releases_at_exact_assessment_boundary();

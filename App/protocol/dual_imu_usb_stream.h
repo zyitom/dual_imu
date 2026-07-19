@@ -22,21 +22,38 @@ extern "C" {
 #define DUAL_IMU_USB_SATURATION_HOLD_US \
     IMU_MOTION_GUARD_STATUS_SATURATION_HOLD_US
 
+/*
+ * MAIN_STATUS bitfield follows the official HiPNUC HI91 status word so the
+ * host decoder can be used unmodified. Bits the host reads as "converged /
+ * healthy" are POSITIVE polarity (1 = good). This hardware has no odometer,
+ * no UTC source and no magnetometer, so those official bits are wired to a
+ * constant 0. HI91 Reserved positions (bit0-1, bit6-7, bit13-15) carry our
+ * private diagnostics; a stock HiPNUC host ignores them.
+ */
 typedef enum
 {
-    DUAL_IMU_USB_STATUS_PRIVATE_ATTITUDE_VALID = (1U << 0),
+    /* --- Private diagnostics (HI91 Reserved bit0-1) --- */
+    DUAL_IMU_USB_STATUS_PRIVATE_GYRO_VALID = (1U << 0),
     DUAL_IMU_USB_STATUS_PRIVATE_ACCEL_VALID = (1U << 1),
-    DUAL_IMU_USB_STATUS_PRIVATE_GYRO_VALID = (1U << 2),
-    DUAL_IMU_USB_STATUS_BIAS_NOT_CONVERGED = (1U << 3),
-    DUAL_IMU_USB_STATUS_MAG_DISTURBED = (1U << 4),
-    DUAL_IMU_USB_STATUS_ACCEL_SATURATION_RECENT = (1U << 5),
-    DUAL_IMU_USB_STATUS_GYRO_SATURATION_RECENT = (1U << 6),
-    DUAL_IMU_USB_STATUS_ATTITUDE_NOT_CONVERGED = (1U << 7),
-    DUAL_IMU_USB_STATUS_PRIVATE_HEADING_LOST = (1U << 8),
-    DUAL_IMU_USB_STATUS_STATIONARY = (1U << 9),
-    DUAL_IMU_USB_STATUS_MAG_AIDING = (1U << 10),
-    DUAL_IMU_USB_STATUS_UTC_UNSYNC = (1U << 11),
-    DUAL_IMU_USB_STATUS_SOUT_PULSE = (1U << 12),
+
+    /* --- Official HI91 bits, unsupported on this hardware (always 0) --- */
+    DUAL_IMU_USB_STATUS_OD = (1U << 2),         /* odometer: none */
+    DUAL_IMU_USB_STATUS_SOUT_PULSE = (1U << 3), /* sync-out pulse: none */
+    DUAL_IMU_USB_STATUS_UTC_TIME = (1U << 4),   /* UTC synced: never */
+    DUAL_IMU_USB_STATUS_MAG_AIDING = (1U << 5), /* mag in fusion: never */
+
+    /* --- Private diagnostics (HI91 Reserved bit6-7) --- */
+    DUAL_IMU_USB_STATUS_PRIVATE_STATIONARY = (1U << 6),
+    DUAL_IMU_USB_STATUS_PRIVATE_HEADING_LOST = (1U << 7),
+
+    /* --- Official HI91 bits, live semantics --- */
+    DUAL_IMU_USB_STATUS_ATT_CONV = (1U << 8), /* attitude converged (positive) */
+    DUAL_IMU_USB_STATUS_GYR_SAT = (1U << 9),  /* gyro over-range */
+    DUAL_IMU_USB_STATUS_ACC_SAT = (1U << 10), /* accel over-range */
+    DUAL_IMU_USB_STATUS_MAG_DIST = (1U << 11), /* mag disturbance: none, always 0 */
+    DUAL_IMU_USB_STATUS_WB_CONV = (1U << 12), /* gyro bias converged (positive) */
+
+    /* --- Private diagnostics (HI91 Reserved bit13-15) --- */
     DUAL_IMU_USB_STATUS_PRIVATE_BMI_FAULT = (1U << 13),
     DUAL_IMU_USB_STATUS_PRIVATE_ICM_FAULT = (1U << 14),
     DUAL_IMU_USB_STATUS_PRIVATE_STREAM_DROP = (1U << 15)

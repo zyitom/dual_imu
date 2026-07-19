@@ -107,8 +107,6 @@ static sample_monitor_t sample_monitors[IMU_SOURCE_COUNT];
 static irq_event_t bmi_accel_irq;
 static irq_event_t bmi_gyro_irq;
 static irq_event_t icm_irq;
-static imu_accel_buffer_t accel_buffers[IMU_SOURCE_COUNT];
-static imu_gyro_buffer_t gyro_buffers[IMU_SOURCE_COUNT];
 static uint32_t bmi_combined_sequence;
 static uint64_t init_time_us;
 static imu_motion_guard_t motion_guard;
@@ -288,6 +286,8 @@ static bool sample_is_sane(const imu_sample_t *sample)
            (vector_norm(sample->gyro_rad_s) < 80.0f);
 }
 
+/* Both IMUs are mounted ROTATION_PITCH_180 on DM-FC01 (board manual,
+ * "IMU 配置": BMI088 and ICM45686 both list 旋转方向 ROTATION_PITCH_180). */
 static void rotate_accel_pitch_180(imu_accel_sample_t *sample)
 {
     sample->accel_mps2[0] = -sample->accel_mps2[0];
@@ -690,7 +690,6 @@ static void ingest_accel_sample(imu_accel_sample_t *sample,
     } else {
         reset_accel_monitor(source);
     }
-    imu_accel_buffer_push(&accel_buffers[source], sample);
 
     if (estimator_initialized && timestamp_trusted) {
         imu_accel_sample_t corrected = *sample;
@@ -761,7 +760,6 @@ static void ingest_gyro_sample(imu_gyro_sample_t *sample,
     } else {
         reset_gyro_monitor(source);
     }
-    imu_gyro_buffer_push(&gyro_buffers[source], sample);
 
     if (estimator_initialized && timestamp_trusted) {
         imu_gyro_sample_t corrected = *sample;
@@ -1459,10 +1457,8 @@ bool dual_imu_init(void)
            sizeof(capture_overrun_accounted_count));
     memset(capture_overrun_reported_count, 0,
            sizeof(capture_overrun_reported_count));
-    for (uint32_t source = 0U; source < IMU_SOURCE_COUNT; source++) {
-        imu_accel_buffer_reset(&accel_buffers[source]);
-        imu_gyro_buffer_reset(&gyro_buffers[source]);
 #if IMU_CALIBRATION_G_SENSITIVITY_BUILD_ENABLE == 1
+    for (uint32_t source = 0U; source < IMU_SOURCE_COUNT; source++) {
         imu_calibration_t calibration;
         if (!imu_calibration_get((imu_source_t)source, &calibration) ||
             !imu_causal_accel_history_init(
@@ -1472,8 +1468,8 @@ bool dual_imu_init(void)
                 calibration.maximum_g_sensitivity_accel_age_us)) {
             return false;
         }
-#endif
     }
+#endif
     bmi_combined_sequence = 0U;
     estimator_initialized = false;
     fast_predictor_initialized = false;
@@ -1753,15 +1749,6 @@ void dual_imu_process(void)
     state.icm45686_event_drop_count =
         imu_timestamp_queue_dropped(&icm_irq.timestamps) +
         coalesced_event_count[IMU_SOURCE_ICM45686][IMU_STREAM_GYRO];
-    state.bmi088_accel_buffer_overwrite_count =
-        imu_accel_buffer_overwritten(&accel_buffers[IMU_SOURCE_BMI088]);
-    state.bmi088_gyro_buffer_overwrite_count =
-        imu_gyro_buffer_overwritten(&gyro_buffers[IMU_SOURCE_BMI088]);
-    state.icm45686_accel_buffer_overwrite_count =
-        imu_accel_buffer_overwritten(&accel_buffers[IMU_SOURCE_ICM45686]);
-    state.icm45686_gyro_buffer_overwrite_count =
-        imu_gyro_buffer_overwritten(&gyro_buffers[IMU_SOURCE_ICM45686]);
-
     imu_motion_guard_diagnostics_t motion_diagnostics;
     imu_motion_guard_get_diagnostics(&motion_guard, now_us,
                                      &motion_diagnostics);
@@ -2207,24 +2194,6 @@ bool dual_imu_set_gyro_g_sensitivity_enabled(imu_source_t source,
             source, &state.calibration_diagnostics[source]);
     }
     return accepted;
-}
-
-bool dual_imu_pop_accel(imu_source_t source, imu_accel_sample_t *sample)
-{
-    if ((source >= IMU_SOURCE_COUNT) || (sample == NULL))
-    {
-        return false;
-    }
-    return imu_accel_buffer_pop(&accel_buffers[source], sample);
-}
-
-bool dual_imu_pop_gyro(imu_source_t source, imu_gyro_sample_t *sample)
-{
-    if ((source >= IMU_SOURCE_COUNT) || (sample == NULL))
-    {
-        return false;
-    }
-    return imu_gyro_buffer_pop(&gyro_buffers[source], sample);
 }
 
 const dual_imu_state_t *dual_imu_get_state(void)

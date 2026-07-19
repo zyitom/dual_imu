@@ -1,0 +1,520 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>双 IMU 姿态融合 — 完整数学推导</title>
+<script>
+MathJax = {
+  tex: {
+    tags: 'ams',
+    inlineMath: [['\\(','\\)']],
+    displayMath: [['\\[','\\]'], ['\\begin{equation}','\\end{equation}'], ['\\begin{align}','\\end{align}']],
+    macros: {
+      bm: ['\\boldsymbol{#1}',1],
+      bs: ['\\boldsymbol{#1}',1],
+      norm: ['\\lVert#1\\rVert', 1],
+      exp: ['\\mathop{\\mathrm{exp}}\\nolimits ']
+    }
+  },
+  chtml: {
+    scale: 1
+  },
+  options: {
+    skipHtmlTags: ['script','noscript','style','textarea','pre','code']
+  }
+};
+</script>
+<!-- 优先用国内CDN，不可用时回退到jsdelivr -->
+<script src="https://registry.npmmirror.com/mathjax/3.2.2/files/es5/tex-chtml-full.js" async
+  onerror="var s=document.createElement('script');s.src='https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml-full.js';s.async=true;document.head.appendChild(s);">
+</script>
+<style>
+body {
+  font-family: "Noto Serif CJK SC", "Source Han Serif SC", "SimSun", serif;
+  max-width: 880px;
+  margin: 40px auto;
+  padding: 0 20px;
+  line-height: 1.7;
+  color: #222;
+}
+h1, h2, h3 { font-weight: bold; }
+h1 { font-size: 1.8em; border-bottom: 2px solid #333; padding-bottom: 6px; }
+h2 { font-size: 1.4em; border-bottom: 1px solid #aaa; padding-bottom: 4px; margin-top: 2em; }
+pre { background: #f7f7f7; padding: 12px; overflow-x: auto; border-radius: 4px; }
+code { font-family: "Fira Code", monospace; }
+table { border-collapse: collapse; margin: 1em 0; }
+th, td { border: 1px solid #ccc; padding: 6px 12px; }
+th { background: #f0f0f0; }
+</style>
+</head>
+<body>
+
+<h1>双 IMU 姿态融合 — 完整数学推导</h1>
+
+<h2>第〇章：坐标系与符号约定</h2>
+
+<p><strong>机体系 (Body):</strong> FRD — X:Forward, Y:Right, Z:Down<br>
+<strong>世界系 (World):</strong> NED — X:North, Y:East, Z:Down<br>
+<strong>四元数顺序:</strong> \([w, x, y, z]\) (Hamilton convention)<br>
+<strong>四元数乘法:</strong> \(q_1 \otimes q_2\) — 先旋转 \(q_2\) 再旋转 \(q_1\)<br>
+<strong>旋转方向:</strong> \(q\) 将 body 向量旋转到 world 向量</p>
+
+<p>四元数乘法（Hamilton convention）：</p>
+
+\begin{equation}
+q_1 \otimes q_2 = \begin{bmatrix}
+w_1 w_2 - x_1 x_2 - y_1 y_2 - z_1 z_2 \\
+w_1 x_2 + x_1 w_2 + y_1 z_2 - z_1 y_2 \\
+w_1 y_2 - x_1 z_2 + y_1 w_2 + z_1 x_2 \\
+w_1 z_2 + x_1 y_2 - y_1 x_2 + z_1 w_2
+\end{bmatrix}
+\end{equation}
+
+<h2>第一章：IMU 测量模型</h2>
+
+<h3>1.1 陀螺测量</h3>
+
+\begin{equation}
+\boldsymbol{\omega}_m(t) = \boldsymbol{\omega}(t) + \mathbf{b}_g(t) + \boldsymbol{\eta}_g(t) \tag{1.1}
+\end{equation}
+<p>其中：</p>
+<ul>
+<li>\(\boldsymbol{\omega}(t)\) — 真实角速度</li>
+<li>\(\mathbf{b}_g(t)\) — 陀螺偏置（随机游走建模）</li>
+<li>\(\boldsymbol{\eta}_g(t)\) — 白噪声，\(\mathbb{E}[\boldsymbol{\eta}_g] = 0\)，\(\mathbb{E}[\boldsymbol{\eta}_g(t)\boldsymbol{\eta}_g(\tau)^T] = \boldsymbol{\Sigma}_g \delta(t-\tau)\)</li>
+</ul>
+
+<p>偏置动态：</p>
+\begin{equation}
+\dot{\mathbf{b}}_g(t) = \boldsymbol{\eta}_b(t), \quad \mathbb{E}[\boldsymbol{\eta}_b(t)\boldsymbol{\eta}_b(\tau)^T] = \boldsymbol{\Sigma}_b \delta(t-\tau) \tag{1.2}
+\end{equation}
+
+<h3>1.2 加速度计测量</h3>
+\begin{equation}
+\mathbf{a}_m(t) = \mathbf{R}^{WB}(t)(\mathbf{a}^W(t) - \mathbf{g}^W) + \boldsymbol{\eta}_a(t) \tag{1.3}
+\end{equation}
+<p>其中 \(\mathbf{g}^W = [0, 0, 9.80665]^T\)（NED 中重力沿 +Z Down）。<br>
+关键假设：飞行器通常 \(\mathbf{a}^W \approx 0\)（非机动状态），于是：</p>
+\begin{equation}
+\mathbf{a}_m \approx \mathbf{R}^{WB}(-\mathbf{g}^W) \tag{1.4}
+\end{equation}
+<p>这就是重力矢量观测：加速度计读数在机体系中的方向指向天空的反方向（Down），可以用来观测 roll 和 pitch。</p>
+
+<h2>第二章：四元数运动学</h2>
+
+<h3>2.1 连续时间</h3>
+\begin{equation}
+\dot{\mathbf{q}} = \frac{1}{2} \boldsymbol{\Omega}(\boldsymbol{\omega}) \mathbf{q} \tag{2.1}
+\end{equation}
+其中：
+\begin{equation}
+\boldsymbol{\Omega}(\boldsymbol{\omega}) = \begin{bmatrix}
+0 & -\omega_x & -\omega_y & -\omega_z \\
+\omega_x & 0 & \omega_z & -\omega_y \\
+\omega_y & -\omega_z & 0 & \omega_x \\
+\omega_z & \omega_y & -\omega_x & 0
+\end{bmatrix}
+\end{equation}
+
+<h3>2.2 离散时间（零阶保持）</h3>
+<p>在小时间区间 \([t_k, t_{k+1}]\) 内假设角速度为常值，角增量 \(\boldsymbol{\delta}_k = \int_{t_k}^{t_{k+1}} \boldsymbol{\omega}(t)dt\)：</p>
+\begin{equation}
+\mathbf{q}_{k+1} = \mathbf{q}_k \otimes \begin{bmatrix}
+\cos(|\boldsymbol{\delta}_k| / 2) \\
+\frac{\boldsymbol{\delta}_k}{|\boldsymbol{\delta}_k|} \sin(|\boldsymbol{\delta}_k| / 2)
+\end{bmatrix} \tag{2.2}
+\end{equation}
+<p>代码中用的是陀螺偏置修正后的角增量：</p>
+\begin{equation}
+\boldsymbol{\delta}_k^{\mathrm{corr}} = \boldsymbol{\delta}_k^{\mathrm{meas}} - \mathbf{b}_g \cdot \Delta t_k \tag{2.3}
+\end{equation}
+
+<h2>第三章：MEKF — 乘法扩展卡尔曼滤波器</h2>
+
+<h3>3.1 状态定义</h3>
+<p><strong>名义状态</strong>：</p>
+\[
+\mathbf{x} = \{\mathbf{q} \in \mathbb{S}^3,\; \mathbf{b}_g \in \mathbb{R}^3\}
+\]
+<p><strong>误差状态</strong>（滤波器实际估计的）：</p>
+\[
+\delta\mathbf{x} = \{\boldsymbol{\delta\theta} \in \mathbb{R}^3,\; \delta\mathbf{b}_g \in \mathbb{R}^3\}
+\]
+<p>其中 \(\boldsymbol{\delta\theta}\) 是局部姿态误差 angle-axis 表示。真实四元数与估计四元数的关系：</p>
+\begin{equation}
+\mathbf{q}_{\mathrm{true}} = \mathbf{q}_{\mathrm{est}} \otimes \begin{bmatrix}
+\cos(|\boldsymbol{\delta\theta}|/2) \\
+\frac{\boldsymbol{\delta\theta}}{|\boldsymbol{\delta\theta}|} \sin(|\boldsymbol{\delta\theta}|/2)
+\end{bmatrix} \approx \mathbf{q}_{\mathrm{est}} \otimes \begin{bmatrix} 1 \\ \boldsymbol{\delta\theta}/2 \end{bmatrix} \tag{3.1}
+\end{equation}
+<p>▎ 这就是“Multiplicative”的来源：误差以乘法方式作用在四元数上，而不是加法。</p>
+<p>误差协方差矩阵：</p>
+\begin{equation}
+\mathbf{P} = \mathbb{E}[\delta\mathbf{x} \cdot \delta\mathbf{x}^T] \in \mathbb{R}^{6 \times 6} \tag{3.2}
+\end{equation}
+
+<h3>3.2 初始化</h3>
+<pre>
+P = diag(σ²_att, σ²_att, σ²_att, σ²_bias, σ²_bias, σ²_bias)
+q = [1, 0, 0, 0]  // 单位四元数
+b_g = [0, 0, 0]
+</pre>
+<p>播种（从加速度计初始化 tilt + 外部给定 yaw）：</p>
+<pre>
+roll  = atan2(a_y, a_z)            // 从重力在body Y-Z平面的分量
+pitch = atan2(-a_x, √(a_y² + a_z²))  // 从重力在body X轴的分量
+// yaw 由外部提供（默认0或上一个lane的heading）
+</pre>
+
+<h2>第四章：传播（Propagation）</h2>
+
+<h3>4.1 名义状态传播</h3>
+<p>代码使用线性速率插值补偿锥运动（coning）：</p>
+\begin{equation}
+\boldsymbol{\delta}_k^{\mathrm{corr}} = \frac{1}{2}(\boldsymbol{\omega}_{\mathrm{left}} + \boldsymbol{\omega}_{\mathrm{right}}) \cdot \Delta t_k + \frac{\Delta t_k^2}{12} \cdot (\boldsymbol{\omega}_{\mathrm{left}} \times \boldsymbol{\omega}_{\mathrm{right}}) \tag{4.1}
+\end{equation}
+<p>传播名义四元数：</p>
+\begin{equation}
+\mathbf{q}_{k+1|k} = \mathbf{q}_{k|k} \otimes \exp\left(\frac{\boldsymbol{\delta}_k^{\mathrm{corr}}}{2}\right) \tag{4.2}
+\end{equation>
+<p>其中 \(\exp(\cdot)\) 是 rotation-vector-to-quaternion 映射。</p>
+
+<h3>4.2 误差状态转移矩阵 \(\boldsymbol{\Phi}\)</h3>
+\begin{equation}
+\boldsymbol{\Phi} = \begin{bmatrix}
+\boldsymbol{\Phi}_{\theta\theta} & \boldsymbol{\Phi}_{\theta b} \\
+\mathbf{0}_{3\times 3} & \mathbf{I}_{3\times 3}
+\end{bmatrix} \in \mathbb{R}^{6\times 6} \tag{4.3}
+\end{equation}
+<p>其中（小角度近似）：</p>
+\begin{align}
+\boldsymbol{\Phi}_{\theta\theta} &= \mathbf{I} - \frac{\sin\theta}{\theta}[\boldsymbol{\delta}]_\times + \frac{1 - \cos\theta}{\theta^2}[\boldsymbol{\delta}]_\times^2 \tag{4.4} \\
+\boldsymbol{\Phi}_{\theta b} &= -\Delta t\left[\mathbf{I} - \frac{1 - \cos\theta}{\theta^2}[\boldsymbol{\delta}]_\times + \frac{\theta - \sin\theta}{\theta^3}[\boldsymbol{\delta}]_\times^2\right] \tag{4.5}
+\end{align}
+<p>其中 \(\theta = |\boldsymbol{\delta}^{\mathrm{corr}}|\)，\([\boldsymbol{\delta}]_\times\) 是叉乘矩阵：</p>
+\begin{equation}
+[\boldsymbol{\delta}]_\times = \begin{bmatrix}
+0 & -\delta_z & \delta_y \\
+\delta_z & 0 & -\delta_x \\
+-\delta_y & \delta_x & 0
+\end{bmatrix}
+\end{equation}
+
+<h3>4.3 过程噪声协方差 \(\mathbf{Q}\)</h3>
+\begin{equation}
+\mathbf{Q} = \begin{bmatrix}
+\boldsymbol{\Sigma}_g \Delta t + \boldsymbol{\Sigma}_b \frac{\Delta t^3}{3} & -\boldsymbol{\Sigma}_b \frac{\Delta t^2}{2} \\
+-\boldsymbol{\Sigma}_b \frac{\Delta t^2}{2} & \boldsymbol{\Sigma}_b \Delta t
+\end{bmatrix} \tag{4.6}
+\end{equation}
+<p>推导来源：</p>
+\begin{align}
+Q_{\theta\theta} &\approx \boldsymbol{\Sigma}_g \Delta t + \boldsymbol{\Sigma}_b \frac{\Delta t^3}{3} \tag{4.7} \\
+Q_{\theta b} &\approx -\boldsymbol{\Sigma}_b \frac{\Delta t^2}{2} \tag{4.8} \\
+Q_{bb} &= \boldsymbol{\Sigma}_b \Delta t \tag{4.9}
+\end{align}
+
+<h3>4.4 协方差传播</h3>
+\begin{equation}
+\mathbf{P}_{k+1|k} = \boldsymbol{\Phi} \mathbf{P}_{k|k} \boldsymbol{\Phi}^T + \mathbf{Q} \tag{4.10}
+\end{equation>
+
+<h2>第五章：加速度计更新（重力观测）</h2>
+
+<h3>5.1 观测模型</h3>
+<p>预测的重力方向：\(\hat{\mathbf{d}}^W = [0, 0, 1]^T\)，旋转到机体系：</p>
+\begin{equation}
+\hat{\mathbf{d}}^B(\mathbf{q}) = \mathbf{R}^{BW}(\mathbf{q}) \cdot [0, 0, 1]^T \tag{5.1}
+\end{equation}
+即：
+\begin{align}
+\hat{d}_x^B &= -2(q_x q_z - q_w q_y) \nonumber\\
+\hat{d}_y^B &= -2(q_w q_x + q_y q_z) \nonumber\\
+\hat{d}_z^B &= -(q_w^2 - q_x^2 - q_y^2 + q_z^2) \tag{5.2}
+\end{align}
+<p>测量值：\(\mathbf{d}_m^B = \dfrac{\mathbf{a}_m}{|\mathbf{a}_m|}\)</p>
+
+<h3>5.2 切平面投影</h3>
+<p>构造切平面基矢量：</p>
+\begin{align}
+\mathbf{r}_{\mathrm{ref}} &=
+\begin{cases}
+  [1,\, 0,\, 0]^T, & |\hat{d}_z| > 0.8 \\[4pt]
+  [0,\, 0,\, 1]^T, & |\hat{d}_z| \le 0.8
+\end{cases}
+\tag{5.4} \\
+\mathbf{t}_0 &=
+\frac{\hat{\mathbf{d}} \times \mathbf{r}_{\mathrm{ref}}}
+     {\|\hat{\mathbf{d}} \times \mathbf{r}_{\mathrm{ref}}\|},
+\quad
+\mathbf{t}_1 =
+\frac{\hat{\mathbf{d}} \times \mathbf{t}_0}
+     {\|\hat{\mathbf{d}} \times \mathbf{t}_0\|}
+\tag{5.5}
+\end{align}
+
+<h3>5.3 观测矩阵 \(\mathbf{H}\)</h3>
+<p>残差：</p>
+\begin{equation}
+\mathbf{r} = \begin{bmatrix}
+\mathbf{t}_0^T(\mathbf{d}_m^B - \hat{\mathbf{d}}^B) \\
+\mathbf{t}_1^T(\mathbf{d}_m^B - \hat{\mathbf{d}}^B)
+\end{bmatrix} \in \mathbb{R}^2 \tag{5.6}
+\end{equation}
+<p>雅可比：</p>
+\begin{equation}
+\mathbf{H}_{\theta} = \begin{bmatrix}
+\mathbf{t}_0^T [\hat{\mathbf{d}}^B]_\times \\
+\mathbf{t}_1^T [\hat{\mathbf{d}}^B]_\times
+\end{bmatrix}, \quad
+\mathbf{H} = \begin{bmatrix} \mathbf{H}_{\theta} & \mathbf{0}_{2\times 3} \end{bmatrix} \tag{5.7, 5.8}
+\end{equation}
+
+<h3>5.4 自适应测量噪声</h3>
+\begin{equation}
+\mathbf{R} = \alpha \cdot \mathbf{T} \mathbf{R}_{\mathrm{dir}} \mathbf{T}^T, \quad \alpha = 1 + \left(\frac{\bigl|\|\mathbf{a}_m\| - g\bigr|}{\sigma_{\mathrm{soft}}}\right)^2 \tag{5.9}
+\end{equation}
+
+<h3>5.5 新息协方差</h3>
+\begin{equation}
+\mathbf{S} = \mathbf{H} \mathbf{P}_{k+1|k} \mathbf{H}^T + \mathbf{R} \tag{5.10}
+\end{equation}
+
+<h3>5.6 卡方检验</h3>
+\begin{equation}
+\mathrm{NIS}_{\mathrm{accel}} = \mathbf{r}^T \mathbf{S}^{-1} \mathbf{r} \sim \chi^2(2) \tag{5.11}
+\end{equation}
+<p>门限：\(\chi^2_{99\%}(2) = 9.210\)</p>
+
+<h3>5.7 卡尔曼更新</h3>
+\begin{align}
+\mathbf{K} &= \mathbf{P}_{k+1|k} \mathbf{H}^T \mathbf{S}^{-1} \nonumber\\
+\boldsymbol{\delta\hat{x}} &= \mathbf{K} \mathbf{r} \nonumber\\
+\mathbf{P}_{k+1|k+1} &= (\mathbf{I} - \mathbf{K}\mathbf{H}) \mathbf{P}_{k+1|k} (\mathbf{I} - \mathbf{K}\mathbf{H})^T + \mathbf{K} \mathbf{R} \mathbf{K}^T \tag{5.12}
+\end{align}
+
+<h3>5.8 误差状态注入（Reset）</h3>
+\begin{align}
+\mathbf{q}_{k+1|k+1} &= \mathbf{q}_{k+1|k} \otimes \exp\left(\frac{\boldsymbol{\delta\hat{\theta}}}{2}\right) \nonumber\\
+\mathbf{b}_{g, k+1|k+1} &= \mathbf{b}_{g, k+1|k} + \delta\hat{\mathbf{b}}_g \tag{5.13}
+\end{align}
+
+<h2>第六章：ZARU — 零角速率更新</h2>
+<p>当静止时，\(\boldsymbol{\omega}_m = \mathbf{b}_g + \boldsymbol{\eta}_g\)，观测矩阵：</p>
+\begin{equation}
+\mathbf{H}^{\mathrm{zaru}} = \begin{bmatrix} \mathbf{0}_{3\times 3} & \mathbf{I}_{3\times 3} \end{bmatrix} \tag{6.2}
+\end{equation}
+<p>卡方检验：\(\mathrm{NIS}_{\mathrm{zaru}} \sim \chi^2(3)\)，门限 11.345。Bounded ZARU 对残差进行裁剪：</p>
+\begin{equation}
+\mathbf{r}_{\mathrm{bounded}} = \mathrm{clip}(\boldsymbol{\omega}_m - \hat{\mathbf{b}}_g, \pm r_{\max}) \tag{6.4}
+\end{equation}
+
+<h2>第七章：IMU 预积分</h2>
+<p>在 MEKF 窗口内对陀螺样本做锥运动补偿：</p>
+\begin{equation}
+\boldsymbol{\delta}_i = \frac{1}{2}(\boldsymbol{\omega}_i + \boldsymbol{\omega}_{i+1}) \Delta t_i + \frac{\Delta t_i^2}{12} (\boldsymbol{\omega}_i \times \boldsymbol{\omega}_{i+1}) \tag{7.1}
+\end{equation}
+<p>然后复合：</p>
+\begin{equation}
+\mathbf{q}_{\mathrm{window}} = \prod_i \exp\left(\frac{\boldsymbol{\delta}_i}{2}\right) \tag{7.2}
+\end{equation}
+<p>加速度计窗口平均并补偿杆臂效应：</p>
+\begin{equation}
+\mathbf{a}_{\mathrm{ref}} = \mathbf{a}_{\mathrm{sensor}} - \dot{\boldsymbol{\omega}} \times \mathbf{r} - \boldsymbol{\omega} \times (\boldsymbol{\omega} \times \mathbf{r}) \tag{7.3}
+\end{equation}
+
+<h2>第七章附：输入滤波器的 IMU 数据全景</h2>
+
+<p>下图追踪从 MEMS 寄存器到 MEKF 输入的完整数据流：</p>
+
+<pre>
+┌─────────────────────────────────────────────────────────────────┐
+│                    传感器 → 滤波器 数据流                        │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  BMI088 Accel (1600Hz)                BMI088 Gyro (2000Hz)     │
+│  ┌──────────────────┐                 ┌──────────────────┐     │
+│  │FIFO 7-byte帧     │                 │FIFO 6-byte帧     │     │
+│  │+24bit sensor_time│                 │INT3→PA1→TIM5_CH2 │     │
+│  └────────┬─────────┘                 │硬件捕获时间戳    │     │
+│           │                           └────────┬─────────┘     │
+│           ▼                                    ▼               │
+│  ┌──────────────────┐                 ┌──────────────────┐     │
+│  │ imu_clock_sync   │                 │ 陀螺capture队列  │     │
+│  │ sensor_tick→MCU  │                 │ 直接MCU时间戳    │     │
+│  │ 映射到TIM5时间   │                 │ (无需时钟同步)   │     │
+│  └────────┬─────────┘                 └────────┬─────────┘     │
+│           │                                    │               │
+│  ICM45686 (1600Hz accel + 3200Hz gyro)         │               │
+│  ┌──────────────────────────┐                   │               │
+│  │FIFO 20-byte帧            │                   │               │
+│  │+16bit sensor_timestamp   │                   │               │
+│  │PE4 watermark→TIM5_CH1    │                   │               │
+│  └────────────┬─────────────┘                   │               │
+│               │                                 │               │
+│               ▼                                 │               │
+│  ┌──────────────────────────┐                   │               │
+│  │ imu_clock_sync           │                   │               │
+│  │ sensor_timestamp→MCU     │                   │               │
+│  │ 映射到TIM5时间           │                   │               │
+│  └────────────┬─────────────┘                   │               │
+│               │                                 │               │
+│               ▼                                 ▼               │
+│  ┌──────────────────────────────────────────────────────────┐  │
+│  │              IMU Stream Buffer (环形队列)                 │  │
+│  │  每个样本 = {timestamp_us, accel/gyro[3], sequence,      │  │
+│  │             temperature, source, valid}                   │  │
+│  └──────────────────────────┬───────────────────────────────┘  │
+│                             │                                  │
+│              ┌──────────────┴──────────────┐                   │
+│              ▼                             ▼                   │
+│  ┌─────────────────────┐     ┌─────────────────────┐          │
+│  │  Preintegrator      │     │  Fast Attitude      │          │
+│  │  (每个lane独立)     │     │  Predictor          │          │
+│  │                     │     │  (每个lane独立)     │          │
+│  │ 输入: gyro样本+     │     │ 输入: gyro样本      │          │
+│  │       accel样本      │     │       (全速率)      │          │
+│  │ 输出: 每2500µs窗口   │     │ 输出: 1600Hz姿态    │          │
+│  │  ┌────────────────┐  │     │       quaternion    │          │
+│  │  │ delta_angle[3] │  │     └─────────────────────┘          │
+│  │  │ (总旋转向量)   │  │                                      │
+│  │  │ accel_mean[3]  │  │                                      │
+│  │  │ gyro_mean[3]   │  │                                      │
+│  │  │ gyro_cov[3×3]  │  │                                      │
+│  │  │ accel 2nd_moment│  │                                     │
+│  │  └───────┬────────┘  │                                      │
+│  └──────────┼───────────┘                                      │
+│             │                                                   │
+│             ▼                                                   │
+│  ┌──────────────────────────────────────────────────────────┐  │
+│  │              MEKF (每个lane独立, 400Hz)                   │  │
+│  │                                                          │  │
+│  │  propagate_delta():                                      │  │
+│  │    输入: delta_angle[3] (窗口内总角增量, 含coning补偿)   │  │
+│  │          dt_s = 2500µs                                   │  │
+│  │    内部: 减去 b̂_g × dt → 修正角增量                      │  │
+│  │         旋转向量→四元数→q ⊗ exp(δ/2)                     │  │
+│  │         计算Φ, Q, 传播P                                  │  │
+│  │                                                          │  │
+│  │  update_accel():                                         │  │
+│  │    输入: specific_force[3] (杆臂补偿后的窗口平均加计)    │  │
+│  │          variance_scale (自适应噪声放大因子)              │  │
+│  │    过程: 归一化→切平面投影→计算residual[2]               │  │
+│  │         计算H, S, K → χ²(2)检验 → Kalman更新             │  │
+│  │                                                          │  │
+│  │  update_zaru() (仅静止时):                               │  │
+│  │    输入: gyro_rad_s[3] (窗口平均角速率)                  │  │
+│  │          measurement_covariance[3×3]                     │  │
+│  │    过程: gyro - b̂_g → residual[3]                        │  │
+│  │          χ²(3)检验 → Kalman更新偏置                      │  │
+│  └──────────────────────────────────────────────────────────┘  │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+</pre>
+
+<h3>关键数据条目总结</h3>
+
+<table>
+<tr><th>输入 MEKF 的数据</th><th>来源</th><th>维度</th><th>预处理</th></tr>
+<tr>
+  <td><code>delta_angle[3]</code></td>
+  <td>preintegrator 压缩</td>
+  <td>ℝ³ (rad)</td>
+  <td>全速率 gyro 样本 → 2500µs 窗口总旋转向量<br>含 coning 补偿 (式 7.1)</td>
+</tr>
+<tr>
+  <td><code>specific_force[3]</code></td>
+  <td>preintegrator + geometry</td>
+  <td>ℝ³ (m/s²)</td>
+  <td>窗口平均 accel → 杆臂效应补偿 (式 7.3)<br>→ 变换到参考点 (IMU 几何中心)</td>
+</tr>
+<tr>
+  <td><code>gyro_rad_s[3]</code></td>
+  <td>preintegrator 窗口统计</td>
+  <td>ℝ³ (rad/s)</td>
+  <td>窗口内 gyro 样本平均角速率<br>仅 ZARU 使用</td>
+</tr>
+<tr>
+  <td><code>gyro_cov[3×3]</code></td>
+  <td>preintegrator 窗口统计</td>
+  <td>ℝ³ˣ³ (rad²)</td>
+  <td>窗口内 gyro 样本的协方差<br>selector 陀螺一致性 NIS 使用</td>
+</tr>
+<tr>
+  <td><code>dt_s</code></td>
+  <td>窗口时间戳差</td>
+  <td>标量 (s)</td>
+  <td>windows[0].end_us - windows[0].start_us<br>固定 ≈ 0.0025s (400Hz)</td>
+</tr>
+</table>
+
+<p><strong>不进入 MEKF 但进入 Selector 的数据</strong>：两个 lane 的 delta_angle 和 gyro_cov，用于计算双 IMU 陀螺一致性 NIS (χ²(3))。</p>
+
+<p><strong>不进入 MEKF 但进入 Fast Predictor 的数据</strong>：全速率 (2000/3200Hz) gyro 样本，从 anchor 开始重放积分到 1600Hz 输出时刻。</p>
+
+<h2>第八章：双 IMU 选择器</h2>
+<p>陀螺一致性 NIS：\(\mathbf{r}_{\mathrm{gyro}} = \boldsymbol{\delta}_0 - \boldsymbol{\delta}_1\)，</p>
+\begin{equation}
+\mathrm{NIS}_{\mathrm{gyro}} = \mathbf{r}_{\mathrm{gyro}}^T \mathbf{S}^{-1} \mathbf{r}_{\mathrm{gyro}} \sim \chi^2(3) \tag{8.2}
+\end{equation}
+<p>迟滞区间 [7.815, 11.345]。</p>
+
+<h2>第九章：快速姿态预测器</h2>
+<p>1600 Hz 纯陀螺重放：</p>
+\begin{equation}
+\mathbf{q}_{\mathrm{output}}(t) = \mathbf{q}_{\mathrm{anchor}} \otimes \prod_{i: t_i \in (t_{\mathrm{anchor}}, t]} \exp\left(\frac{\boldsymbol{\delta}_i^{\mathrm{corr}}}{2}\right) \tag{9.1}
+\end{equation}
+
+<h2>第十章：时钟同步</h2>
+<p>线性回归映射 \(t_{\mathrm{MCU}} = \alpha t_{\mathrm{sensor}} + \beta\)，斜率与相位使用一阶 IIR 更新：</p>
+\begin{align}
+s_{k+1} &= s_k + \frac{\Delta t_{\mathrm{sensor}}}{\tau_{\mathrm{rate}} + \Delta t_{\mathrm{sensor}}} (s_{\mathrm{obs}} - s_k) \tag{10.3}\\
+\beta_{k+1} &= \beta_k + \frac{\Delta t_{\mathrm{sensor}}}{\tau_{\mathrm{phase}} + \Delta t_{\mathrm{sensor}}} \cdot r \tag{10.5}
+\end{align}
+<p>锚点需通过单调性、间隔、斜率、残差四层检验。</p>
+
+<h2>第十一章：运动守护</h2>
+<p>饱和检测（硬冲击）：\(|a| \ge a_{\mathrm{range}} \lor |\omega| \ge \omega_{\mathrm{range}}\)<br>
+加速度计扰动检测（持续振动）：严重 \(|a|>8g\)，中度 \(|a-g|>0.5g\) 等。<br>
+冲击后 accel_inhibited 持续 100ms，期间只做陀螺传播。</p>
+
+<h2>第十二章：完整状态机</h2>
+<pre>
+                  ┌──────────────┐
+                  │  POWER ON    │
+                  └──────┬───────┘
+                         │
+                  ┌──────▼───────┐
+                  │   INIT       │
+                  └──────┬───────┘
+                         │ seeding
+                  ┌──────▼───────┐
+                  │   SEEDED     │
+                  └──────┬───────┘
+                         │ 陀螺传播 + 加速度计更新
+                  ┌──────▼───────┐
+         ┌───────│   RUNNING    │◄──────────┐
+         │       └──────┬───────┘           │
+         │ impact / NIS reject / stationary │
+         │ ...                              │
+         └──────────────────────────────────┘
+</pre>
+
+<h2>第十三章：冲击后无法恢复的数学解释</h2>
+<p>accel_inhibit 期间（100ms）只传播：</p>
+\begin{align}
+\mathbf{P}_{k+1} &= \boldsymbol{\Phi}_k \mathbf{P}_k \boldsymbol{\Phi}_k^T + \mathbf{Q}_k \tag{13.1}\\
+\mathbf{q}_{k+1} &= \mathbf{q}_k \otimes \exp\left(\frac{\boldsymbol{\delta}_k - \mathbf{b}_g \Delta t}{2}\right) \tag{13.2}
+\end{align}
+<p>偏置误差累积导致 100ms 后角度漂移 \(\Delta\boldsymbol{\theta}_{\mathrm{err}} = (\mathbf{b}_g^* - \hat{\mathbf{b}}_g) \Delta t_{\mathrm{window}}\)。</p>
+<p>加速度计恢复时的 NIS：</p>
+\begin{equation}
+\mathrm{NIS} \approx \frac{|\boldsymbol{\theta}_{\mathrm{err}}|^2}{\sigma_P^2 + \sigma_R^2} \tag{13.4}
+\end{equation}
+<p>如果冲击触发 filter_fault，姿态冻结并导致 lane_seeded 变 false，无法走 Path A，必须走 Path B（静止），而飞行中不可能静止 → 死锁。</p>
+
+<p style="margin-top:3em; color:#666;">—— 全文完 ——</p>
+
+</body>
+</html>

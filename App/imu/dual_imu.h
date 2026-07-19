@@ -186,10 +186,6 @@ typedef struct
     uint32_t bmi088_accel_event_drop_count;
     uint32_t bmi088_gyro_event_drop_count;
     uint32_t icm45686_event_drop_count;
-    uint32_t bmi088_accel_buffer_overwrite_count;
-    uint32_t bmi088_gyro_buffer_overwrite_count;
-    uint32_t icm45686_accel_buffer_overwrite_count;
-    uint32_t icm45686_gyro_buffer_overwrite_count;
     uint32_t bmi088_accel_fifo_batch_count;
     uint32_t bmi088_gyro_fifo_batch_count;
     uint32_t bmi088_fifo_dma_error_count;
@@ -263,8 +259,6 @@ bool dual_imu_set_temperature_compensation_enabled(imu_source_t source,
 /* Enabling is qualification-only and must happen before the first stream read. */
 bool dual_imu_set_gyro_g_sensitivity_enabled(imu_source_t source,
                                             bool enabled);
-bool dual_imu_pop_accel(imu_source_t source, imu_accel_sample_t *sample);
-bool dual_imu_pop_gyro(imu_source_t source, imu_gyro_sample_t *sample);
 const dual_imu_state_t *dual_imu_get_state(void);
 
 #endif

@@ -58,6 +58,15 @@ typedef struct
     float timestamp_jitter_std_s;
     float pipeline_delay_std_s;
     float alignment_std_rad;
+    /* Fraction of the rotation angle added to the cross-lane disagreement
+     * covariance, base + (k*|omega|*dt)^2 per axis. Absorbs the rate-proportional
+     * gyro cross-axis sensitivity (BMI088 1.4%, ICM45686 0.2% per datasheet) plus
+     * scale-nonlinearity margin so a fast slew does not read as a lane fault.
+     * At |omega|=0 the term vanishes and the gate is bit-identical to before, so
+     * static 1v1 soft-fault sensitivity is preserved. Default 0.016; tighten
+     * toward ~0.003 once per-lane cross-axis calibration is loaded (FIX_PLAN
+     * §9.1-3). */
+    float gyro_disagreement_rate_fraction;
     float rate_floor_std_rad_s;
     float output_alignment_slew_rad_s;
     /* One-sigma angular-rate uncertainty while neither gyro is observable. */
@@ -67,6 +76,33 @@ typedef struct
     float zaru_bias_slew_limit_rad_s2;
     float zaru_calibration_tolerance_rad_s;
     float zaru_calibration_revoke_tolerance_rad_s;
+
+    /* In-run bias recovery (FIX_PLAN §12.3). The bias-residual gate that admits
+     * ZARU requires the learned bias to already be close to correct, so a bias
+     * that diverged during violent motion deadlocks the only mechanism that can
+     * repair it. When every bias-INDEPENDENT stationary criterion keeps passing
+     * yet the residual stays large for this many consecutive windows, reseed the
+     * diverged lanes' biases from their raw dwell means. Recovery is admitted
+     * only while each lane's raw dwell mean, decomposed against that lane's
+     * dwell-mean gravity direction, stays inside two rest tolerances:
+     * (a) the gravity-PARALLEL (yaw) component must be near zero, because a
+     * steady rotation about gravity keeps every other stationary criterion
+     * passing and is genuinely indistinguishable from a yaw-axis bias
+     * (FIX_PLAN §12.3-3) -- a slow turntable pan must never be learned as bias;
+     * (b) the gravity-PERPENDICULAR (tilt) component gets a wider tolerance
+     * sized for post-shock ZRO shift, because a real tilt-axis rotation at that
+     * rate would visibly move the gravity direction across the dwell and be
+     * rejected by the gravity-stability gate, so a steady perpendicular reading
+     * under stable gravity can only be bias. Additionally both heterogeneous
+     * lanes' raw dwell means must agree within the dual-lane tolerance so a
+     * grossly lying lane cannot donate its fault to the reseed (a unilateral
+     * post-shock shift is a genuine bias the reseed should absorb, so this
+     * budget is deliberately loose). A single available lane has no cross-check
+     * and must hold twice the dwell. */
+    float zaru_recovery_rest_yaw_rate_tolerance_rad_s;
+    float zaru_recovery_rest_tilt_rate_tolerance_rad_s;
+    float zaru_recovery_dual_lane_rate_tolerance_rad_s;
+    uint16_t zaru_recovery_reject_windows;
 
     float stationary_gyro_limit_rad_s;
     /* Per-axis variance limit inside one preintegration window. */
@@ -96,6 +132,27 @@ typedef struct
     uint16_t calibration_revoke_windows;
     uint16_t accel_fault_enter_windows;
     uint16_t accel_fault_recovery_windows;
+
+    /* A shock can leave a large tilt error while covariance stays small, so
+     * the gravity NIS gate rejects forever. After this many consecutive NIS
+     * rejections on otherwise clean windows, inflate attitude covariance each
+     * window until the gate reopens; after the larger count, reseed tilt from
+     * gravity while preserving heading. A rejection only counts as stuck
+     * evidence on a gravity-quality window (FIX_PLAN §1.2 第 1 层准入条件):
+     * the window-mean specific-force magnitude must be within the norm
+     * tolerance of gravity AND the rotation rate below the recovery rate
+     * limit. During sustained rotation the measurement carries centripetal/
+     * tangential acceleration, the gate is rejecting correctly, and inflating
+     * or reseeding from it would drive tilt toward the contaminated
+     * direction. The two admissions are complementary: perpendicular
+     * contamination up to ~3 m/s2 barely changes the magnitude
+     * (sqrt(g^2+a^2)-g ~= a^2/2g) yet tilts the direction ~17 deg, while at
+     * rates below the limit the centripetal term is physically small. */
+    uint16_t accel_recovery_stuck_windows;
+    uint16_t accel_recovery_reseed_windows;
+    float accel_recovery_inflation_std_rad;
+    float accel_recovery_norm_tolerance_mps2;
+    float accel_recovery_max_rate_rad_s;
 
     float accel_update_max_rate_rad_s;
     float accel_update_max_angular_accel_rad_s2;
@@ -132,6 +189,9 @@ typedef struct
     bool lane_calibrated[DUAL_IMU_ESTIMATOR_LANE_COUNT];
     bool lane_aided_propagation[DUAL_IMU_ESTIMATOR_LANE_COUNT];
     bool lane_accel_aided[DUAL_IMU_ESTIMATOR_LANE_COUNT];
+    bool lane_accel_recovery_inflating[DUAL_IMU_ESTIMATOR_LANE_COUNT];
+    bool lane_accel_recovery_reseeded[DUAL_IMU_ESTIMATOR_LANE_COUNT];
+    bool lane_bias_recovery_reseeded[DUAL_IMU_ESTIMATOR_LANE_COUNT];
     bool output_alignment_active;
     bool stationary_candidate;
     bool stationary_confirmed;
@@ -160,8 +220,11 @@ typedef struct
     uint32_t hard_fault_flags[DUAL_IMU_ESTIMATOR_LANE_COUNT];
     uint16_t zaru_accept_count[DUAL_IMU_ESTIMATOR_LANE_COUNT];
     uint16_t zaru_divergence_count[DUAL_IMU_ESTIMATOR_LANE_COUNT];
+    uint16_t zaru_recovery_reject_streak;
+    uint32_t zaru_bias_recovery_count;
     uint16_t accel_bad_streak[DUAL_IMU_ESTIMATOR_LANE_COUNT];
     uint16_t accel_good_streak[DUAL_IMU_ESTIMATOR_LANE_COUNT];
+    uint16_t accel_nis_stuck_streak[DUAL_IMU_ESTIMATOR_LANE_COUNT];
     uint16_t stationary_streak;
     uint16_t stationary_max_streak;
     uint16_t stationary_soft_exit_streak;
@@ -175,6 +238,8 @@ typedef struct
     uint32_t stationary_statistics_count;
     uint32_t post_impact_episode_count;
     uint32_t post_impact_reacquire_count;
+    uint32_t accel_recovery_inflation_count;
+    uint32_t accel_recovery_reseed_count;
     /* Frozen normalized accel mean after the stationary statistics warmup. */
     float stationary_gravity_reference[DUAL_IMU_ESTIMATOR_LANE_COUNT][3];
     float stationary_gyro_mean_rad_s[DUAL_IMU_ESTIMATOR_LANE_COUNT][3];

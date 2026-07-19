@@ -3,7 +3,8 @@
 本文只讨论 BMI088、ICM45686、STM32H743 组成的双 6 轴姿态系统。运行时输入仅来自
 这两颗 MEMS，不依赖其他信号。板级连线以 `DM-FC01_pinout.xlsx` 为唯一最终依据，
 算法细节见 [IMU_FUSION.md](IMU_FUSION.md)，当前恢复点和待办见
-[PROJECT_STATUS.md](PROJECT_STATUS.md)。
+[PROJECT_STATUS.md](PROJECT_STATUS.md)；器件资料、SOTA 论文和未进入生产的候选算法见
+[FUSION_RESEARCH.md](FUSION_RESEARCH.md)。
 
 文中严格区分：
 

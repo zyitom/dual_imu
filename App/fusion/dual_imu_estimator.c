@@ -261,6 +261,9 @@ static bool estimator_config_is_valid(const dual_imu_estimator_config_t *config)
         (config->pipeline_delay_std_s < 0.0f) ||
         !isfinite(config->alignment_std_rad) ||
         (config->alignment_std_rad < 0.0f) ||
+        !isfinite(config->gyro_disagreement_rate_fraction) ||
+        (config->gyro_disagreement_rate_fraction < 0.0f) ||
+        (config->gyro_disagreement_rate_fraction >= 0.2f) ||
         !isfinite(config->rate_floor_std_rad_s) ||
         (config->rate_floor_std_rad_s <= 0.0f) ||
         !isfinite(config->output_alignment_slew_rad_s) ||
@@ -284,6 +287,18 @@ static bool estimator_config_is_valid(const dual_imu_estimator_config_t *config)
          config->zaru_calibration_tolerance_rad_s) ||
         (config->zaru_calibration_revoke_tolerance_rad_s >=
          config->zaru_target_residual_limit_rad_s) ||
+        !isfinite(config->zaru_recovery_rest_yaw_rate_tolerance_rad_s) ||
+        (config->zaru_recovery_rest_yaw_rate_tolerance_rad_s <= 0.0f) ||
+        (config->zaru_recovery_rest_yaw_rate_tolerance_rad_s >
+         config->zaru_recovery_rest_tilt_rate_tolerance_rad_s) ||
+        !isfinite(config->zaru_recovery_rest_tilt_rate_tolerance_rad_s) ||
+        (config->zaru_recovery_rest_tilt_rate_tolerance_rad_s >=
+         config->stationary_gyro_limit_rad_s) ||
+        !isfinite(config->zaru_recovery_dual_lane_rate_tolerance_rad_s) ||
+        (config->zaru_recovery_dual_lane_rate_tolerance_rad_s <= 0.0f) ||
+        (config->zaru_recovery_dual_lane_rate_tolerance_rad_s >=
+         config->stationary_gyro_limit_rad_s) ||
+        (config->zaru_recovery_reject_windows < 2U) ||
         !isfinite(config->stationary_gyro_variance_limit_rad2_s2) ||
         (config->stationary_gyro_variance_limit_rad2_s2 <= 0.0f) ||
         !isfinite(config->stationary_accel_norm_tolerance_mps2) ||
@@ -318,6 +333,17 @@ static bool estimator_config_is_valid(const dual_imu_estimator_config_t *config)
         (config->calibration_revoke_windows == 0U) ||
         (config->accel_fault_enter_windows == 0U) ||
         (config->accel_fault_recovery_windows == 0U) ||
+        (config->accel_recovery_stuck_windows < 2U) ||
+        (config->accel_recovery_reseed_windows <=
+         config->accel_recovery_stuck_windows) ||
+        !isfinite(config->accel_recovery_inflation_std_rad) ||
+        (config->accel_recovery_inflation_std_rad <= 0.0f) ||
+        !isfinite(config->accel_recovery_norm_tolerance_mps2) ||
+        (config->accel_recovery_norm_tolerance_mps2 <= 0.0f) ||
+        !isfinite(config->accel_recovery_max_rate_rad_s) ||
+        (config->accel_recovery_max_rate_rad_s <= 0.0f) ||
+        (config->accel_recovery_max_rate_rad_s >
+         config->accel_update_max_rate_rad_s) ||
         !isfinite(config->accel_update_max_rate_rad_s) ||
         (config->accel_update_max_rate_rad_s <= 0.0f) ||
         !isfinite(config->accel_update_max_angular_accel_rad_s2) ||
@@ -371,6 +397,10 @@ void dual_imu_estimator_default_config(dual_imu_estimator_config_t *config)
     config->timestamp_jitter_std_s = 20.0e-6f;
     config->pipeline_delay_std_s = 100.0e-6f;
     config->alignment_std_rad = 0.25f * degree;
+    /* 1.6% = BMI088 gyro cross-axis 1.4% (datasheet) + scale-nonlinearity margin
+     * (FIX_PLAN §9.1-3). Tighten toward ~0.3% after per-lane cross-axis
+     * calibration is loaded. */
+    config->gyro_disagreement_rate_fraction = 0.016f;
     config->rate_floor_std_rad_s = 0.03f * degree;
     config->output_alignment_slew_rad_s = 1.0f;
     config->unobserved_rotation_rate_std_rad_s = 4000.0f * degree;
@@ -381,6 +411,23 @@ void dual_imu_estimator_default_config(dual_imu_estimator_config_t *config)
     config->zaru_bias_slew_limit_rad_s2 = 0.10f * degree;
     config->zaru_calibration_tolerance_rad_s = 0.05f * degree;
     config->zaru_calibration_revoke_tolerance_rad_s = 0.20f * degree;
+    /* Yaw (gravity-parallel) rest tolerance stays at the ZARU residual limit:
+     * a steady sub-limit pan about gravity is indistinguishable from yaw bias,
+     * so it must stay below the 1 dps turntable guarantee
+     * (test_unobservable_static_yaw_rate_is_not_learned_as_bias). The tilt
+     * (gravity-perpendicular) tolerance is sized for what a healthy-but-shifted
+     * gyro really reads at rest -- fixed-calibration ZRO residual (~0.2 dps
+     * measured) plus post-shock ZRO shift (FIX_PLAN §5-①, the very failure §12
+     * recovers from) -- and is safe to widen because a real 2 dps tilt rotation
+     * moves gravity ~10° over the 5 s dwell and trips the gravity-stability
+     * gate. The dual-lane budget matches: a unilateral post-shock shift is a
+     * genuine bias the reseed should absorb, so the cross-check only blocks a
+     * grossly lying lane, not spec-level offset spread. 2000 windows = 5 s at
+     * the 2.5 ms window rate (FIX_PLAN §12.3). */
+    config->zaru_recovery_rest_yaw_rate_tolerance_rad_s = 0.50f * degree;
+    config->zaru_recovery_rest_tilt_rate_tolerance_rad_s = 2.0f * degree;
+    config->zaru_recovery_dual_lane_rate_tolerance_rad_s = 2.0f * degree;
+    config->zaru_recovery_reject_windows = 2000U;
     const float stationary_gyro_rms_limit = 1.0f * degree;
     config->stationary_gyro_variance_limit_rad2_s2 =
         stationary_gyro_rms_limit * stationary_gyro_rms_limit;
@@ -414,6 +461,17 @@ void dual_imu_estimator_default_config(dual_imu_estimator_config_t *config)
     config->calibration_revoke_windows = 40U;
     config->accel_fault_enter_windows = 200U;
     config->accel_fault_recovery_windows = 400U;
+    config->accel_recovery_stuck_windows = 100U;
+    config->accel_recovery_reseed_windows = 400U;
+    config->accel_recovery_inflation_std_rad = 0.6f * degree;
+    /* ~5% g: wide enough for post-shock rest with residual vibration, far
+     * below the >1 m/s2 centripetal contamination of a hand-rate rotation. */
+    config->accel_recovery_norm_tolerance_mps2 = 0.5f;
+    /* ~57 dps: below this the centripetal term at a 0.2 m lever is
+     * <= 0.25 m/s2 (<= 1.5 deg direction error), so a rejected update is
+     * attitude error, not dynamics. Catches the perpendicular-contamination
+     * band the norm tolerance cannot see. */
+    config->accel_recovery_max_rate_rad_s = 1.0f;
     config->accel_update_max_rate_rad_s = 15.0f;
     config->accel_update_max_angular_accel_rad_s2 = 1000.0f;
     config->accel_rate_variance_scale_rad_s = 3.0f;
@@ -854,6 +912,19 @@ static void estimator_selector_covariance(const dual_imu_estimator_t *estimator,
         estimator->config.alignment_std_rad;
     const float floor_delta = estimator->config.rate_floor_std_rad_s * dt_s;
     const float floor_variance = floor_delta * floor_delta;
+    /* Rate-proportional cross-lane disagreement budget: gyro cross-axis
+     * sensitivity and scale nonlinearity produce an apparent disagreement that
+     * grows with the rotation angle |omega|*dt = delta_norm (FIX_PLAN §9.1-3,
+     * §12.1). Add (k*delta_norm)^2 isotropically so a fast slew widens the NIS
+     * gate instead of reading as a lane fault. delta_norm is this lane's own
+     * rotation angle; both lanes measure the same motion and their covariances
+     * are summed in the selector NIS, so each contributing its own term yields a
+     * correctly scaled combined gate. The term is exactly zero at delta_norm=0,
+     * keeping the static gate bit-identical to before. */
+    const float disagreement_fraction =
+        estimator->config.gyro_disagreement_rate_fraction;
+    const float disagreement_variance =
+        (disagreement_fraction * disagreement_fraction) * delta_norm_sq;
 
     for (size_t row = 0U; row < 3U; ++row) {
         for (size_t column = 0U; column < 3U; ++column) {
@@ -873,7 +944,7 @@ static void estimator_selector_covariance(const dual_imu_estimator_t *estimator,
                                   estimator->config.pipeline_delay_std_s;
         covariance[row][row] += (jitter_delta * jitter_delta) +
                                 (delay_delta * delay_delta) +
-                                floor_variance;
+                                floor_variance + disagreement_variance;
     }
 }
 
@@ -984,6 +1055,107 @@ static void estimator_record_unobserved_rotation(
 
     estimator_mark_heading_continuity_lost(estimator, output->start_us);
     estimator_enter_post_impact_reacquire(estimator);
+}
+
+/* A shock that never trips the impact detectors can leave a large tilt error
+ * while covariance stays small; the gravity NIS gate then rejects every
+ * update and the lane never reconverges. Count consecutive NIS rejections on
+ * otherwise clean windows, reopen the gate by inflating attitude covariance,
+ * and fall back to a heading-preserving tilt reseed if inflation alone is
+ * not enough. Rotation was observed throughout, so heading continuity is
+ * kept; only the gravity-observable tilt is corrected. */
+static void estimator_handle_accel_recovery(
+    dual_imu_estimator_t *estimator,
+    dual_imu_estimator_output_t *output,
+    const imu_preintegrated_window_t windows[DUAL_IMU_ESTIMATOR_LANE_COUNT],
+    bool accel_updates_enabled)
+{
+    for (size_t lane = 0U; lane < DUAL_IMU_ESTIMATOR_LANE_COUNT; ++lane) {
+        /* Windows without a clean own-lane gravity attempt are evidence in
+         * neither direction: hold the streak so dynamics or an inhibit
+         * interval cannot silently clear a stuck gate. */
+        if (!accel_updates_enabled || !estimator->lane_seeded[lane] ||
+            !windows[lane].accel_valid ||
+            (estimator->hard_fault_flags[lane] != 0U) ||
+            estimator->lane_accel_fault[lane])
+            continue;
+
+        if (output->accel_result[lane] == ATTITUDE_MEKF_ACCEL_ACCEPTED) {
+            estimator->accel_nis_stuck_streak[lane] = 0U;
+            continue;
+        }
+        /* REJECTED_CORRECTION is equally conclusive stuck evidence: inflation
+         * reopened the NIS gate but the needed correction exceeds the trust
+         * region, so only the reseed escalation can recover. */
+        if ((output->accel_result[lane] != ATTITUDE_MEKF_ACCEL_REJECTED_NIS) &&
+            (output->accel_result[lane] !=
+             ATTITUDE_MEKF_ACCEL_REJECTED_CORRECTION))
+            continue;
+        /* Gravity-quality admission (FIX_PLAN §1.2 第 1 层): a rejection is
+         * stuck evidence only when the measured magnitude is close to gravity
+         * AND the rotation rate is low. During sustained rotation the window
+         * mean carries centripetal and tangential acceleration, the direction
+         * is genuinely not gravity and the NIS gate is rejecting CORRECTLY;
+         * inflating the covariance or reseeding tilt from such windows would
+         * drive the attitude toward the contaminated direction. Perpendicular
+         * contamination below ~3 m/s2 barely moves the magnitude, so the rate
+         * limit is the admission that actually excludes it. Hold the streak
+         * instead of advancing it. */
+        const float specific_force_norm = estimator_vector_norm(
+            output->lane_specific_force_mps2[lane]);
+        const float rotation_rate = estimator_vector_norm(
+            output->angular_rate_rad_s);
+        if (!isfinite(specific_force_norm) || !isfinite(rotation_rate) ||
+            (fabsf(specific_force_norm - DUAL_IMU_ESTIMATOR_GRAVITY_MPS2) >
+             estimator->config.accel_recovery_norm_tolerance_mps2) ||
+            (rotation_rate > estimator->config.accel_recovery_max_rate_rad_s))
+            continue;
+
+        if (estimator->accel_nis_stuck_streak[lane] < UINT16_MAX)
+            estimator->accel_nis_stuck_streak[lane]++;
+        const uint16_t streak = estimator->accel_nis_stuck_streak[lane];
+        if (streak < estimator->config.accel_recovery_stuck_windows)
+            continue;
+
+        if (streak >= estimator->config.accel_recovery_reseed_windows) {
+            float recoverable_bias[3];
+            if (!estimator_get_recoverable_bias(&estimator->mekf[lane],
+                                                recoverable_bias)) {
+                estimator->lane_calibrated[lane] = false;
+                estimator->zaru_accept_count[lane] = 0U;
+                estimator->zaru_divergence_count[lane] = 0U;
+            }
+            float reference_quaternion[4];
+            if (!attitude_mekf_get_quaternion(&estimator->mekf[lane],
+                                              reference_quaternion) ||
+                !estimator_reseed_tilt_preserving_heading(
+                    &estimator->mekf[lane],
+                    output->lane_specific_force_mps2[lane],
+                    reference_quaternion,
+                    recoverable_bias)) {
+                estimator_latch_filter_fault(estimator, lane, output->end_us);
+                estimator->accel_nis_stuck_streak[lane] = 0U;
+                continue;
+            }
+            estimator->accel_nis_stuck_streak[lane] = 0U;
+            output->lane_accel_recovery_reseeded[lane] = true;
+            if (estimator->accel_recovery_reseed_count < UINT32_MAX)
+                estimator->accel_recovery_reseed_count++;
+            estimator_enter_post_impact_reacquire(estimator);
+            continue;
+        }
+
+        if (!attitude_mekf_mark_rotation_unobserved(
+                &estimator->mekf[lane],
+                estimator->config.accel_recovery_inflation_std_rad)) {
+            estimator_latch_filter_fault(estimator, lane, output->end_us);
+            estimator->accel_nis_stuck_streak[lane] = 0U;
+            continue;
+        }
+        output->lane_accel_recovery_inflating[lane] = true;
+        if (estimator->accel_recovery_inflation_count < UINT32_MAX)
+            estimator->accel_recovery_inflation_count++;
+    }
 }
 
 static void estimator_reset_impact_gyro_disagreement(
@@ -1144,6 +1316,10 @@ static bool estimator_reject_stationary(
         (estimator->stationary_reject_count[reason] < UINT32_MAX)) {
         estimator->stationary_reject_count[reason]++;
     }
+    /* Any genuine reject (motion, variance, gravity drift, invalid) is evidence
+     * against a stuck-bias deadlock; only the in-run bias-recovery hold path
+     * (which preserves the dwell statistics) advances the streak. */
+    estimator->zaru_recovery_reject_streak = 0U;
     estimator_reset_stationary_tracking(estimator);
     return false;
 }
@@ -1297,9 +1473,171 @@ static bool estimator_update_stationary_statistics(
     return within_limits;
 }
 
+/* Bias-independent gravity-direction stability over the dwell. Establishes the
+ * per-lane reference on first use and rejects once the dwell-mean specific-force
+ * direction drifts past the limit (a slow tilting rotation). Shared by the
+ * normal candidate path and the in-run bias-recovery admissibility test. */
+static bool estimator_stationary_gravity_direction_stable(
+    dual_imu_estimator_t *estimator,
+    uint8_t lane_mask)
+{
+    for (size_t lane = 0U; lane < DUAL_IMU_ESTIMATOR_LANE_COUNT; ++lane) {
+        if ((lane_mask & (uint8_t)(1U << lane)) == 0U)
+            continue;
+        const float norm = estimator_vector_norm(
+            estimator->stationary_accel_mean_mps2[lane]);
+        if (!isfinite(norm) || (norm <= 0.0f))
+            return false;
+        float gravity_direction[3];
+        for (size_t axis = 0U; axis < 3U; ++axis)
+            gravity_direction[axis] =
+                estimator->stationary_accel_mean_mps2[lane][axis] / norm;
+
+        if (!estimator->stationary_gravity_reference_valid[lane]) {
+            memcpy(estimator->stationary_gravity_reference[lane],
+                   gravity_direction, sizeof(gravity_direction));
+            estimator->stationary_gravity_reference_valid[lane] = true;
+            continue;
+        }
+        if (estimator_vector_distance(
+                gravity_direction,
+                estimator->stationary_gravity_reference[lane]) >
+            estimator->config.stationary_accel_direction_limit)
+            return false;
+    }
+    return true;
+}
+
+/* Admissibility for in-run gyro-bias recovery (FIX_PLAN §12.3). The bias
+ * residual is large, but that alone cannot tell a stuck-bias deadlock from
+ * genuine slow motion, so require the bias-INDEPENDENT evidence that only real
+ * rest produces. Each lane's raw dwell mean is decomposed against that lane's
+ * dwell-mean gravity direction: the gravity-parallel (yaw) component must be
+ * near zero because a steady pan about gravity is indistinguishable from
+ * yaw-axis bias (FIX_PLAN §12.3-3, accepted residual risk below the yaw
+ * tolerance), while the perpendicular (tilt) component only needs to stay
+ * inside the post-shock ZRO-shift budget because a real tilt-axis rotation at
+ * that rate would move the gravity direction across the dwell and fail the
+ * gravity-stability gate that guards this path. When both lanes are available
+ * the two heterogeneous sensors must also agree so a grossly lying lane cannot
+ * self-absolve; a single available lane has no cross-check and the caller
+ * compensates with a longer required dwell. */
+static bool estimator_bias_recovery_admissible(
+    dual_imu_estimator_t *estimator,
+    uint8_t lane_mask)
+{
+    for (size_t lane = 0U; lane < DUAL_IMU_ESTIMATOR_LANE_COUNT; ++lane) {
+        if ((lane_mask & (uint8_t)(1U << lane)) == 0U)
+            continue;
+        const float accel_norm = estimator_vector_norm(
+            estimator->stationary_accel_mean_mps2[lane]);
+        if (!isfinite(accel_norm) || (accel_norm <= 0.0f))
+            return false;
+        float parallel_rate = 0.0f;
+        for (size_t axis = 0U; axis < 3U; ++axis) {
+            parallel_rate +=
+                estimator->stationary_gyro_mean_rad_s[lane][axis] *
+                (estimator->stationary_accel_mean_mps2[lane][axis] /
+                 accel_norm);
+        }
+        const float total_rate = estimator_vector_norm(
+            estimator->stationary_gyro_mean_rad_s[lane]);
+        const float tilt_rate_squared =
+            (total_rate * total_rate) - (parallel_rate * parallel_rate);
+        const float tilt_rate = sqrtf(fmaxf(0.0f, tilt_rate_squared));
+        if (!isfinite(parallel_rate) || !isfinite(tilt_rate) ||
+            (fabsf(parallel_rate) >
+             estimator->config.zaru_recovery_rest_yaw_rate_tolerance_rad_s) ||
+            (tilt_rate >
+             estimator->config.zaru_recovery_rest_tilt_rate_tolerance_rad_s))
+            return false;
+    }
+    if (lane_mask == 0x03U) {
+        const float difference = estimator_vector_distance(
+            estimator->stationary_gyro_mean_rad_s[0],
+            estimator->stationary_gyro_mean_rad_s[1]);
+        if (!isfinite(difference) ||
+            (difference >
+             estimator->config.zaru_recovery_dual_lane_rate_tolerance_rad_s))
+            return false;
+    }
+    return estimator_stationary_gravity_direction_stable(estimator, lane_mask);
+}
+
+/* Reseeds each diverged lane's gyro bias from its raw stationary dwell mean and
+ * inflates covariance to reflect the discontinuous reset (FIX_PLAN §12.3).
+ * attitude_mekf_reset preserves the current attitude estimate (its mean is
+ * unchanged) while restoring the bias and attitude covariance blocks to their
+ * initial one-sigma; gravity aiding then re-tightens tilt within the
+ * confirmation dwell. Calibration is revoked so the normal ZARU path must
+ * re-confirm the lane. */
+static void estimator_recover_diverged_bias(
+    dual_imu_estimator_t *estimator,
+    dual_imu_estimator_output_t *output,
+    uint8_t reseed_mask)
+{
+    float target_bias_rad_s[DUAL_IMU_ESTIMATOR_LANE_COUNT][3];
+    memcpy(target_bias_rad_s, estimator->stationary_gyro_mean_rad_s,
+           sizeof(target_bias_rad_s));
+    for (size_t lane = 0U; lane < DUAL_IMU_ESTIMATOR_LANE_COUNT; ++lane) {
+        if ((reseed_mask & (uint8_t)(1U << lane)) == 0U)
+            continue;
+        float current_quaternion[4];
+        if (!attitude_mekf_get_quaternion(&estimator->mekf[lane],
+                                          current_quaternion) ||
+            !attitude_mekf_reset(&estimator->mekf[lane], current_quaternion,
+                                 target_bias_rad_s[lane])) {
+            estimator_latch_filter_fault(estimator, lane, output->end_us);
+            continue;
+        }
+        estimator->lane_calibrated[lane] = false;
+        estimator->zaru_accept_count[lane] = 0U;
+        estimator->zaru_divergence_count[lane] = 0U;
+        output->lane_bias_recovery_reseeded[lane] = true;
+        if (estimator->zaru_bias_recovery_count < UINT32_MAX)
+            estimator->zaru_bias_recovery_count++;
+    }
+}
+
+/* Residual-gate hold path (FIX_PLAN §12.3). Every bias-independent stationary
+ * criterion passed this window, only the bias residual failed -- exactly the
+ * signature of a stuck-bias deadlock. Record the reject for attribution but
+ * KEEP the dwell statistics (estimator_reject_stationary would reset them), and
+ * count consecutive admissible windows toward the recovery reseed. Any other
+ * reject reason resets the streak in estimator_reject_stationary. */
+static bool estimator_hold_stationary_for_bias_recovery(
+    dual_imu_estimator_t *estimator,
+    dual_imu_estimator_output_t *output,
+    uint8_t lane_mask,
+    uint8_t diverged_mask)
+{
+    estimator->stationary_last_reject_reason =
+        DUAL_IMU_STATIONARY_REJECT_MEAN_RATE;
+    if (estimator->stationary_reject_count[DUAL_IMU_STATIONARY_REJECT_MEAN_RATE] <
+        UINT32_MAX) {
+        estimator->stationary_reject_count[DUAL_IMU_STATIONARY_REJECT_MEAN_RATE]++;
+    }
+
+    if (!estimator_bias_recovery_admissible(estimator, lane_mask)) {
+        estimator->zaru_recovery_reject_streak = 0U;
+        return false;
+    }
+    if (estimator->zaru_recovery_reject_streak < UINT16_MAX)
+        estimator->zaru_recovery_reject_streak++;
+    /* A single lane has no heterogeneous cross-check; demand a longer dwell. */
+    const uint32_t required_windows = (lane_mask == 0x03U)
+        ? estimator->config.zaru_recovery_reject_windows
+        : 2U * (uint32_t)estimator->config.zaru_recovery_reject_windows;
+    if (estimator->zaru_recovery_reject_streak >= required_windows) {
+        estimator_recover_diverged_bias(estimator, output, diverged_mask);
+        estimator->zaru_recovery_reject_streak = 0U;
+    }
+    return false;
+}
+
 static bool estimator_stationary_candidate(
     dual_imu_estimator_t *estimator,
-    const dual_imu_estimator_output_t *output,
+    dual_imu_estimator_output_t *output,
     uint8_t lane_mask)
 {
     if (lane_mask == 0U) {
@@ -1360,6 +1698,7 @@ static bool estimator_stationary_candidate(
     if (estimator->stationary_statistics_count < warmup_windows)
         return true;
 
+    uint8_t diverged_mask = 0U;
     for (size_t lane = 0U; lane < DUAL_IMU_ESTIMATOR_LANE_COUNT; ++lane) {
         if ((lane_mask & (uint8_t)(1U << lane)) == 0U)
             continue;
@@ -1399,39 +1738,23 @@ static bool estimator_stationary_candidate(
         }
         if (estimator_vector_norm(residual_rad_s) >
             estimator->config.zaru_target_residual_limit_rad_s) {
-            return estimator_reject_stationary(
-                estimator, DUAL_IMU_STATIONARY_REJECT_MEAN_RATE);
+            diverged_mask |= (uint8_t)(1U << lane);
         }
     }
 
-    for (size_t lane = 0U; lane < DUAL_IMU_ESTIMATOR_LANE_COUNT; ++lane) {
-        if ((lane_mask & (uint8_t)(1U << lane)) == 0U)
-            continue;
-        const float norm = estimator_vector_norm(
-            estimator->stationary_accel_mean_mps2[lane]);
-        if (!isfinite(norm) || (norm <= 0.0f)) {
-            return estimator_reject_stationary(
-                estimator, DUAL_IMU_STATIONARY_REJECT_GRAVITY_DIRECTION);
-        }
-        float gravity_direction[3];
-        for (size_t axis = 0U; axis < 3U; ++axis)
-            gravity_direction[axis] =
-                estimator->stationary_accel_mean_mps2[lane][axis] / norm;
-
-        if (!estimator->stationary_gravity_reference_valid[lane]) {
-            memcpy(estimator->stationary_gravity_reference[lane],
-                   gravity_direction, sizeof(gravity_direction));
-            estimator->stationary_gravity_reference_valid[lane] = true;
-            continue;
-        }
-        if (estimator_vector_distance(
-                gravity_direction,
-                estimator->stationary_gravity_reference[lane]) >
-            estimator->config.stationary_accel_direction_limit) {
-            return estimator_reject_stationary(
-                estimator, DUAL_IMU_STATIONARY_REJECT_GRAVITY_DIRECTION);
-        }
+    /* Bias-independent, so it outranks the bias-residual verdict: unstable
+     * gravity is positive evidence of real motion and must fully reset the
+     * dwell rather than enter the stuck-bias hold path. */
+    if (!estimator_stationary_gravity_direction_stable(estimator, lane_mask)) {
+        return estimator_reject_stationary(
+            estimator, DUAL_IMU_STATIONARY_REJECT_GRAVITY_DIRECTION);
     }
+
+    if (diverged_mask != 0U) {
+        return estimator_hold_stationary_for_bias_recovery(
+            estimator, output, lane_mask, diverged_mask);
+    }
+    estimator->zaru_recovery_reject_streak = 0U;
     return true;
 }
 
@@ -2209,6 +2532,8 @@ imu_preintegrator_result_t dual_imu_estimator_process_next(
                     accel_variance_scale) == ATTITUDE_MEKF_ACCEL_ACCEPTED;
         }
     }
+    estimator_handle_accel_recovery(estimator, output, windows,
+                                    accel_updates_enabled);
 
     bool selected_lane_aiding_evidence = false;
     if (accel_updates_enabled) {

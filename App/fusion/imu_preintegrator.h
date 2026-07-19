@@ -165,8 +165,8 @@ imu_preintegrator_result_t imu_preintegrator_next_window_ready(
 /*
  * complete_through_us is an event-time watermark: before calling, the caller
  * guarantees that every sample with timestamp <= this value has already been
- * pushed. A normal integration loop drains dual_imu_pop_accel()/pop_gyro() for
- * the lane, then advances this watermark after its chosen FIFO/IRQ latency.
+ * pushed. The manager pushes each lane's samples straight from FIFO ingest,
+ * then advances this watermark after its chosen FIFO/IRQ latency.
  * A stream normally also needs a sample at/after the window end for boundary
  * interpolation. If it stops, max_*_gap_us acts as the grace period before an
  * invalid window is emitted instead of deadlocking (window_us if the check is
