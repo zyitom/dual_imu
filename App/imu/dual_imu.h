@@ -16,6 +16,18 @@
 #define DUAL_IMU_ATTITUDE_MAX_PREDICTION_HORIZON_US (3000U)
 #define DUAL_IMU_BMI088_ACCEL_REGISTER_SNAPSHOT_SIZE (16U)
 
+/*
+ * Bring-up switch: run attitude on ICM45686 alone. BMI088 is still probed and
+ * still reports health, but none of its samples reach the estimator and the
+ * lane is held faulted, so the cross-lane machinery (disagreement rollback,
+ * accel-pair variance inflation, dual-lane stationary mask) is bypassed
+ * rather than fed a lane that is deliberately silent. Set to 0 to restore
+ * dual-lane operation; no other file needs to change.
+ */
+#ifndef DUAL_IMU_SINGLE_LANE_ICM45686
+#define DUAL_IMU_SINGLE_LANE_ICM45686 (1)
+#endif
+
 typedef enum
 {
     DUAL_IMU_MODE_NONE = 0,

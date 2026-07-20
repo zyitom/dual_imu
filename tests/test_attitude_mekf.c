@@ -222,6 +222,48 @@ static void test_gravity_update_at_arbitrary_attitude(void)
     TEST_EXPECT(attitude_mekf_is_valid(&filter));
 }
 
+/*
+ * A specific force whose magnitude is off gravity but whose direction still
+ * carries gravity must reach the measurement update, down-weighted, instead of
+ * being dropped. Dropping it is what let a sustained high-rate sweep run tilt
+ * open-loop; the seed path, which writes tilt straight from the vector, must
+ * still refuse the same input.
+ */
+static void test_off_norm_accel_updates_but_does_not_seed(void)
+{
+    attitude_mekf_t filter;
+    const float zero_bias[3] = {0.0f, 0.0f, 0.0f};
+    const float static_force[3] = {0.0f, 0.0f, -TEST_GRAVITY};
+    const float zero_delta[3] = {0.0f, 0.0f, 0.0f};
+    /* 1.5 g along the level down axis: a centrifugal/linear disturbance that
+     * has not yet swamped the gravity direction. */
+    const float inflated_force[3] = {0.0f, 0.0f, -1.5f * TEST_GRAVITY};
+
+    TEST_EXPECT(attitude_mekf_init(&filter, NULL));
+    for (unsigned int sample = 0U; sample < 400U; ++sample)
+    {
+        TEST_EXPECT(attitude_mekf_propagate_delta(&filter, zero_delta, TEST_DT_S));
+        TEST_EXPECT(attitude_mekf_update_accel(&filter, static_force, 1.0f) ==
+                    ATTITUDE_MEKF_ACCEL_ACCEPTED);
+    }
+
+    TEST_EXPECT(attitude_mekf_update_accel(&filter, inflated_force, 1.0f) ==
+                ATTITUDE_MEKF_ACCEL_ACCEPTED);
+    /* Accepted, but the norm excursion must have inflated the measurement
+     * variance far above the nominal weight rather than trusting it. */
+    TEST_EXPECT(filter.diagnostics.last_accel_variance_scale > 50.0f);
+
+    /* Same vector through the seeding path is still refused: there is no
+     * covariance there to discount a contaminated tilt. */
+    TEST_EXPECT(!attitude_mekf_seed_from_accel(&filter, inflated_force, 0.0f,
+                                               zero_bias));
+
+    /* Beyond the update gate the direction is more disturbance than gravity. */
+    const float overwhelming_force[3] = {0.0f, 0.0f, -3.0f * TEST_GRAVITY};
+    TEST_EXPECT(attitude_mekf_update_accel(&filter, overwhelming_force, 1.0f) ==
+                ATTITUDE_MEKF_ACCEL_REJECTED_NORM);
+}
+
 static void test_accel_rejection_is_transactional(void)
 {
     attitude_mekf_t filter;
@@ -761,6 +803,68 @@ static void test_unobserved_rotation_only_inflates_attitude_covariance(void)
     TEST_EXPECT(filter.diagnostics.unobserved_rotation_count == 1U);
 }
 
+static void test_directional_unobserved_rotation_is_anisotropic(void)
+{
+    attitude_mekf_t filter;
+    TEST_EXPECT(attitude_mekf_init(&filter, NULL));
+
+    float quaternion_before[4];
+    float bias_before[3];
+    float covariance_before[ATTITUDE_MEKF_STATE_DIM][ATTITUDE_MEKF_STATE_DIM];
+    memcpy(quaternion_before, filter.q, sizeof(quaternion_before));
+    memcpy(bias_before, filter.gyro_bias_rad_s, sizeof(bias_before));
+    memcpy(covariance_before, filter.covariance, sizeof(covariance_before));
+
+    /* Baseline along +Y: the axis component gets the large std, the
+     * perpendicular axes the small one. */
+    const float axis[3] = {0.0f, 1.0f, 0.0f};
+    TEST_EXPECT(attitude_mekf_mark_rotation_unobserved_directional(
+        &filter, 0.5f, 0.01f, axis));
+    TEST_EXPECT(memcmp(quaternion_before, filter.q,
+                       sizeof(quaternion_before)) == 0);
+    TEST_EXPECT(memcmp(bias_before, filter.gyro_bias_rad_s,
+                       sizeof(bias_before)) == 0);
+    const float axis_added = filter.covariance[1][1] -
+                             covariance_before[1][1];
+    const float perp_added_x = filter.covariance[0][0] -
+                               covariance_before[0][0];
+    const float perp_added_z = filter.covariance[2][2] -
+                               covariance_before[2][2];
+    TEST_EXPECT(fabsf(axis_added - 0.25f) < 0.01f);
+    TEST_EXPECT(fabsf(perp_added_x - 1.0e-4f) < 1.0e-5f);
+    TEST_EXPECT(fabsf(perp_added_z - 1.0e-4f) < 1.0e-5f);
+    for (size_t axis_index = 0U; axis_index < 3U; ++axis_index) {
+        TEST_EXPECT(filter.covariance[axis_index + 3U][axis_index + 3U] ==
+                    covariance_before[axis_index + 3U][axis_index + 3U]);
+    }
+    TEST_EXPECT(filter.diagnostics.unobserved_rotation_count == 1U);
+    TEST_EXPECT(attitude_mekf_is_valid(&filter));
+
+    /* A zero perpendicular std with a positive axis std is legal (evidence
+     * only along the axis); both zero is not, nor is a non-unit axis. */
+    TEST_EXPECT(attitude_mekf_mark_rotation_unobserved_directional(
+        &filter, 0.1f, 0.0f, axis));
+    TEST_EXPECT(!attitude_mekf_mark_rotation_unobserved_directional(
+        &filter, 0.0f, 0.0f, axis));
+    const float skewed[3] = {0.5f, 0.5f, 0.0f};
+    TEST_EXPECT(!attitude_mekf_mark_rotation_unobserved_directional(
+        &filter, 0.1f, 0.1f, skewed));
+    TEST_EXPECT(!attitude_mekf_mark_rotation_unobserved_directional(
+        &filter, NAN, 0.1f, axis));
+
+    /* Saturation at the attitude-variance cap reports success without
+     * exceeding the cap, like the isotropic variant. */
+    for (size_t repeat = 0U; repeat < 200U; ++repeat) {
+        TEST_EXPECT(attitude_mekf_mark_rotation_unobserved_directional(
+            &filter, 10.0f, 10.0f, axis));
+    }
+    const float cap = 0.5f * filter.config.covariance_ceiling;
+    for (size_t axis_index = 0U; axis_index < 3U; ++axis_index)
+        TEST_EXPECT(filter.covariance[axis_index][axis_index] <=
+                    cap + 1.0e-6f);
+    TEST_EXPECT(attitude_mekf_is_valid(&filter));
+}
+
 int main(void)
 {
     test_initialization_and_validation();
@@ -768,6 +872,7 @@ int main(void)
     test_accel_seed_coordinate_convention();
     test_tilt_and_bias_convergence();
     test_gravity_update_at_arbitrary_attitude();
+    test_off_norm_accel_updates_but_does_not_seed();
     test_accel_rejection_is_transactional();
     test_inflated_covariance_accel_correction_is_step_limited();
     test_yaw_unobservability_and_propagation_rejection();
@@ -779,6 +884,7 @@ int main(void)
     test_zaru_rejection_is_transactional();
     test_zaru_bias_limit();
     test_unobserved_rotation_only_inflates_attitude_covariance();
+    test_directional_unobserved_rotation_is_anisotropic();
     test_long_run_numerical_health();
 
     if (failure_count != 0U)

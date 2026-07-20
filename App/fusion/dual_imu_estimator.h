@@ -2,6 +2,7 @@
 #define DUAL_IMU_ESTIMATOR_H
 
 #include "attitude_mekf.h"
+#include "cross_lane_calibrator.h"
 #include "imu_geometry.h"
 #include "imu_preintegrator.h"
 #include "imu_selector.h"
@@ -70,6 +71,7 @@ typedef struct
     imu_preintegrator_config_t preintegrator[DUAL_IMU_ESTIMATOR_LANE_COUNT];
     attitude_mekf_config_t mekf[DUAL_IMU_ESTIMATOR_LANE_COUNT];
     imu_selector_config_t selector;
+    cross_lane_calibrator_config_t cross_lane_calibrator;
 
     /* Signed vectors from the common virtual origin to each MEMS center. */
     float reference_to_sensor_m[DUAL_IMU_ESTIMATOR_LANE_COUNT][3];
@@ -87,6 +89,15 @@ typedef struct
      * toward ~0.003 once per-lane cross-axis calibration is loaded (FIX_PLAN
      * §9.1-3). */
     float gyro_disagreement_rate_fraction;
+    /* Values substituted for gyro_disagreement_rate_fraction and
+     * alignment_std_rad in the selector covariance while the cross-lane
+     * calibrator is converged (DUAL_FUSION_DESIGN.md §3.1): once the BMI
+     * delta-angle is mapped through the estimated misalignment/scale/delay,
+     * the remaining deterministic disagreement budget shrinks by roughly a
+     * factor of five, so a real lane fault of the same size is detected that
+     * much earlier during dynamics. */
+    float gyro_disagreement_rate_fraction_calibrated;
+    float alignment_std_calibrated_rad;
     float rate_floor_std_rad_s;
     float output_alignment_slew_rad_s;
     /* One-sigma angular-rate uncertainty while neither gyro is observable. */
@@ -174,6 +185,15 @@ typedef struct
      * rates below the limit the centripetal term is physically small. */
     uint16_t accel_recovery_stuck_windows;
     uint16_t accel_recovery_reseed_windows;
+    /* One-shot rebuild of tilt straight from the accelerometer once a lane's
+     * gravity updates have been NIS-rejected for reseed_windows. It exists as
+     * a backstop from when gravity aiding could switch off entirely, and it
+     * repairs by rewriting the state and slewing the step out -- the visible
+     * "attitude freezes for a second, then jumps back". With aiding now
+     * continuous and softly weighted the backstop mostly fires on top of a
+     * filter that was already converging, so it is off by default. Covariance
+     * inflation (the streak's other branch) still runs either way. */
+    bool accel_recovery_reseed_enabled;
     float accel_recovery_inflation_std_rad;
     float accel_recovery_norm_tolerance_mps2;
     float accel_recovery_max_rate_rad_s;
@@ -182,6 +202,36 @@ typedef struct
     float accel_update_max_angular_accel_rad_s2;
     float accel_rate_variance_scale_rad_s;
     float accel_angular_accel_variance_scale_rad_s2;
+    /* Variance multiplier applied while the motion guard holds its accel
+     * inhibit, in place of dropping the measurement. The inhibit runs 100 ms
+     * past each disturbance, and measured over real captures it covered ~50%
+     * of all frames in which the accelerometer was in fact within 1 g of
+     * gravity and the body below the old rate gate -- good data, discarded.
+     * A genuinely destroyed reading (an impact at 15 g) is still refused by
+     * the MEKF's own norm gate, so this only governs how little the tail of
+     * an inhibit is trusted, not whether garbage gets in. */
+    float accel_inhibit_variance_scale;
+
+    /* Accelerometer-pair rotation witness (DUAL_FUSION_DESIGN.md §3.3).
+     * Projecting the difference of the two accelerometers onto the sensor
+     * baseline isolates the centripetal term d*mean(|w_perp|^2), a measured
+     * bound on the rotation rate about the axes perpendicular to the
+     * baseline. Two consumers: (a) gyro-blind windows use it instead of the
+     * blind unobserved_rotation_rate_std_rad_s, so a translational shock
+     * with little real rotation no longer costs a full-scale covariance
+     * dump; (b) with valid gyros, a residual above the trigger for the
+     * configured streak means rotation/vibration the gyros did not capture
+     * (the FIX_PLAN §1 "shock that never trips the motion guard" hole) and
+     * inflates attitude covariance about the witnessed axes only. Rotation
+     * about the baseline itself is invisible to the witness and keeps the
+     * blind uncertainty. leakage_fraction absorbs accel-pair misalignment
+     * leaking common-mode acceleration into the difference. */
+    float rotation_witness_leakage_fraction;
+    float rotation_witness_noise_floor_mps2;
+    float rotation_witness_safety_factor;
+    float rotation_witness_min_rate_std_rad_s;
+    float rotation_witness_trigger_residual_mps2;
+    uint16_t rotation_witness_trigger_windows;
 } dual_imu_estimator_config_t;
 
 typedef struct
@@ -226,6 +276,12 @@ typedef struct
     bool lane_accel_recovery_inflating[DUAL_IMU_ESTIMATOR_LANE_COUNT];
     bool lane_accel_recovery_reseeded[DUAL_IMU_ESTIMATOR_LANE_COUNT];
     bool lane_bias_recovery_reseeded[DUAL_IMU_ESTIMATOR_LANE_COUNT];
+    /* Cross-lane gyro calibration converged; the selector residual is being
+     * computed on the calibrated BMI stream with the tightened budgets. */
+    bool cross_lane_calibrated;
+    /* Persistent accel-pair residual witnessed rotation the gyros missed;
+     * attitude covariance was inflated about the witnessed axes. */
+    bool accel_pair_rotation_witness_active;
     bool output_alignment_active;
     bool stationary_candidate;
     bool stationary_confirmed;
@@ -250,6 +306,7 @@ typedef struct
     attitude_mekf_t impact_gyro_mekf_checkpoint
         [DUAL_IMU_ESTIMATOR_LANE_COUNT];
     imu_selector_t selector;
+    cross_lane_calibrator_t cross_lane_calibrator;
     imu_angular_accel_estimator_t angular_accel_estimator;
     imu_angular_accel_estimator_t impact_gyro_angular_accel_checkpoint;
     dual_imu_estimator_config_t config;
@@ -277,6 +334,8 @@ typedef struct
     uint32_t post_impact_reacquire_count;
     uint32_t accel_recovery_inflation_count;
     uint32_t accel_recovery_reseed_count;
+    uint32_t accel_pair_witness_count;
+    uint16_t accel_pair_witness_streak;
     /* Frozen normalized accel mean after the stationary statistics warmup. */
     float stationary_gravity_reference[DUAL_IMU_ESTIMATOR_LANE_COUNT][3];
     float stationary_gyro_mean_rad_s[DUAL_IMU_ESTIMATOR_LANE_COUNT][3];

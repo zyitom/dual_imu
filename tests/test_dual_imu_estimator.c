@@ -1837,6 +1837,100 @@ static void test_inhibited_known_bad_gyro_does_not_poison_healthy_lane(void)
     TEST_EXPECT(estimator.impact_gyro_disagreement_streak == 0U);
 }
 
+/*
+ * BMI088's gyro clips at 2000 dps where ICM45686 clips at 4000, so an impact
+ * in between latches a saturation fault on one lane while the other keeps
+ * delivering valid samples. Post-impact gravity trust used to require every
+ * lane to be clean, which let that one-sided fault hold the healthy lane in
+ * reacquire indefinitely (measured on hardware: 41 deg of tilt error held for
+ * ~7 s while the device sat still). Recovery must proceed on the sound lane.
+ */
+static void test_post_impact_reacquire_survives_one_sided_lane_fault(void)
+{
+    dual_imu_estimator_t estimator = make_estimator();
+    dual_imu_estimator_output_t output;
+    const float zero[3] = {0.0f, 0.0f, 0.0f};
+    const float yaw_rate[3] = {0.0f, 0.0f, 1.0f};
+    const float level[3] = {0.0f, 0.0f, -9.80665f};
+
+    memset(&output, 0, sizeof(output));
+    for (uint32_t sample = 0U; sample <= 12U; ++sample) {
+        const uint64_t timestamp = TEST_EPOCH_US +
+                                   ((uint64_t)sample * TEST_PERIOD_US);
+        push_lane_measurements_validity(&estimator, IMU_SOURCE_BMI088,
+                                        timestamp, sample, zero, level,
+                                        true, true);
+        push_lane_measurements_validity(&estimator, IMU_SOURCE_ICM45686,
+                                        timestamp, sample, zero, level,
+                                        true, true);
+        (void)dual_imu_estimator_process_next(&estimator, timestamp, &output);
+    }
+    TEST_EXPECT(output.output_valid);
+    TEST_EXPECT(output.attitude_converged);
+
+    float erroneous_quaternion[4];
+    quaternion_from_roll_yaw(degrees_to_radians(3.0f), output.euler_rad[2],
+                             erroneous_quaternion);
+    for (size_t lane = 0U; lane < DUAL_IMU_ESTIMATOR_LANE_COUNT; ++lane) {
+        TEST_EXPECT(attitude_mekf_reset(&estimator.mekf[lane],
+                                        erroneous_quaternion, zero));
+    }
+
+    const uint64_t impact_start_us =
+        TEST_EPOCH_US + (UINT64_C(12) * TEST_PERIOD_US);
+    const uint64_t impact_end_us =
+        TEST_EPOCH_US + (UINT64_C(16) * TEST_PERIOD_US);
+    TEST_EXPECT(dual_imu_estimator_notify_impact_interval(
+        &estimator, impact_start_us, impact_end_us));
+    for (uint32_t sample = 13U; sample <= 16U; ++sample) {
+        const uint64_t timestamp = TEST_EPOCH_US +
+                                   ((uint64_t)sample * TEST_PERIOD_US);
+        push_lane_measurements_validity(&estimator, IMU_SOURCE_BMI088,
+                                        timestamp, sample, yaw_rate, level,
+                                        true, true);
+        push_lane_measurements_validity(&estimator, IMU_SOURCE_ICM45686,
+                                        timestamp, sample, yaw_rate, level,
+                                        true, true);
+        TEST_EXPECT(dual_imu_estimator_process_next(
+                        &estimator, timestamp, &output) ==
+                    IMU_PREINTEGRATOR_WINDOW_READY);
+        TEST_EXPECT(output.post_impact_reacquire_active);
+    }
+
+    /* The lane that clipped stays faulted for the rest of the run. */
+    dual_imu_estimator_set_hard_faults(&estimator, IMU_SOURCE_BMI088,
+                                       UINT32_C(1) << 4); /* GYRO_SATURATED */
+
+    bool saw_reacquire = false;
+    for (uint32_t sample = 17U; sample <= 120U && !saw_reacquire; ++sample) {
+        const uint64_t timestamp = TEST_EPOCH_US +
+                                   ((uint64_t)sample * TEST_PERIOD_US);
+        push_lane_measurements_validity(&estimator, IMU_SOURCE_BMI088,
+                                        timestamp, sample, yaw_rate, level,
+                                        true, true);
+        push_lane_measurements_validity(&estimator, IMU_SOURCE_ICM45686,
+                                        timestamp, sample, yaw_rate, level,
+                                        true, true);
+        TEST_EXPECT(dual_imu_estimator_process_next(
+                        &estimator, timestamp, &output) ==
+                    IMU_PREINTEGRATOR_WINDOW_READY);
+        if (output.attitude_reacquired)
+            saw_reacquire = true;
+    }
+
+    TEST_EXPECT(saw_reacquire);
+    TEST_EXPECT(!output.post_impact_reacquire_active);
+    TEST_EXPECT(output.attitude_converged);
+
+    /* The healthy lane's tilt is back on gravity despite its partner never
+     * clearing its fault. */
+    float recovered_euler[3];
+    TEST_EXPECT(attitude_mekf_get_euler(
+        &estimator.mekf[IMU_SELECTOR_LANE_1], recovered_euler));
+    TEST_EXPECT(fabsf(recovered_euler[0]) < degrees_to_radians(1.0f));
+    TEST_EXPECT(fabsf(recovered_euler[1]) < degrees_to_radians(1.0f));
+}
+
 static void test_post_impact_dynamic_quality_reacquires_without_stationary(void)
 {
     dual_imu_estimator_t estimator = make_estimator();
@@ -2788,6 +2882,8 @@ static void test_undetected_shock_recovers_through_nis_inflation(void)
 static void test_undetected_shock_reseeds_after_inflation_timeout(void)
 {
     dual_imu_estimator_t estimator = make_estimator();
+    /* This test is about the reseed backstop itself, which ships disabled. */
+    estimator.config.accel_recovery_reseed_enabled = true;
     estimator.config.accel_recovery_stuck_windows = 8U;
     estimator.config.accel_recovery_reseed_windows = 24U;
     /* Deliberately too small to reopen the gate before the reseed count. */
@@ -3754,6 +3850,301 @@ static void test_single_lane_recovers_first_after_dual_gyro_loss(void)
     TEST_EXPECT(quaternion_distance(output.quaternion, expected) < 0.01f);
 }
 
+static void calibrator_truth_rate(float time_s, float rate_rad_s[3])
+{
+    const float w0 = 2.0f * TEST_PI_F * 1.3f;
+    const float w1 = 2.0f * TEST_PI_F * 2.1f;
+    const float w2 = 2.0f * TEST_PI_F * 0.7f;
+    rate_rad_s[0] = 1.2f * sinf(w0 * time_s);
+    rate_rad_s[1] = 0.96f * sinf((w1 * time_s) + 0.5f);
+    rate_rad_s[2] = 0.72f * sinf((w2 * time_s) + 1.1f);
+}
+
+static void calibrator_quat_multiply(const float lhs[4], const float rhs[4],
+                                     float result[4])
+{
+    const float w = (lhs[0] * rhs[0]) - (lhs[1] * rhs[1]) -
+                    (lhs[2] * rhs[2]) - (lhs[3] * rhs[3]);
+    const float x = (lhs[0] * rhs[1]) + (lhs[1] * rhs[0]) +
+                    (lhs[2] * rhs[3]) - (lhs[3] * rhs[2]);
+    const float y = (lhs[0] * rhs[2]) - (lhs[1] * rhs[3]) +
+                    (lhs[2] * rhs[0]) + (lhs[3] * rhs[1]);
+    const float z = (lhs[0] * rhs[3]) + (lhs[1] * rhs[2]) -
+                    (lhs[2] * rhs[1]) + (lhs[3] * rhs[0]);
+    result[0] = w;
+    result[1] = x;
+    result[2] = y;
+    result[3] = z;
+}
+
+static void calibrator_quat_integrate(float quaternion[4],
+                                      const float rate_rad_s[3],
+                                      float dt_s)
+{
+    const float half[3] = {0.5f * rate_rad_s[0] * dt_s,
+                           0.5f * rate_rad_s[1] * dt_s,
+                           0.5f * rate_rad_s[2] * dt_s};
+    const float delta[4] = {1.0f, half[0], half[1], half[2]};
+    float updated[4];
+    calibrator_quat_multiply(quaternion, delta, updated);
+    const float norm = sqrtf((updated[0] * updated[0]) +
+                             (updated[1] * updated[1]) +
+                             (updated[2] * updated[2]) +
+                             (updated[3] * updated[3]));
+    for (size_t axis = 0U; axis < 4U; ++axis)
+        quaternion[axis] = updated[axis] / norm;
+}
+
+static void calibrator_world_to_body(const float quaternion[4],
+                                     const float world[3],
+                                     float body[3])
+{
+    /* body = q^-1 * world * q for q rotating body vectors into world. */
+    const float inverse[4] = {quaternion[0], -quaternion[1],
+                              -quaternion[2], -quaternion[3]};
+    const float vector[4] = {0.0f, world[0], world[1], world[2]};
+    float temporary[4];
+    float rotated[4];
+    calibrator_quat_multiply(inverse, vector, temporary);
+    const float forward[4] = {quaternion[0], quaternion[1], quaternion[2],
+                              quaternion[3]};
+    calibrator_quat_multiply(temporary, forward, rotated);
+    body[0] = rotated[1];
+    body[1] = rotated[2];
+    body[2] = rotated[3];
+}
+
+static void test_cross_lane_calibrator_converges_through_estimator(void)
+{
+    dual_imu_estimator_t estimator = make_estimator();
+    /* Mild deterministic BMI-vs-ICM differences: inside the uncalibrated
+     * 1.6% disagreement budget so the selector must stay healthy while the
+     * calibrator learns them out of the difference channel. */
+    const float misalignment[3] = {degrees_to_radians(0.3f),
+                                   degrees_to_radians(-0.2f),
+                                   degrees_to_radians(0.3f)};
+    const float scale[3] = {0.005f, -0.003f, 0.004f};
+    const float bias[3] = {degrees_to_radians(0.2f),
+                           degrees_to_radians(-0.1f),
+                           degrees_to_radians(0.15f)};
+    const float gravity_world[3] = {0.0f, 0.0f, -9.80665f};
+
+    float attitude[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+    dual_imu_estimator_output_t output;
+    memset(&output, 0, sizeof(output));
+    const uint32_t total_samples = 4000U;
+    for (uint32_t sample = 0U; sample <= total_samples; ++sample) {
+        const float time_s = (float)sample * 0.0025f;
+        const uint64_t timestamp = TEST_EPOCH_US +
+                                   ((uint64_t)sample * TEST_PERIOD_US);
+        float rate[3];
+        calibrator_truth_rate(time_s, rate);
+        float accel_body[3];
+        calibrator_world_to_body(attitude, gravity_world, accel_body);
+        const float cross[3] = {
+            (misalignment[1] * rate[2]) - (misalignment[2] * rate[1]),
+            (misalignment[2] * rate[0]) - (misalignment[0] * rate[2]),
+            (misalignment[0] * rate[1]) - (misalignment[1] * rate[0]),
+        };
+        float bmi_rate[3];
+        for (size_t axis = 0U; axis < 3U; ++axis)
+            bmi_rate[axis] = rate[axis] + cross[axis] +
+                             (scale[axis] * rate[axis]) + bias[axis];
+        push_lane_measurements_validity(&estimator, IMU_SOURCE_BMI088,
+                                        timestamp, sample, bmi_rate,
+                                        accel_body, true, true);
+        push_lane_measurements_validity(&estimator, IMU_SOURCE_ICM45686,
+                                        timestamp, sample, rate,
+                                        accel_body, true, true);
+        const imu_preintegrator_result_t result =
+            dual_imu_estimator_process_next(&estimator, timestamp, &output);
+        TEST_EXPECT(result == ((sample == 0U)
+                                  ? IMU_PREINTEGRATOR_NOT_READY
+                                  : IMU_PREINTEGRATOR_WINDOW_READY));
+        calibrator_quat_integrate(attitude, rate, 0.0025f);
+    }
+
+    TEST_EXPECT(output.output_valid);
+    TEST_EXPECT(output.cross_lane_calibrated);
+    TEST_EXPECT(cross_lane_calibrator_is_converged(
+        &estimator.cross_lane_calibrator));
+    TEST_EXPECT(output.selector.state == IMU_SELECTOR_HEALTHY);
+    TEST_EXPECT(output.selector.selected_lane == IMU_SELECTOR_LANE_1);
+    for (size_t axis = 0U; axis < 3U; ++axis) {
+        TEST_EXPECT(fabsf(estimator.cross_lane_calibrator.state[axis] -
+                          bias[axis]) < degrees_to_radians(0.1f));
+        TEST_EXPECT(fabsf(estimator.cross_lane_calibrator.state[3U + axis] -
+                          misalignment[axis]) < degrees_to_radians(0.05f));
+        TEST_EXPECT(fabsf(estimator.cross_lane_calibrator.state[6U + axis] -
+                          scale[axis]) < 1.5e-3f);
+    }
+    TEST_EXPECT(fabsf(estimator.cross_lane_calibrator.state[9]) < 30.0e-6f);
+}
+
+static void test_cross_lane_calibrator_skips_suspect_windows(void)
+{
+    dual_imu_estimator_t estimator = make_estimator();
+    const float zero[3] = {0.0f, 0.0f, 0.0f};
+    /* Inhibit the first five windows: none of them may reach the
+     * calibrator, valid or not. */
+    TEST_EXPECT(dual_imu_estimator_inhibit_accel_interval(
+        &estimator, TEST_EPOCH_US,
+        TEST_EPOCH_US + (5U * TEST_PERIOD_US)));
+    dual_imu_estimator_output_t output;
+    memset(&output, 0, sizeof(output));
+    for (uint32_t sample = 0U; sample <= 10U; ++sample) {
+        const uint64_t timestamp = TEST_EPOCH_US +
+                                   ((uint64_t)sample * TEST_PERIOD_US);
+        push_lane_sample(&estimator, IMU_SOURCE_BMI088, timestamp, sample,
+                         zero);
+        push_lane_sample(&estimator, IMU_SOURCE_ICM45686, timestamp, sample,
+                         zero);
+        (void)dual_imu_estimator_process_next(&estimator, timestamp,
+                                              &output);
+        if (sample == 5U) {
+            TEST_EXPECT(estimator.cross_lane_calibrator.diagnostics
+                            .update_count == 0U);
+        }
+    }
+    TEST_EXPECT(estimator.cross_lane_calibrator.diagnostics.update_count ==
+                5U);
+    TEST_EXPECT(!output.cross_lane_calibrated);
+}
+
+static void test_quiet_accel_pair_bounds_blind_window_inflation(void)
+{
+    /* Both gyros blind but the accel pair is quiet: the rotation witness
+     * must bound the covariance dump on the axes perpendicular to the Y
+     * sensor baseline while the baseline axis keeps the blind full-scale
+     * uncertainty (DUAL_FUSION_DESIGN.md §3.3(b)). */
+    dual_imu_estimator_t estimator = make_estimator();
+    const float zero[3] = {0.0f, 0.0f, 0.0f};
+    dual_imu_estimator_output_t output;
+    memset(&output, 0, sizeof(output));
+    uint32_t sample = 0U;
+    for (; sample <= 10U; ++sample) {
+        const uint64_t timestamp = TEST_EPOCH_US +
+                                   ((uint64_t)sample * TEST_PERIOD_US);
+        push_lane_sample(&estimator, IMU_SOURCE_BMI088, timestamp, sample,
+                         zero);
+        push_lane_sample(&estimator, IMU_SOURCE_ICM45686, timestamp, sample,
+                         zero);
+        (void)dual_imu_estimator_process_next(&estimator, timestamp,
+                                              &output);
+    }
+    TEST_EXPECT(estimator.lane_seeded[DUAL_IMU_ESTIMATOR_LANE_ICM45686]);
+    float covariance_before[3];
+    for (size_t axis = 0U; axis < 3U; ++axis)
+        covariance_before[axis] =
+            estimator.mekf[DUAL_IMU_ESTIMATOR_LANE_ICM45686]
+                .covariance[axis][axis];
+
+    for (uint32_t blind = 0U; blind < 4U; ++blind, ++sample) {
+        const uint64_t timestamp = TEST_EPOCH_US +
+                                   ((uint64_t)sample * TEST_PERIOD_US);
+        push_lane_sample_validity(&estimator, IMU_SOURCE_BMI088, timestamp,
+                                  sample, zero, false, true);
+        push_lane_sample_validity(&estimator, IMU_SOURCE_ICM45686, timestamp,
+                                  sample, zero, false, true);
+        (void)dual_imu_estimator_process_next(&estimator, timestamp,
+                                              &output);
+        TEST_EXPECT(output.rotation_unobserved);
+    }
+    const float added_x =
+        estimator.mekf[DUAL_IMU_ESTIMATOR_LANE_ICM45686].covariance[0][0] -
+        covariance_before[0];
+    const float added_y =
+        estimator.mekf[DUAL_IMU_ESTIMATOR_LANE_ICM45686].covariance[1][1] -
+        covariance_before[1];
+    const float added_z =
+        estimator.mekf[DUAL_IMU_ESTIMATOR_LANE_ICM45686].covariance[2][2] -
+        covariance_before[2];
+    /* Witness floor 2 rad/s vs blind 4000 dps: the perpendicular axes must
+     * receive orders of magnitude less inflation than the baseline axis. */
+    TEST_EXPECT(added_x > 0.0f);
+    TEST_EXPECT(added_z > 0.0f);
+    TEST_EXPECT(added_x < 1.0e-3f);
+    TEST_EXPECT(added_z < 1.0e-3f);
+    TEST_EXPECT(added_y > 0.01f);
+    TEST_EXPECT(output.heading_continuity_lost);
+    TEST_EXPECT(output.post_impact_reacquire_active);
+}
+
+static void test_hidden_rotation_pair_residual_inflates_covariance(void)
+{
+    /* Valid, quiet gyros but a large persistent accel-pair residual: the
+     * hidden-rotation trigger must inflate attitude covariance about the
+     * witnessed axes without declaring heading loss (the FIX_PLAN §1
+     * "vibration that never clips the gyros" hole). */
+    dual_imu_estimator_t estimator = make_estimator();
+    const float zero[3] = {0.0f, 0.0f, 0.0f};
+    const float gravity[3] = {0.0f, 0.0f, -9.80665f};
+    dual_imu_estimator_output_t output;
+    memset(&output, 0, sizeof(output));
+    uint32_t sample = 0U;
+    for (; sample <= 10U; ++sample) {
+        const uint64_t timestamp = TEST_EPOCH_US +
+                                   ((uint64_t)sample * TEST_PERIOD_US);
+        push_lane_sample(&estimator, IMU_SOURCE_BMI088, timestamp, sample,
+                         zero);
+        push_lane_sample(&estimator, IMU_SOURCE_ICM45686, timestamp, sample,
+                         zero);
+        (void)dual_imu_estimator_process_next(&estimator, timestamp,
+                                              &output);
+    }
+    float covariance_before[3];
+    for (size_t axis = 0U; axis < 3U; ++axis)
+        covariance_before[axis] =
+            estimator.mekf[DUAL_IMU_ESTIMATOR_LANE_ICM45686]
+                .covariance[axis][axis];
+
+    /* BMI reads 4 m/s^2 more +Y specific force than ICM: on the BMI-minus-
+     * ICM baseline (-Y) this projects as a centripetal signature about the
+     * X/Z axes that the (quiet) gyros never measured. */
+    const float bmi_accel[3] = {0.0f, 4.0f, -9.80665f};
+    bool witness_seen = false;
+    for (uint32_t vibration = 0U; vibration < 4U; ++vibration, ++sample) {
+        const uint64_t timestamp = TEST_EPOCH_US +
+                                   ((uint64_t)sample * TEST_PERIOD_US);
+        push_lane_measurements_validity(&estimator, IMU_SOURCE_BMI088,
+                                        timestamp, sample, zero, bmi_accel,
+                                        true, true);
+        push_lane_measurements_validity(&estimator, IMU_SOURCE_ICM45686,
+                                        timestamp, sample, zero, gravity,
+                                        true, true);
+        (void)dual_imu_estimator_process_next(&estimator, timestamp,
+                                              &output);
+        witness_seen = witness_seen ||
+                       output.accel_pair_rotation_witness_active;
+        TEST_EXPECT(!output.rotation_unobserved);
+    }
+    TEST_EXPECT(witness_seen);
+    TEST_EXPECT(estimator.accel_pair_witness_count >= 1U);
+    const float added_x =
+        estimator.mekf[DUAL_IMU_ESTIMATOR_LANE_ICM45686].covariance[0][0] -
+        covariance_before[0];
+    const float added_y =
+        estimator.mekf[DUAL_IMU_ESTIMATOR_LANE_ICM45686].covariance[1][1] -
+        covariance_before[1];
+    const float added_z =
+        estimator.mekf[DUAL_IMU_ESTIMATOR_LANE_ICM45686].covariance[2][2] -
+        covariance_before[2];
+    TEST_EXPECT(added_x > 5.0e-3f);
+    TEST_EXPECT(added_z > 5.0e-3f);
+    TEST_EXPECT(added_y < 1.0e-3f);
+    TEST_EXPECT(!output.heading_continuity_lost);
+    /* A quiet pair must never arm the trigger. */
+    TEST_EXPECT(estimator.accel_pair_witness_streak > 0U);
+    const uint64_t timestamp = TEST_EPOCH_US +
+                               ((uint64_t)sample * TEST_PERIOD_US);
+    push_lane_sample(&estimator, IMU_SOURCE_BMI088, timestamp, sample, zero);
+    push_lane_sample(&estimator, IMU_SOURCE_ICM45686, timestamp, sample,
+                     zero);
+    (void)dual_imu_estimator_process_next(&estimator, timestamp, &output);
+    TEST_EXPECT(estimator.accel_pair_witness_streak == 0U);
+    TEST_EXPECT(!output.accel_pair_rotation_witness_active);
+}
+
 int main(void)
 {
     test_disagreement_confirmation_requires_multiple_windows();
@@ -3792,6 +4183,7 @@ int main(void)
     test_impact_gyro_confirmation_requires_contiguous_evidence();
     test_impact_gyro_confirmation_does_not_cross_inhibit_gaps();
     test_inhibited_known_bad_gyro_does_not_poison_healthy_lane();
+    test_post_impact_reacquire_survives_one_sided_lane_fault();
     test_post_impact_dynamic_quality_reacquires_without_stationary();
     test_accel_only_inhibit_keeps_matching_gyro_attitude_observable();
     test_accel_fallback_is_explicit();
@@ -3820,6 +4212,10 @@ int main(void)
     test_nonimpact_filter_reseed_preserves_real_hard_fault();
     test_selected_icm_filter_fault_reseeds_without_attitude_jump();
     test_single_lane_recovers_first_after_dual_gyro_loss();
+    test_cross_lane_calibrator_converges_through_estimator();
+    test_cross_lane_calibrator_skips_suspect_windows();
+    test_quiet_accel_pair_bounds_blind_window_inflation();
+    test_hidden_rotation_pair_residual_inflates_covariance();
 
     if (failure_count != 0U) {
         (void)fprintf(stderr, "dual_imu_estimator: %u test failure(s)\n",

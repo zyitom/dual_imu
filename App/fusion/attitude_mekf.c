@@ -442,6 +442,9 @@ static bool mekf_config_is_valid(const attitude_mekf_config_t *config)
            isfinite(config->accel_norm_hard_deviation_mps2) &&
            (config->accel_norm_hard_deviation_mps2 >=
             config->accel_norm_soft_deviation_mps2) &&
+           isfinite(config->accel_update_norm_hard_deviation_mps2) &&
+           (config->accel_update_norm_hard_deviation_mps2 >=
+            config->accel_norm_soft_deviation_mps2) &&
            isfinite(config->accel_variance_scale_max) &&
            (config->accel_variance_scale_max >= 1.0f) &&
            isfinite(config->accel_nis_gate) && (config->accel_nis_gate > 0.0f) &&
@@ -559,7 +562,11 @@ void attitude_mekf_default_config(attitude_mekf_config_t *config)
     config->standard_gravity_mps2 = ATTITUDE_MEKF_DEFAULT_GRAVITY;
     config->accel_norm_soft_deviation_mps2 = 0.35f;
     config->accel_norm_hard_deviation_mps2 = 3.0f;
-    config->accel_variance_scale_max = 100.0f;
+    /* One g of slack: a centrifugal/linear disturbance up to 2 g still gets
+     * a (heavily down-weighted) vote, beyond that the direction carries more
+     * disturbance than gravity and is dropped. */
+    config->accel_update_norm_hard_deviation_mps2 = ATTITUDE_MEKF_DEFAULT_GRAVITY;
+    config->accel_variance_scale_max = 10000.0f;
     config->accel_nis_gate = ATTITUDE_MEKF_DEFAULT_NIS_GATE_99;
     config->zaru_nis_gate = ATTITUDE_MEKF_DEFAULT_NIS_GATE_3D;
     config->max_accel_correction_step_rad =
@@ -937,6 +944,84 @@ bool attitude_mekf_mark_rotation_unobserved(attitude_mekf_t *filter,
     return true;
 }
 
+bool attitude_mekf_mark_rotation_unobserved_directional(
+    attitude_mekf_t *filter,
+    float axis_std_rad,
+    float perpendicular_std_rad,
+    const float unit_axis[ATTITUDE_MEKF_VECTOR_DIM])
+{
+    if ((filter == NULL) || !filter->initialized ||
+        !attitude_mekf_is_valid(filter) || (unit_axis == NULL) ||
+        !isfinite(axis_std_rad) || (axis_std_rad < 0.0f) ||
+        !isfinite(perpendicular_std_rad) || (perpendicular_std_rad < 0.0f) ||
+        ((axis_std_rad <= 0.0f) && (perpendicular_std_rad <= 0.0f)))
+        return false;
+    const float axis_norm_sq = (unit_axis[0] * unit_axis[0]) +
+                               (unit_axis[1] * unit_axis[1]) +
+                               (unit_axis[2] * unit_axis[2]);
+    if (!isfinite(axis_norm_sq) || (fabsf(axis_norm_sq - 1.0f) > 1.0e-3f))
+        return false;
+
+    /* Added covariance perp^2*(I - aa') + axis^2*aa': anisotropic rotation
+     * uncertainty with axis_std about unit_axis and perpendicular_std about
+     * every axis orthogonal to it. */
+    const float perpendicular_variance =
+        perpendicular_std_rad * perpendicular_std_rad;
+    const float axis_variance = axis_std_rad * axis_std_rad;
+    float added[ATTITUDE_MEKF_VECTOR_DIM][ATTITUDE_MEKF_VECTOR_DIM];
+    for (size_t row = 0U; row < ATTITUDE_MEKF_VECTOR_DIM; ++row) {
+        for (size_t column = 0U; column < ATTITUDE_MEKF_VECTOR_DIM;
+             ++column) {
+            added[row][column] = (axis_variance - perpendicular_variance) *
+                                 unit_axis[row] * unit_axis[column];
+            if (row == column)
+                added[row][column] += perpendicular_variance;
+            if (!isfinite(added[row][column]))
+                return false;
+        }
+    }
+
+    /* Uniformly scale the added matrix into the per-axis headroom below the
+     * attitude variance cap: scaling the whole SPD increment keeps it SPD,
+     * unlike clipping individual diagonals after the add. */
+    const float maximum_attitude_variance =
+        0.5f * filter->config.covariance_ceiling;
+    float scale = 1.0f;
+    for (size_t axis = 0U; axis < ATTITUDE_MEKF_VECTOR_DIM; ++axis) {
+        if (added[axis][axis] <= 0.0f)
+            continue;
+        const float headroom = fmaxf(
+            0.0f,
+            maximum_attitude_variance - filter->covariance[axis][axis]);
+        scale = fminf(scale, headroom / added[axis][axis]);
+    }
+    if (scale <= 0.0f) {
+        /* Already at the cap everywhere the increment acts: report success
+         * without change, matching the saturating isotropic behaviour. */
+        if (filter->diagnostics.unobserved_rotation_count < UINT32_MAX)
+            filter->diagnostics.unobserved_rotation_count++;
+        return true;
+    }
+
+    float inflated[ATTITUDE_MEKF_STATE_DIM][ATTITUDE_MEKF_STATE_DIM];
+    memcpy(inflated, filter->covariance, sizeof(inflated));
+    for (size_t row = 0U; row < ATTITUDE_MEKF_VECTOR_DIM; ++row) {
+        for (size_t column = 0U; column < ATTITUDE_MEKF_VECTOR_DIM;
+             ++column) {
+            inflated[row][column] += scale * added[row][column];
+        }
+    }
+    if (!mekf_condition_covariance(&filter->config, inflated)) {
+        filter->diagnostics.numeric_fault_count++;
+        return false;
+    }
+
+    memcpy(filter->covariance, inflated, sizeof(filter->covariance));
+    if (filter->diagnostics.unobserved_rotation_count < UINT32_MAX)
+        filter->diagnostics.unobserved_rotation_count++;
+    return true;
+}
+
 attitude_mekf_accel_result_t attitude_mekf_update_accel(
     attitude_mekf_t *filter,
     const float specific_force_mps2[ATTITUDE_MEKF_VECTOR_DIM],
@@ -965,7 +1050,7 @@ attitude_mekf_accel_result_t attitude_mekf_update_accel(
     filter->diagnostics.last_accel_norm_mps2 = accel_norm;
     if ((!isfinite(accel_norm)) ||
         (fabsf(accel_norm - filter->config.standard_gravity_mps2) >
-         filter->config.accel_norm_hard_deviation_mps2))
+         filter->config.accel_update_norm_hard_deviation_mps2))
     {
         return mekf_record_accel_result(filter, ATTITUDE_MEKF_ACCEL_REJECTED_NORM);
     }

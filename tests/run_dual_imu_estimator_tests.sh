@@ -9,6 +9,7 @@ cc -std=c11 -O2 -Wall -Wextra -Werror -Wpedantic -Wshadow \
     -I"$project_root/App/fusion" \
     -I"$project_root/App/imu" \
     "$project_root/App/fusion/attitude_mekf.c" \
+    "$project_root/App/fusion/cross_lane_calibrator.c" \
     "$project_root/App/fusion/dual_imu_estimator.c" \
     "$project_root/App/fusion/imu_preintegrator.c" \
     "$project_root/App/fusion/imu_selector.c" \

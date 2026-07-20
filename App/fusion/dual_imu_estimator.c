@@ -7,7 +7,12 @@
 #define DUAL_IMU_ESTIMATOR_GRAVITY_MPS2 (9.80665f)
 #define DUAL_IMU_ESTIMATOR_PI_F          (3.14159265358979323846f)
 #define DUAL_IMU_ESTIMATOR_US_TO_S       (1.0e-6f)
-#define DUAL_IMU_ESTIMATOR_MAX_SCALE     (100.0f)
+/* Ceiling on the accel measurement-variance inflation. Now that a high slew
+ * rate down-weights gravity aiding instead of switching it off, this ceiling
+ * is what bounds how far the weight can fall; clipping at 100 would have made
+ * a 1800 deg/s sweep look only as noisy as a 900 deg/s one. The quadratic in
+ * estimator_accel_variance_scale() stays unclipped out past 17000 deg/s. */
+#define DUAL_IMU_ESTIMATOR_MAX_SCALE     (10000.0f)
 #define DUAL_IMU_ESTIMATOR_FILTER_FAULT  (1UL << 31)
 #define DUAL_IMU_ESTIMATOR_STATIONARY_WARMUP_WINDOWS (40U)
 
@@ -268,6 +273,14 @@ static bool estimator_config_is_valid(const dual_imu_estimator_config_t *config)
         !isfinite(config->gyro_disagreement_rate_fraction) ||
         (config->gyro_disagreement_rate_fraction < 0.0f) ||
         (config->gyro_disagreement_rate_fraction >= 0.2f) ||
+        !isfinite(config->gyro_disagreement_rate_fraction_calibrated) ||
+        (config->gyro_disagreement_rate_fraction_calibrated < 0.0f) ||
+        (config->gyro_disagreement_rate_fraction_calibrated >
+         config->gyro_disagreement_rate_fraction) ||
+        !isfinite(config->alignment_std_calibrated_rad) ||
+        (config->alignment_std_calibrated_rad < 0.0f) ||
+        (config->alignment_std_calibrated_rad >
+         config->alignment_std_rad) ||
         !isfinite(config->rate_floor_std_rad_s) ||
         (config->rate_floor_std_rad_s <= 0.0f) ||
         !isfinite(config->output_alignment_slew_rad_s) ||
@@ -356,7 +369,22 @@ static bool estimator_config_is_valid(const dual_imu_estimator_config_t *config)
         !isfinite(config->accel_rate_variance_scale_rad_s) ||
         (config->accel_rate_variance_scale_rad_s <= 0.0f) ||
         !isfinite(config->accel_angular_accel_variance_scale_rad_s2) ||
-        (config->accel_angular_accel_variance_scale_rad_s2 <= 0.0f))
+        (config->accel_angular_accel_variance_scale_rad_s2 <= 0.0f) ||
+        !isfinite(config->rotation_witness_leakage_fraction) ||
+        (config->rotation_witness_leakage_fraction < 0.0f) ||
+        (config->rotation_witness_leakage_fraction >= 1.0f) ||
+        !isfinite(config->rotation_witness_noise_floor_mps2) ||
+        (config->rotation_witness_noise_floor_mps2 < 0.0f) ||
+        !isfinite(config->rotation_witness_safety_factor) ||
+        (config->rotation_witness_safety_factor < 1.0f) ||
+        !isfinite(config->rotation_witness_min_rate_std_rad_s) ||
+        (config->rotation_witness_min_rate_std_rad_s <= 0.0f) ||
+        (config->rotation_witness_min_rate_std_rad_s >
+         config->unobserved_rotation_rate_std_rad_s) ||
+        !isfinite(config->rotation_witness_trigger_residual_mps2) ||
+        (config->rotation_witness_trigger_residual_mps2 <=
+         config->stationary_accel_pair_limit_mps2) ||
+        (config->rotation_witness_trigger_windows == 0U))
         return false;
 
     for (size_t lane = 0U; lane < DUAL_IMU_ESTIMATOR_LANE_COUNT; ++lane) {
@@ -379,6 +407,7 @@ void dual_imu_estimator_default_config(dual_imu_estimator_config_t *config)
     for (size_t lane = 0U; lane < DUAL_IMU_ESTIMATOR_LANE_COUNT; ++lane)
         imu_preintegrator_default_config(&config->preintegrator[lane]);
     imu_selector_default_config(&config->selector);
+    cross_lane_calibrator_default_config(&config->cross_lane_calibrator);
     for (size_t lane = 0U; lane < DUAL_IMU_ESTIMATOR_LANE_COUNT; ++lane)
         attitude_mekf_default_config(&config->mekf[lane]);
 
@@ -406,6 +435,11 @@ void dual_imu_estimator_default_config(dual_imu_estimator_config_t *config)
      * (FIX_PLAN §9.1-3). Tighten toward ~0.3% after per-lane cross-axis
      * calibration is loaded. */
     config->gyro_disagreement_rate_fraction = 0.016f;
+    /* Residual budgets once the cross-lane calibrator has absorbed the
+     * deterministic misalignment/scale/delay difference: 0.3% of the
+     * rotation angle plus a 0.1 deg residual alignment. */
+    config->gyro_disagreement_rate_fraction_calibrated = 0.003f;
+    config->alignment_std_calibrated_rad = 0.1f * degree;
     config->rate_floor_std_rad_s = 0.03f * degree;
     config->output_alignment_slew_rad_s = 1.0f;
     config->unobserved_rotation_rate_std_rad_s = 4000.0f * degree;
@@ -451,9 +485,17 @@ void dual_imu_estimator_default_config(dual_imu_estimator_config_t *config)
         stationary_temporal_accel_rms_limit *
         stationary_temporal_accel_rms_limit;
     config->stationary_accel_direction_limit = 0.02f;
-    config->stationary_dwell_windows = 800U;
+    /* Windows are 2500 us, so these are 300 ms / 600 ms of continuous quiet.
+     * The previous 800/1600 meant 2 s / 4 s, which no hand-held rest between
+     * motions ever reached: across three captures the longest qualifying
+     * still segment was 2116 ms, and the streak resets on any single failing
+     * window, so stationary was confirmed exactly zero times. That starved
+     * ZUPT/ZARU and left the gyro bias unobserved. Only the dwell shortens
+     * here; every instantaneous admission test (rate, accel norm, window
+     * variance, cross-lane accel agreement) is unchanged. */
+    config->stationary_dwell_windows = 120U;
     config->stationary_hint_dwell_windows = 80U;
-    config->stationary_single_lane_dwell_windows = 1600U;
+    config->stationary_single_lane_dwell_windows = 240U;
     config->stationary_single_lane_hint_dwell_windows = 160U;
     config->stationary_soft_exit_windows = 4U;
     config->stationary_rate_exit_windows = 3U;
@@ -464,7 +506,7 @@ void dual_imu_estimator_default_config(dual_imu_estimator_config_t *config)
     /* 200 ms at 400 Hz. This is shorter than the stationary reseed dwell but
      * long enough that a fast-yaw inhibit cannot reopen gravity aiding on the
      * first still-contaminated window after its 100 ms hold expires. */
-    config->post_impact_gravity_trust_windows = 80U;
+    config->post_impact_gravity_trust_windows = 8U;
     config->impact_gyro_disagreement_confirm_windows = 3U;
     config->calibration_accept_windows = 40U;
     config->calibration_revoke_windows = 40U;
@@ -475,6 +517,7 @@ void dual_imu_estimator_default_config(dual_imu_estimator_config_t *config)
     config->accel_recovery_inflation_std_rad = 0.6f * degree;
     /* ~5% g: wide enough for post-shock rest with residual vibration, far
      * below the >1 m/s2 centripetal contamination of a hand-rate rotation. */
+    config->accel_recovery_reseed_enabled = false;
     config->accel_recovery_norm_tolerance_mps2 = 0.5f;
     /* ~57 dps: below this the centripetal term at a 0.2 m lever is
      * <= 0.25 m/s2 (<= 1.5 deg direction error), so a rejected update is
@@ -485,6 +528,21 @@ void dual_imu_estimator_default_config(dual_imu_estimator_config_t *config)
     config->accel_update_max_angular_accel_rad_s2 = 1000.0f;
     config->accel_rate_variance_scale_rad_s = 3.0f;
     config->accel_angular_accel_variance_scale_rad_s2 = 200.0f;
+    config->accel_inhibit_variance_scale = 400.0f;
+    /* 0.5% of the common-mode magnitude covers a ~0.3 deg accel-pair
+     * misalignment leaking translation into the difference channel. */
+    config->rotation_witness_leakage_fraction = 0.005f;
+    config->rotation_witness_noise_floor_mps2 = 0.05f;
+    config->rotation_witness_safety_factor = 2.0f;
+    /* ~115 dps floor: rotation modes the 7.1 mm baseline cannot resolve
+     * (intermittent within the window, partial cancellation) must still
+     * inflate a meaningful covariance. */
+    config->rotation_witness_min_rate_std_rad_s = 2.0f;
+    /* Far above both the stationary pair limit (0.35) and worst-case
+     * misalignment leakage at moderate g, so only genuinely unmodeled
+     * rotation/vibration can arm the trigger. */
+    config->rotation_witness_trigger_residual_mps2 = 3.0f;
+    config->rotation_witness_trigger_windows = 2U;
 }
 
 bool dual_imu_estimator_init(dual_imu_estimator_t *estimator,
@@ -512,6 +570,10 @@ bool dual_imu_estimator_init(dual_imu_estimator_t *estimator,
     if (!imu_selector_init(&estimator->selector,
                            &config->selector,
                            IMU_SELECTOR_LANE_1))
+        return false;
+
+    if (!cross_lane_calibrator_init(&estimator->cross_lane_calibrator,
+                                    &config->cross_lane_calibrator))
         return false;
 
     imu_angular_accel_estimator_init(&estimator->angular_accel_estimator,
@@ -792,12 +854,81 @@ static void estimator_window_rate(const imu_preintegrated_window_t *window,
         rate[axis] = window->gyro_mean_rad_s[axis];
 }
 
+/*
+ * DUAL_FUSION_DESIGN.md §3.3: projecting the difference of the two
+ * accelerometers' specific force onto the sensor-baseline direction isolates
+ * the mean centripetal term:
+ *
+ *   (f_bmi - f_icm) . unit(r_bmi - r_icm) = -|r_bmi - r_icm| * mean(|w_perp|^2)
+ *
+ * because the tangential wdot x dr term is exactly perpendicular to dr. The
+ * result is a measured one-sigma bound on the window's rotation rate about
+ * the axes perpendicular to the baseline; rotation about the baseline is
+ * invisible. Works on raw sensor-position means (gyro-blind windows) and on
+ * lever-arm-translated residuals (hidden-rotation trigger) alike: in the
+ * latter case the gyro-predicted part is already subtracted, so the
+ * projection measures the rotation the gyros missed.
+ */
+static bool estimator_baseline_rotation_witness(
+    const dual_imu_estimator_t *estimator,
+    const float bmi_specific_force_mps2[3],
+    const float icm_specific_force_mps2[3],
+    float *perpendicular_rate_std_rad_s,
+    float baseline_axis[3])
+{
+    const dual_imu_estimator_config_t *config = &estimator->config;
+    float baseline[3];
+    float difference[3];
+    for (size_t axis = 0U; axis < 3U; ++axis) {
+        baseline[axis] =
+            config->reference_to_sensor_m[DUAL_IMU_ESTIMATOR_LANE_BMI088]
+                                         [axis] -
+            config->reference_to_sensor_m[DUAL_IMU_ESTIMATOR_LANE_ICM45686]
+                                         [axis];
+        difference[axis] = bmi_specific_force_mps2[axis] -
+                           icm_specific_force_mps2[axis];
+    }
+    if (!estimator_vector_is_finite(baseline) ||
+        !estimator_vector_is_finite(difference) ||
+        !estimator_vector_is_finite(bmi_specific_force_mps2) ||
+        !estimator_vector_is_finite(icm_specific_force_mps2))
+        return false;
+    const float distance = estimator_vector_norm(baseline);
+    if (!isfinite(distance) || (distance < 1.0e-4f))
+        return false;
+
+    float projection = 0.0f;
+    for (size_t axis = 0U; axis < 3U; ++axis) {
+        baseline_axis[axis] = baseline[axis] / distance;
+        projection += difference[axis] * baseline_axis[axis];
+    }
+    const float common_mode = fmaxf(
+        estimator_vector_norm(bmi_specific_force_mps2),
+        estimator_vector_norm(icm_specific_force_mps2));
+    const float leakage_margin =
+        (config->rotation_witness_leakage_fraction * common_mode) +
+        config->rotation_witness_noise_floor_mps2;
+    const float centripetal = fmaxf(0.0f, -projection - leakage_margin);
+    const float witnessed_rate = sqrtf(centripetal / distance);
+    const float rate_std = fminf(
+        config->unobserved_rotation_rate_std_rad_s,
+        (config->rotation_witness_safety_factor * witnessed_rate) +
+            config->rotation_witness_min_rate_std_rad_s);
+    if (!isfinite(rate_std) || (rate_std <= 0.0f))
+        return false;
+    *perpendicular_rate_std_rad_s = rate_std;
+    return true;
+}
+
 static bool estimator_propagate_half_window(
     dual_imu_estimator_t *estimator,
     uint32_t lane,
     const imu_preintegrated_window_t windows[DUAL_IMU_ESTIMATOR_LANE_COUNT],
     uint32_t half_index,
     float half_dt_s,
+    bool witness_valid,
+    float witness_rate_std_rad_s,
+    const float witness_axis[3],
     bool *aided,
     bool *rotation_unobserved)
 {
@@ -825,6 +956,17 @@ static bool estimator_propagate_half_window(
             *aided = false;
             if (rotation_unobserved != NULL)
                 *rotation_unobserved = true;
+            if (witness_valid) {
+                /* The accel-pair witness bounds the rotation about the axes
+                 * perpendicular to the baseline; the baseline axis itself
+                 * keeps the blind full-range uncertainty. */
+                return attitude_mekf_mark_rotation_unobserved_directional(
+                    &estimator->mekf[lane],
+                    estimator->config.unobserved_rotation_rate_std_rad_s *
+                        half_dt_s,
+                    witness_rate_std_rad_s * half_dt_s,
+                    witness_axis);
+            }
             return attitude_mekf_mark_rotation_unobserved(
                 &estimator->mekf[lane],
                 estimator->config.unobserved_rotation_rate_std_rad_s *
@@ -911,14 +1053,15 @@ static void estimator_selector_covariance(const dual_imu_estimator_t *estimator,
                                           const float angular_accel[3],
                                           const float delta_angle[3],
                                           float dt_s,
+                                          float alignment_std_rad,
+                                          float disagreement_fraction,
                                           float covariance[3][3])
 {
     const float dt_sq = dt_s * dt_s;
     const float delta_norm = estimator_vector_norm(delta_angle);
     const float delta_norm_sq = delta_norm * delta_norm;
     const float alignment_variance_scale =
-        estimator->config.alignment_std_rad *
-        estimator->config.alignment_std_rad;
+        alignment_std_rad * alignment_std_rad;
     const float floor_delta = estimator->config.rate_floor_std_rad_s * dt_s;
     const float floor_variance = floor_delta * floor_delta;
     /* Rate-proportional cross-lane disagreement budget: gyro cross-axis
@@ -929,9 +1072,9 @@ static void estimator_selector_covariance(const dual_imu_estimator_t *estimator,
      * rotation angle; both lanes measure the same motion and their covariances
      * are summed in the selector NIS, so each contributing its own term yields a
      * correctly scaled combined gate. The term is exactly zero at delta_norm=0,
-     * keeping the static gate bit-identical to before. */
-    const float disagreement_fraction =
-        estimator->config.gyro_disagreement_rate_fraction;
+     * keeping the static gate bit-identical to before. The caller passes the
+     * tightened calibrated budgets while the cross-lane calibrator is
+     * converged (DUAL_FUSION_DESIGN.md §3.1). */
     const float disagreement_variance =
         (disagreement_fraction * disagreement_fraction) * delta_norm_sq;
 
@@ -1130,7 +1273,8 @@ static void estimator_handle_accel_recovery(
         if (streak < estimator->config.accel_recovery_stuck_windows)
             continue;
 
-        if (streak >= estimator->config.accel_recovery_reseed_windows) {
+        if (estimator->config.accel_recovery_reseed_enabled &&
+            (streak >= estimator->config.accel_recovery_reseed_windows)) {
             float recoverable_bias[3];
             if (!estimator_get_recoverable_bias(&estimator->mekf[lane],
                                                 recoverable_bias)) {
@@ -2071,6 +2215,8 @@ static float estimator_accel_variance_scale(
             estimator->config.stationary_accel_pair_limit_mps2;
         scale += normalized_pair * normalized_pair;
     }
+    if (output->accel_inhibited)
+        scale *= estimator->config.accel_inhibit_variance_scale;
     return fminf(DUAL_IMU_ESTIMATOR_MAX_SCALE, fmaxf(1.0f, scale));
 }
 
@@ -2091,24 +2237,42 @@ static bool estimator_update_post_impact_gravity_trust(
     candidate = candidate && isfinite(rate_norm) &&
         (rate_norm <= estimator->config.accel_recovery_max_rate_rad_s);
 
-    for (size_t lane = 0U;
-         candidate && (lane < DUAL_IMU_ESTIMATOR_LANE_COUNT);
-         ++lane) {
+    /* Evidence is collected per lane, not from both lanes unconditionally.
+     * BMI088's gyro clips at 2000 dps against ICM45686's 4000 dps, so a hand
+     * impact in the 1960-3920 dps band latches a BMI-only saturation fault
+     * while the ICM samples stay valid. Requiring every lane here let that
+     * one-sided fault block the healthy lane's gravity recovery for seconds
+     * (observed: 41 deg of tilt error held for ~7 s while stationary with
+     * accel aiding nominally enabled). A faulted lane is excluded from the
+     * evidence set instead; recovery proceeds on whatever lane is sound, and
+     * an empty set is still no evidence. */
+    uint8_t usable_mask = 0U;
+    for (size_t lane = 0U; lane < DUAL_IMU_ESTIMATOR_LANE_COUNT; ++lane) {
         if (!estimator->lane_seeded[lane] ||
             (estimator->hard_fault_flags[lane] != 0U) ||
-            estimator->lane_accel_fault[lane] || !windows[lane].accel_valid) {
+            estimator->lane_accel_fault[lane] || !windows[lane].accel_valid)
+            continue;
+        const float specific_force_norm = estimator_vector_norm(
+            output->lane_specific_force_mps2[lane]);
+        if (!isfinite(specific_force_norm) ||
+            (fabsf(specific_force_norm - DUAL_IMU_ESTIMATOR_GRAVITY_MPS2) >
+             estimator->config.accel_recovery_norm_tolerance_mps2)) {
+            /* A lane that is healthy but reads a non-gravity field is live
+             * evidence of motion, not an absent witness: reject outright. */
             candidate = false;
             break;
         }
-        const float specific_force_norm = estimator_vector_norm(
-            output->lane_specific_force_mps2[lane]);
-        candidate = isfinite(specific_force_norm) &&
-            (fabsf(specific_force_norm - DUAL_IMU_ESTIMATOR_GRAVITY_MPS2) <=
-             estimator->config.accel_recovery_norm_tolerance_mps2);
+        usable_mask |= (uint8_t)(1U << lane);
     }
-    candidate = candidate && isfinite(output->accel_pair_residual_mps2) &&
-        (output->accel_pair_residual_mps2 <=
-         estimator->config.stationary_accel_pair_limit_mps2);
+    candidate = candidate && (usable_mask != 0U);
+
+    /* The pair residual only means anything when both lanes are in the
+     * evidence set; with one lane out it is stale or undefined. */
+    if (usable_mask == 0x03U) {
+        candidate = candidate && isfinite(output->accel_pair_residual_mps2) &&
+            (output->accel_pair_residual_mps2 <=
+             estimator->config.stationary_accel_pair_limit_mps2);
+    }
 
     if (!candidate) {
         estimator->post_impact_gravity_trusted = false;
@@ -2435,6 +2599,21 @@ imu_preintegrator_result_t dual_imu_estimator_process_next(
                 corrected_second_moment);
     }
 
+    /* Raw-mean rotation witness for gyro-blind windows. Computed before the
+     * translation loop below because that loop clears accel_valid whenever
+     * the geometry lane is missing -- exactly the both-gyros-unusable case
+     * this witness serves (DUAL_FUSION_DESIGN.md §3.3(b)). */
+    float unobserved_witness_rate_std_rad_s = 0.0f;
+    float unobserved_witness_axis[3] = {0.0f, 0.0f, 0.0f};
+    const bool unobserved_witness_valid =
+        windows[0].accel_valid && windows[1].accel_valid &&
+        estimator_baseline_rotation_witness(
+            estimator,
+            windows[DUAL_IMU_ESTIMATOR_LANE_BMI088].accel_mean_mps2,
+            windows[DUAL_IMU_ESTIMATOR_LANE_ICM45686].accel_mean_mps2,
+            &unobserved_witness_rate_std_rad_s,
+            unobserved_witness_axis);
+
     for (size_t lane = 0U; lane < DUAL_IMU_ESTIMATOR_LANE_COUNT; ++lane) {
         if (windows[lane].accel_valid && geometry_statistics_valid) {
             if (!imu_translate_mean_specific_force(
@@ -2489,6 +2668,9 @@ imu_preintegrator_result_t dual_imu_estimator_process_next(
                                                  windows,
                                                  0U,
                                                  half_dt_s,
+                                                 unobserved_witness_valid,
+                                                 unobserved_witness_rate_std_rad_s,
+                                                 unobserved_witness_axis,
                                                  &aided,
                                                  &rotation_unobserved) &&
                 windows[lane].gyro_propagation_valid &&
@@ -2556,6 +2738,34 @@ imu_preintegrator_result_t dual_imu_estimator_process_next(
         }
     }
 
+    /* Cross-lane calibrator (DUAL_FUSION_DESIGN.md §3.1): learn the
+     * deterministic BMI-vs-ICM gyro differences from the raw difference
+     * channel. Windows under any suspicion machinery (inhibit/impact
+     * interval, pending gyro-disagreement checkpoint, external sensor
+     * faults) never enter: a shock's differential g-sensitivity or a lying
+     * lane must not be learned as calibration. Window validity, the rate
+     * admission and outlier gating are enforced inside the module. */
+    if (!output->accel_inhibited && !impact_interval_active &&
+        !estimator->impact_gyro_checkpoint_valid &&
+        (estimator_sensor_fault_flags(estimator, 0U) == 0U) &&
+        (estimator_sensor_fault_flags(estimator, 1U) == 0U)) {
+        (void)cross_lane_calibrator_update(
+            &estimator->cross_lane_calibrator,
+            &windows[DUAL_IMU_ESTIMATOR_LANE_BMI088],
+            &windows[DUAL_IMU_ESTIMATOR_LANE_ICM45686],
+            dt_s);
+    }
+    const bool cross_lane_calibrated = cross_lane_calibrator_is_converged(
+        &estimator->cross_lane_calibrator);
+    output->cross_lane_calibrated = cross_lane_calibrated;
+    const float effective_alignment_std_rad =
+        cross_lane_calibrated ? estimator->config.alignment_std_calibrated_rad
+                              : estimator->config.alignment_std_rad;
+    const float effective_disagreement_fraction =
+        cross_lane_calibrated
+            ? estimator->config.gyro_disagreement_rate_fraction_calibrated
+            : estimator->config.gyro_disagreement_rate_fraction;
+
     /* Select before any ZARU update so bias learning cannot hide this residual. */
     imu_selector_input_t selector_input;
     memset(&selector_input, 0, sizeof(selector_input));
@@ -2568,10 +2778,33 @@ imu_preintegrator_result_t dual_imu_estimator_process_next(
             attitude_mekf_is_valid(&estimator->mekf[lane]);
         selector_input.lane[lane].hard_fault_flags =
             estimator_sensor_fault_flags(estimator, lane);
+        float lane_delta[3];
+        memcpy(lane_delta, windows[lane].delta_angle_rad,
+               sizeof(lane_delta));
+        if (cross_lane_calibrated &&
+            (lane == DUAL_IMU_ESTIMATOR_LANE_BMI088)) {
+            /* Map the BMI window into the ICM gyro frame. The bias
+             * difference stays in: this lane's own MEKF bias is subtracted
+             * below, exactly as before. */
+            const float rate_change[3] = {
+                windows[lane].gyro_end_rad_s[0] -
+                    windows[lane].gyro_start_rad_s[0],
+                windows[lane].gyro_end_rad_s[1] -
+                    windows[lane].gyro_start_rad_s[1],
+                windows[lane].gyro_end_rad_s[2] -
+                    windows[lane].gyro_start_rad_s[2],
+            };
+            float corrected_delta[3];
+            if (cross_lane_calibrator_correct_bmi_delta_angle(
+                    &estimator->cross_lane_calibrator,
+                    lane_delta,
+                    rate_change,
+                    corrected_delta))
+                memcpy(lane_delta, corrected_delta, sizeof(lane_delta));
+        }
         for (size_t axis = 0U; axis < 3U; ++axis) {
             selector_input.lane[lane].delta_angle_rad[axis] =
-                windows[lane].delta_angle_rad[axis] -
-                (bias_before[lane][axis] * dt_s);
+                lane_delta[axis] - (bias_before[lane][axis] * dt_s);
         }
         estimator_selector_covariance(
             estimator,
@@ -2579,6 +2812,8 @@ imu_preintegrator_result_t dual_imu_estimator_process_next(
             mean_angular_accel_rad_s2,
             selector_input.lane[lane].delta_angle_rad,
             dt_s,
+            effective_alignment_std_rad,
+            effective_disagreement_fraction,
             selector_input.lane[lane].covariance_rad2);
     }
     if (!imu_selector_update(&estimator->selector,
@@ -2606,22 +2841,52 @@ imu_preintegrator_result_t dual_imu_estimator_process_next(
     const bool impact_gyro_disagreement_pending =
         estimator->impact_gyro_checkpoint_valid;
 
-    const float accel_variance_scale = estimator_accel_variance_scale(estimator,
-                                                                      output);
     bool accel_health_evidence[DUAL_IMU_ESTIMATOR_LANE_COUNT] = {false, false};
     const bool post_impact_quality_pending =
         estimator->post_impact_reacquire_active;
     const bool post_impact_gravity_trusted =
         estimator_update_post_impact_gravity_trust(estimator, output, windows,
                                                    dynamic_accel_gate);
-    const bool accel_updates_enabled =
-        !output->accel_inhibited && !dynamic_accel_gate &&
-        post_impact_gravity_trusted;
+    const float accel_variance_scale = estimator_accel_variance_scale(estimator,
+                                                                      output);
+    /* dynamic_accel_gate is deliberately NOT a hard cutoff here. Above
+     * accel_update_max_rate_rad_s the old code dropped gravity aiding
+     * entirely, so a fast yaw sweep ran open-loop on gyro alone for as long
+     * as it lasted; measured, that let tilt error grow to ~16 deg over 12 s
+     * and it was only repaired afterwards by a one-shot alignment patch.
+     * estimator_accel_variance_scale() already inflates R quadratically in
+     * rate and angular acceleration, so a contaminated measurement is
+     * down-weighted continuously rather than discarded, and the MEKF's NIS
+     * gate still rejects one that is outright inconsistent. The gate is kept
+     * hard for reseeding and for the post-impact trust evidence above, where
+     * a contaminated gravity vector would be written into the state instead
+     * of merely nudging it.
+     *
+     * accel_inhibited is soft here for the same reason and it matters more:
+     * the motion guard holds it 100 ms past every disturbance, which across
+     * real captures covered ~50% of all frames while the accelerometer was
+     * still within 1 g of gravity. Those frames now arrive scaled by
+     * accel_inhibit_variance_scale rather than being dropped. What actually
+     * keeps a destroyed reading out is the MEKF norm gate, which an impact at
+     * 15 g fails outright. Every path that WRITES attitude from the accel
+     * (seed, reseed, accel recovery, post-impact trust) still tests
+     * accel_inhibited directly and stays hard.
+     *
+     * post_impact_gravity_trusted, by contrast, STAYS hard, and the reason is
+     * worth recording because softening it looks tempting: measured, 94.7% of
+     * all frames still carrying more than 3 deg of error were sitting in this
+     * state waiting for the streak. But right after an impact the covariance
+     * is deliberately huge, so an inflated R does not hold the filter back --
+     * it correctly trusts the measurement, and a sustained non-gravity
+     * specific force is a measurement that lies. Down-weighting a lie the
+     * filter is primed to believe does not work; refusing it does. What is
+     * safe to shorten is how long the evidence must persist, which is
+     * post_impact_gravity_trust_windows, not whether it is required. */
+    const bool accel_updates_enabled = post_impact_gravity_trusted;
     output->post_impact_gravity_trusted =
         estimator->post_impact_gravity_trusted;
     output->post_impact_gravity_trust_streak =
         estimator->post_impact_gravity_trust_streak;
-    output->gravity_aiding_inhibited = !accel_updates_enabled;
     if (accel_updates_enabled) {
         for (size_t lane = 0U; lane < DUAL_IMU_ESTIMATOR_LANE_COUNT; ++lane) {
             if (estimator->lane_seeded[lane] && windows[lane].accel_valid) {
@@ -2633,6 +2898,16 @@ imu_preintegrator_result_t dual_imu_estimator_process_next(
                     accel_variance_scale);
             }
         }
+    }
+    /* Reported as an outcome, not an intention. Aiding no longer switches
+     * off, so "we decided not to update" is never true and would make the
+     * flag a constant; what a reader needs to know is whether gravity
+     * actually corrected anything this window, which is false when every
+     * lane was unseeded, invalid, or had its measurement rejected. */
+    output->gravity_aiding_inhibited = true;
+    for (size_t lane = 0U; lane < DUAL_IMU_ESTIMATOR_LANE_COUNT; ++lane) {
+        if (output->accel_result[lane] == ATTITUDE_MEKF_ACCEL_ACCEPTED)
+            output->gravity_aiding_inhibited = false;
     }
     estimator_update_accel_health(estimator,
                                   output,
@@ -2661,6 +2936,66 @@ imu_preintegrator_result_t dual_imu_estimator_process_next(
     estimator_handle_accel_recovery(estimator, output, windows,
                                     accel_updates_enabled);
 
+    /* Hidden-rotation trigger (DUAL_FUSION_DESIGN.md §3.3(b), FIX_PLAN §1's
+     * "shock that never trips the motion guard" hole): with both gyros
+     * valid, the lever-arm translation already removed the gyro-predicted
+     * centripetal field from lane_specific_force_mps2, so a persistent pair
+     * residual above the trigger witnesses rotation/vibration the gyros did
+     * not capture. Inflate attitude covariance about the witnessed axes only
+     * (axis component zero: no evidence there) and declare nothing about
+     * heading -- this is honest-uncertainty widening, not impact machinery.
+     * Runs after this window's gravity updates, whose pair-residual variance
+     * scaling already down-weighted the contaminated measurement. */
+    output->accel_pair_rotation_witness_active = false;
+    if (!output->accel_inhibited && !impact_interval_active &&
+        !impact_gyro_disagreement_pending &&
+        !estimator->stationary_confirmed_latched &&
+        windows[0].gyro_valid && windows[1].gyro_valid &&
+        windows[0].accel_valid && windows[1].accel_valid &&
+        (estimator->hard_fault_flags[0] == 0U) &&
+        (estimator->hard_fault_flags[1] == 0U) &&
+        !estimator->lane_accel_fault[0] &&
+        !estimator->lane_accel_fault[1] &&
+        isfinite(output->accel_pair_residual_mps2) &&
+        (output->accel_pair_residual_mps2 >
+         estimator->config.rotation_witness_trigger_residual_mps2)) {
+        if (estimator->accel_pair_witness_streak < UINT16_MAX)
+            estimator->accel_pair_witness_streak++;
+    } else {
+        estimator->accel_pair_witness_streak = 0U;
+    }
+    if (estimator->accel_pair_witness_streak >=
+        estimator->config.rotation_witness_trigger_windows) {
+        float hidden_rate_std_rad_s = 0.0f;
+        float hidden_axis[3] = {0.0f, 0.0f, 0.0f};
+        if (estimator_baseline_rotation_witness(
+                estimator,
+                output->lane_specific_force_mps2
+                    [DUAL_IMU_ESTIMATOR_LANE_BMI088],
+                output->lane_specific_force_mps2
+                    [DUAL_IMU_ESTIMATOR_LANE_ICM45686],
+                &hidden_rate_std_rad_s,
+                hidden_axis)) {
+            bool inflated = false;
+            for (size_t lane = 0U; lane < DUAL_IMU_ESTIMATOR_LANE_COUNT;
+                 ++lane) {
+                if (!estimator->lane_seeded[lane])
+                    continue;
+                inflated = attitude_mekf_mark_rotation_unobserved_directional(
+                               &estimator->mekf[lane],
+                               0.0f,
+                               hidden_rate_std_rad_s * dt_s,
+                               hidden_axis) ||
+                           inflated;
+            }
+            if (inflated) {
+                output->accel_pair_rotation_witness_active = true;
+                if (estimator->accel_pair_witness_count < UINT32_MAX)
+                    estimator->accel_pair_witness_count++;
+            }
+        }
+    }
+
     bool selected_lane_aiding_evidence = false;
     if (accel_updates_enabled) {
         const imu_selector_lane_t selected_lane =
@@ -2673,23 +3008,39 @@ imu_preintegrator_result_t dual_imu_estimator_process_next(
                  output->lane_accel_aided[selected_lane]);
         }
     }
+    /* Quality evidence for leaving reacquire is gathered per lane, for the
+     * same reason as the gravity trust above: a lane held out by a one-sided
+     * fault (BMI088 clipping at 2000 dps where ICM45686 clips at 4000) must
+     * not be able to veto the healthy lane's recovery forever. The lane whose
+     * attitude is actually published has to carry the evidence; the
+     * cross-lane checks only apply when both lanes are in the evidence set,
+     * since with one lane out they compare against nothing. */
+    uint8_t quality_evidence_mask = 0U;
+    for (size_t lane = 0U; lane < DUAL_IMU_ESTIMATOR_LANE_COUNT; ++lane) {
+        if (estimator->lane_seeded[lane] &&
+            (estimator->hard_fault_flags[lane] == 0U) &&
+            !estimator->lane_accel_fault[lane] &&
+            windows[lane].accel_valid &&
+            (output->accel_result[lane] == ATTITUDE_MEKF_ACCEL_ACCEPTED))
+            quality_evidence_mask |= (uint8_t)(1U << lane);
+    }
+    const imu_selector_lane_t quality_lane = output->selector.selected_lane;
+    const bool quality_lane_has_evidence =
+        (quality_lane < IMU_SELECTOR_LANE_COUNT)
+            ? ((quality_evidence_mask & (uint8_t)(1U << quality_lane)) != 0U)
+            : (quality_evidence_mask != 0U);
+    const bool quality_cross_lane_evidence =
+        (quality_evidence_mask != 0x03U) ||
+        (isfinite(output->accel_pair_residual_mps2) &&
+         (output->accel_pair_residual_mps2 <=
+          estimator->config.stationary_accel_pair_limit_mps2) &&
+         output->selector.residual_valid &&
+         isfinite(output->selector.residual_nis) &&
+         (output->selector.residual_nis <
+          estimator->selector.config.nis_clear_threshold));
     const bool post_impact_quality_evidence =
         post_impact_quality_pending && accel_updates_enabled &&
-        estimator->lane_seeded[0] && estimator->lane_seeded[1] &&
-        (estimator->hard_fault_flags[0] == 0U) &&
-        (estimator->hard_fault_flags[1] == 0U) &&
-        !estimator->lane_accel_fault[0] &&
-        !estimator->lane_accel_fault[1] && windows[0].accel_valid &&
-        windows[1].accel_valid &&
-        (output->accel_result[0] == ATTITUDE_MEKF_ACCEL_ACCEPTED) &&
-        (output->accel_result[1] == ATTITUDE_MEKF_ACCEL_ACCEPTED) &&
-        isfinite(output->accel_pair_residual_mps2) &&
-        (output->accel_pair_residual_mps2 <=
-         estimator->config.stationary_accel_pair_limit_mps2) &&
-        output->selector.residual_valid &&
-        isfinite(output->selector.residual_nis) &&
-        (output->selector.residual_nis <
-         estimator->selector.config.nis_clear_threshold);
+        quality_lane_has_evidence && quality_cross_lane_evidence;
     const bool attitude_convergence_evidence =
         post_impact_quality_pending ? post_impact_quality_evidence
                                     : selected_lane_aiding_evidence;
@@ -2853,6 +3204,9 @@ imu_preintegrator_result_t dual_imu_estimator_process_next(
                                              windows,
                                              1U,
                                              half_dt_s,
+                                             unobserved_witness_valid,
+                                             unobserved_witness_rate_std_rad_s,
+                                             unobserved_witness_axis,
                                              &aided,
                                              &rotation_unobserved) &&
             windows[lane].gyro_propagation_valid &&

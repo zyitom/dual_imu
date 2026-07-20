@@ -463,6 +463,10 @@ static void apply_motion_guard_inhibit(void)
 static bool estimator_accel_sample_is_eligible(imu_source_t source,
                                                bool timestamp_trusted)
 {
+#if DUAL_IMU_SINGLE_LANE_ICM45686
+    if (source == IMU_SOURCE_BMI088)
+        return false;
+#endif
     if (!timestamp_trusted ||
         (sample_monitors[source].repeated_accel_samples >=
          IMU_FROZEN_SAMPLE_LIMIT))
@@ -476,6 +480,10 @@ static bool estimator_accel_sample_is_eligible(imu_source_t source,
 static bool estimator_gyro_sample_is_eligible(imu_source_t source,
                                               bool timestamp_trusted)
 {
+#if DUAL_IMU_SINGLE_LANE_ICM45686
+    if (source == IMU_SOURCE_BMI088)
+        return false;
+#endif
     if (!timestamp_trusted ||
         (sample_monitors[source].repeated_gyro_samples >=
          IMU_FROZEN_SAMPLE_LIMIT))
@@ -1690,6 +1698,14 @@ void dual_imu_process(void)
                                                      &state.icm45686_sample,
                                                      &state.icm45686_health,
                                                      now_us);
+#if DUAL_IMU_SINGLE_LANE_ICM45686
+    /* Single-lane bring-up: hold BMI088 in the same state as a physically
+     * absent die so the selector isolates it and every cross-lane consumer
+     * (disagreement rollback, accel-pair variance, dual-lane stationary
+     * mask) degrades to its single-lane path instead of comparing against a
+     * lane that is deliberately not being fed. */
+    state.bmi088_fault_flags = DUAL_IMU_FAULT_HEALTH;
+#endif
     /* BMI accel/gyro are independent dies; never derive gyro clipping from
        the combined sample, which may be stale when only accel has failed. */
     state.bmi088_fault_flags &= ~((uint32_t)DUAL_IMU_FAULT_SATURATED);

@@ -43,7 +43,17 @@ typedef struct
     float initial_bias_std_rad_s;
     float standard_gravity_mps2;
     float accel_norm_soft_deviation_mps2;
+    /* Admission gate for paths that WRITE tilt straight from the measured
+     * specific force (seed/reset). A contaminated vector becomes the state
+     * there, with no covariance to discount it, so this stays tight. */
     float accel_norm_hard_deviation_mps2;
+    /* Admission gate for the measurement update, which only nudges the state
+     * through a gain that accel_variance_scale_max already bounds. It is
+     * deliberately looser: rejecting every off-norm sample during sustained
+     * rotation leaves tilt running open-loop, which drifts far worse than a
+     * heavily down-weighted update pulls it wrong. Must be >= the soft
+     * deviation; there is no requirement that it match the seed gate. */
+    float accel_update_norm_hard_deviation_mps2;
     float accel_variance_scale_max;
     float accel_nis_gate;
     float zaru_nis_gate;
@@ -131,6 +141,20 @@ bool attitude_mekf_propagate_delta(attitude_mekf_t *filter,
  */
 bool attitude_mekf_mark_rotation_unobserved(attitude_mekf_t *filter,
                                             float rotation_std_rad);
+
+/*
+ * Anisotropic variant: the unobserved rotation has axis_std_rad uncertainty
+ * about unit_axis and perpendicular_std_rad about the two orthogonal axes.
+ * Used when an accelerometer-pair witness bounds the rotation about the axes
+ * perpendicular to the sensor baseline while rotation about the baseline
+ * itself stays unbounded (DUAL_FUSION_DESIGN.md §3.3). Either std may be
+ * zero (no evidence-free inflation on that subspace), but not both.
+ */
+bool attitude_mekf_mark_rotation_unobserved_directional(
+    attitude_mekf_t *filter,
+    float axis_std_rad,
+    float perpendicular_std_rad,
+    const float unit_axis[ATTITUDE_MEKF_VECTOR_DIM]);
 
 /*
  * The update is rank-two in the gravity tangent plane and cannot observe yaw.

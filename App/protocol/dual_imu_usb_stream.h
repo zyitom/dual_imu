@@ -33,9 +33,13 @@ extern "C" {
  *
  * The unused HI91 magnetometer field carries debug channels as well:
  *   mag_x = cumulative attitude-rewrite count (integer)
- *   mag_y = last rewrite reason + 10 * last rewrite lane
+ *   mag_y = last rewrite reason + 10 * last rewrite lane + 100 * inhibit
  *           (reason: 1=seed 2=accel-recovery 3=reacquire 4=rollback;
- *            lane: 0=BMI088 1=ICM45686 2=both)
+ *            lane: 0=BMI088 1=ICM45686 2=both;
+ *            inhibit: the motion guard's raw accel inhibit for this window.
+ *            It is reported separately from the ACC_INHIBIT status bit
+ *            because that bit now means "gravity aiding produced no update",
+ *            while the guard's inhibit only down-weights one.)
  *   mag_z = residual output-alignment tilt still being slewed out, in deg
  */
 typedef enum

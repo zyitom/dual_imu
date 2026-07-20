@@ -79,6 +79,7 @@ set(APPLICATION_SOURCES
     App/imu/imu_stream_buffer.c
     App/imu/imu_time.c
     App/fusion/attitude_mekf.c
+    App/fusion/cross_lane_calibrator.c
     App/fusion/dual_imu_estimator.c
     App/fusion/fast_attitude_predictor.c
     App/fusion/imu_preintegrator.c

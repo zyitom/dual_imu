@@ -397,7 +397,8 @@ static void fill_frame_data(const dual_imu_state_t *state,
     data->magnetic_field_ut[0] = (float)state->attitude_rewrite_count;
     data->magnetic_field_ut[1] =
         (float)state->attitude_rewrite_last_reason +
-        (10.0f * (float)state->attitude_rewrite_last_lane);
+        (10.0f * (float)state->attitude_rewrite_last_lane) +
+        (state->accel_update_inhibited ? 100.0f : 0.0f);
     data->magnetic_field_ut[2] =
         state->output_alignment_tilt_rad * DUAL_IMU_USB_RAD_TO_DEG;
 
